@@ -102,8 +102,15 @@ Describe 'Get-FileInventory' {
         try { $null = New-Item -ItemType SymbolicLink -Path $link -Target $root -ErrorAction Stop }
         catch { Set-ItResult -Skipped -Because "symbolic links cannot be created here: $_"; return }
 
-        $found = @(Get-FileInventory -Path $root)
-        $found.Name | Should -Be @('a.txt')
+        try {
+            $found = @(Get-FileInventory -Path $root)
+            $found.Name | Should -Be @('a.txt')
+        }
+        finally {
+            # Remove the loop ourselves: Pester's TestDrive cleanup follows links and
+            # would recurse forever. Deleting a link never touches its target.
+            [System.IO.Directory]::Delete($link)
+        }
     }
 
     It 'rejects a path that is not a folder' {
