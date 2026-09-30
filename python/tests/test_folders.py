@@ -80,6 +80,15 @@ class FindDuplicateFoldersTests(TempRootTestCase):
         self.assertEqual(result.folder_name, "Photos")
         self.assertEqual((result.file_count, result.folder_count), (2, 2))
 
+    def test_orders_each_rows_locations_from_the_least_to_the_most_nested(self):
+        for folder in ("z/Photos", "a/b/c/Photos", "a/b/Photos", "B/Photos", "a/C/c/Photos"):
+            add_photo_folder(self.root, folder)
+
+        (photos,) = [r for r in self.find() if r.folder_name == "Photos"]  # (a/b/c and a/C/c are a set too)
+
+        expected = [self.path(f"{folder}/Photos") for folder in ("B", "z", "a/b", "a/b/c", "a/C/c")]
+        self.assertEqual(photos.folders, expected, "equally deep folders keep their alphabetical order")
+
     def test_matches_folder_names_that_differ_only_by_case(self):
         add_photo_folder(self.root, "one/Photos")
         add_photo_folder(self.root, "two/photos")

@@ -82,7 +82,8 @@ FOLDER_RULES = (
     "other folder (same name, saved date and MD5).",
     "Only the top-most duplicates are listed: a sub folder is listed on its own only when one of its copies is "
     "outside a duplicate folder. Folders that contain no files are not listed.",
-    "Each row is one duplicated folder. Each Location column is the full path of one copy.",
+    "Each row is one duplicated folder. Each Location column is the full path of one copy: Location 1 is the least "
+    "nested (fewest folders deep), the last Location the most nested; folders equally deep are in alphabetical order.",
 )
 # Written only when the scan left names or small files out. The label rows are read back, so
 # validating leaves the same names out and rewriting the report keeps the settings.

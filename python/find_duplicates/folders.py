@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set
 
 from .matcher import HashCallback, NS_PER_SECOND, groups_of_many, md5_map
-from .names import name_key, path_sort_key, sort_key
+from .names import depth_sort_key, name_key, path_sort_key, sort_key
 from .scanner import FileRecord, FolderRecord, is_cloud_only
 
 log = logging.getLogger("find_duplicates")
@@ -218,7 +218,7 @@ def find_duplicate_folders(
     for members in sets:
         if all(os.path.dirname(p) in duplicated for p in members):
             continue
-        ordered = sorted(members, key=path_sort_key)
+        ordered = sorted(members, key=depth_sort_key)
         info = full[ordered[0]]
         results.append(
             DuplicateFolderSet(

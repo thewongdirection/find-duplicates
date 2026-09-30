@@ -44,8 +44,8 @@ calling `find_duplicate_files()` / `validate_report()` from Python. Console
 messages are worded identically apart from the option names they mention.
 
 Keep orderings identical: folders and files are visited in ordinal name order,
-file locations from the least to the most nested (`Get-PathDepth` / `path_depth`),
-equally deep ones and folder locations ordinal-ignore-case, rows by file name
+the locations of a file or folder from the least to the most nested (`Get-PathDepth` /
+`path_depth`), equally deep ones ordinal-ignore-case, rows by file name
 (ordinal-ignore-case), saved date, then MD5. Excel dates are truncated to the
 millisecond when written and rounded to it when read, as .NET does.
 

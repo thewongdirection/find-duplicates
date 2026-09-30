@@ -31,7 +31,8 @@
     MD5) of the file at the same place in the other folder. Only the top-most
     duplicate folders are reported, on a second sheet, "Duplicate Folders":
     Folder Name | Files | Sub Folders | Size (bytes) | Copies | Location 1 | ...
-    where each "Location" column holds the full path of one copy of the folder.
+    where each "Location" column holds the full path of one copy of the folder, from the
+    least nested (Location 1) to the most nested.
 
     VALIDATE (-Validate)
     Re-checks every copy listed in an existing report with a quick file lookup

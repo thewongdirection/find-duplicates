@@ -112,7 +112,8 @@ duplicated folder:
 |-------------|-------|-------------|--------------|--------|------------|------------|
 | Photos      | 1250  | 14          | 5368709120   | 2      | D:\Photos  | E:\Backup\Photos |
 
-Here each `Location` is the full path of the duplicate folder itself.
+Here each `Location` is the full path of the duplicate folder itself, from the least
+nested copy (*Location 1*) to the most nested, as on the *Duplicates* sheet.
 
 ## Command reference
 

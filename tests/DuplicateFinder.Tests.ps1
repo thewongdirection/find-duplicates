@@ -1446,6 +1446,17 @@ Describe 'Find-DuplicateFolder' {
         $result[0].FolderCount | Should -Be 2
     }
 
+    It 'orders each row''s locations from the least to the most nested' {
+        $root = Add-TestRoot
+        foreach ($folder in 'z/Photos', 'a/b/c/Photos', 'a/b/Photos', 'B/Photos', 'a/C/c/Photos') { Add-PhotoFolder $root $folder }
+
+        $result = Find-InTree $root
+        $photos = @($result | Where-Object { $_.FolderName -eq 'Photos' })  # (a/b/c and a/C/c are a set too)
+
+        $expected = @('B', 'z', 'a/b', 'a/b/c', 'a/C/c') | ForEach-Object { [System.IO.Path]::GetFullPath((Join-Path $root "$_/Photos")) }
+        $photos[0].Folders | Should -BeExactly $expected -Because 'equally deep folders keep their alphabetical order'
+    }
+
     It 'matches folder names that differ only by case' {
         $root = Add-TestRoot
         Add-PhotoFolder $root 'one/Photos'
