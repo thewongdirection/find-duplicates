@@ -121,6 +121,24 @@ class FindDuplicateFoldersTests(TempRootTestCase):
         records = [FolderRecord(r.path, r.path != unreadable) for r in records]
         self.assertEqual(find_duplicate_folders(files, records), [])
 
+    def test_does_not_report_a_folder_that_holds_the_excluded_report(self):
+        add_photo_folder(self.root, "one/Photos")
+        add_photo_folder(self.root, "two/Photos")
+        report = add_file(self.root, "one/Photos/dupes.xlsx")
+        records = []
+        files = list(iter_files(self.root, exclude=[report], folders=records))
+        # Without the report the two trees look identical, but one really holds an extra file.
+        self.assertEqual([r.folder_name for r in find_duplicate_folders(files, records)], ["sub"])
+
+    def test_does_not_report_a_folder_that_holds_a_folder_link(self):
+        add_photo_folder(self.root, "one/Photos")
+        add_photo_folder(self.root, "two/Photos")
+        try:
+            os.symlink(self.path("two"), self.path("one/Photos/link"), target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symbolic links cannot be created here: {exc}")
+        self.assertEqual([r.folder_name for r in self.find()], ["sub"])
+
     def test_does_not_read_files_again_that_the_file_scan_already_hashed(self):
         add_photo_folder(self.root, "one/Photos")
         add_photo_folder(self.root, "two/Photos")
@@ -159,6 +177,17 @@ class DuplicateFoldersInTheReportTests(TempRootTestCase):
     def test_writes_and_reads_back_a_duplicate_folders_sheet(self):
         path = self.path("report.xlsx")
         export_duplicate_report([], path, self.SETS)
+        self.assertEqual(read_duplicate_folder_report(path), self.SETS)
+
+    def test_finds_the_folder_sheet_whatever_the_case_of_its_name(self):
+        path = self.path("report.xlsx")
+        export_duplicate_report([], path, self.SETS)
+        with zipfile.ZipFile(path) as archive:
+            parts = {name: archive.read(name) for name in archive.namelist()}
+        parts["xl/workbook.xml"] = parts["xl/workbook.xml"].replace(b'name="Duplicate Folders"', b'name="duplicate folders"')
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, data in parts.items():
+                archive.writestr(name, data)
         self.assertEqual(read_duplicate_folder_report(path), self.SETS)
 
     def test_writes_no_folder_sheet_unless_folder_sets_are_given(self):

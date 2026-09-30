@@ -34,22 +34,26 @@ BeforeAll {
     }
 
     function Read-Worksheet {
-        # Returns the worksheet as a list of rows, each row a list of cell texts.
-        param([string] $Path)
+        # Returns a worksheet as a list of rows, each row a list of cell texts: from the
+        # table's header row down, or with -IncludeRules every row including the rules above.
+        param([string] $Path, [string] $Part = 'xl/worksheets/sheet1.xml', [switch] $IncludeRules)
         $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
         try {
-            $reader = [System.IO.StreamReader]::new($zip.GetEntry('xl/worksheets/sheet1.xml').Open())
+            $reader = [System.IO.StreamReader]::new($zip.GetEntry($Part).Open())
             try { [xml] $xml = $reader.ReadToEnd() } finally { $reader.Dispose() }
         }
         finally { $zip.Dispose() }
 
         $ns = [System.Xml.XmlNamespaceManager]::new($xml.NameTable)
         $ns.AddNamespace('s', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main')
+        $inTable = [bool] $IncludeRules
         foreach ($row in $xml.SelectNodes('//s:sheetData/s:row', $ns)) {
-            , @(foreach ($cell in $row.SelectNodes('s:c', $ns)) {
+            $cells = @(foreach ($cell in $row.SelectNodes('s:c', $ns)) {
                     $text = $cell.SelectSingleNode('s:is/s:t', $ns)
                     if ($text) { $text.InnerText } else { $cell.SelectSingleNode('s:v', $ns).InnerText }
                 })
+            if (-not $inTable -and $cells[0] -in 'File Name', 'Folder Name') { $inTable = $true }
+            if ($inTable) { , $cells }
         }
     }
 }
@@ -271,6 +275,26 @@ Describe 'Find-DuplicateFile' {
         (Find-DuplicateFile -File $scanned).FileName | Should -BeExactly 'Photo.JPG'
     }
 
+    It 'includes files of 0 bytes by default' {
+        $root = Add-TestRoot
+        $files = @(
+            Add-TestFile $root 'a/empty.txt' -Content ''
+            Add-TestFile $root 'b/empty.txt' -Content ''
+        )
+        @(Find-DuplicateFile -File $files).Count | Should -Be 1
+    }
+
+    It 'leaves files of 0 bytes out with -IgnoreEmptyFiles' {
+        $root = Add-TestRoot
+        $files = @(
+            Add-TestFile $root 'a/empty.txt' -Content ''
+            Add-TestFile $root 'b/empty.txt' -Content ''
+            Add-TestFile $root 'a/full.txt'
+            Add-TestFile $root 'b/full.txt'
+        )
+        (Find-DuplicateFile -File $files -IgnoreEmptyFiles).FileName | Should -Be @('full.txt')
+    }
+
     It 'returns nothing for an empty list' {
         @(Find-DuplicateFile -File @()).Count | Should -Be 0
     }
@@ -479,6 +503,25 @@ Describe 'Export-DuplicateReport' {
         finally { $zip.Dispose() }
     }
 
+    It 'writes the matching rules above the table' {
+        $out = Join-Path (Add-TestRoot) 'report.xlsx'
+        Export-DuplicateReport -DuplicateSet $script:Sets -Path $out
+
+        $all = @(Read-Worksheet $out -IncludeRules)
+        $all[0][0] | Should -Be 'Duplicate files'
+        $all[1][0] | Should -BeLike 'A file is listed when another file has ALL of*MD5*'
+        $all[4][0] | Should -Be 'File Name' -Because 'rules, then one blank row (not written), then the table'
+
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($out)
+        try {
+            $reader = [System.IO.StreamReader]::new($zip.GetEntry('xl/worksheets/sheet1.xml').Open())
+            try { $sheetXml = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        }
+        finally { $zip.Dispose() }
+        $sheetXml | Should -Match '<pane ySplit="6" topLeftCell="A7"'
+        $sheetXml | Should -Match '<autoFilter ref="A6:H8"'
+    }
+
     It 'writes a header-only workbook when there are no duplicates' {
         $out = Join-Path (Add-TestRoot) 'empty.xlsx'
         Export-DuplicateReport -DuplicateSet @() -Path $out
@@ -606,6 +649,15 @@ Describe 'Import-DuplicateReport' {
         $path = Join-Path (Add-TestRoot) 'gap.xlsx'
         Write-ExcelSavedWorkbook -Path $path -Rows @(, @('File Name', $null, 'Size (bytes)', 'MD5', 'Copies'))
         { Import-DuplicateReport -Path $path } | Should -Throw '*is not a duplicates report*'
+    }
+
+    It 'reports a blank number cell as a clear error' {
+        $path = Join-Path (Add-TestRoot) 'blank.xlsx'
+        Write-ExcelSavedWorkbook -Path $path -Rows @(
+            , @('File Name', 'Last Modified', 'Size (bytes)', 'MD5', 'Copies', 'Location 1', 'Location 2')
+            , @('x.txt', $null, 10, 'CCCC', 2, 'C:\a', 'C:\b')
+        )
+        { Import-DuplicateReport -Path $path } | Should -Throw '*could not be read as a duplicates report*'
     }
 
     It 'rejects a report containing a DTD' {
@@ -792,7 +844,9 @@ Describe 'Find-DuplicateFolder' {
         function Find-InTree {
             param([string] $Root, [hashtable] $Options = @{})
             $scan = Get-FolderScan $Root
-            @(Find-DuplicateFolder -File $scan.Files -Folder $scan.Folders @Options)
+            # ", @(...)": returned bare, a single result would be unrolled into the set
+            # object itself, whose Count property is its number of copies.
+            , @(Find-DuplicateFolder -File $scan.Files -Folder $scan.Folders @Options)
         }
     }
 
@@ -880,6 +934,30 @@ Describe 'Find-DuplicateFolder' {
         @(Find-DuplicateFolder -File $scan.Files -Folder $scan.Folders).Count | Should -Be 0
     }
 
+    It 'does not report a folder that holds the excluded report' {
+        $root = Add-TestRoot
+        Add-PhotoFolder $root 'one/Photos'
+        Add-PhotoFolder $root 'two/Photos'
+        $report = Add-TestFile $root 'one/Photos/dupes.xlsx'
+        $info = [System.Collections.Generic.List[object]]::new()
+        $files = @(Get-FileInventory -Path $root -ExcludeFile $report.FullName -FolderInfo $info)
+
+        # Without the report the two trees look identical, but one really holds an extra file.
+        (Find-DuplicateFolder -File $files -Folder $info.ToArray()).FolderName | Should -Be @('sub')
+    }
+
+    It 'does not report a folder that holds a folder link' {
+        $root = Add-TestRoot
+        Add-PhotoFolder $root 'one/Photos'
+        Add-PhotoFolder $root 'two/Photos'
+        $link = Join-Path $root 'one/Photos/link'
+        try { $null = New-Item -ItemType SymbolicLink -Path $link -Target (Join-Path $root 'two') -ErrorAction Stop }
+        catch { Set-ItResult -Skipped -Because "symbolic links cannot be created here: $_"; return }
+
+        try { (Find-InTree $root).FolderName | Should -Be @('sub') }
+        finally { [System.IO.Directory]::Delete($link) }
+    }
+
     It 'does not read files again that the file scan already hashed' {
         $root = Add-TestRoot
         Add-PhotoFolder $root 'one/Photos'
@@ -902,7 +980,9 @@ Describe 'Find-DuplicateFolder' {
         Add-PhotoFolder $root 'cloud/Photos'
         Mock -ModuleName DuplicateFinder Test-CloudOnlyFile { "$($File.FullName)" -like '*cloud*' }
 
-        $result = Find-InTree $root @{ SkipCloudOnly = $true; WarningVariable = 'warnings'; WarningAction = 'SilentlyContinue' }
+        # Called directly: -WarningVariable creates the variable in the caller's scope.
+        $scan = Get-FolderScan $root
+        $result = @(Find-DuplicateFolder -File $scan.Files -Folder $scan.Folders -SkipCloudOnly -WarningVariable warnings -WarningAction SilentlyContinue)
 
         $result.Count | Should -Be 1
         $result[0].Folders | Should -Not -BeLike '*cloud*'
@@ -919,6 +999,88 @@ Describe 'Find-DuplicateFolder' {
         $result = Find-InTree $root @{ ThrottleLimit = 4 }
 
         $result.FolderName | Should -Be @('Other', 'Photos')
+    }
+}
+
+Describe 'Unicode names' {
+    BeforeAll {
+        # Built from code points so this file stays ASCII (Windows PowerShell 5.1 reads
+        # BOM-less scripts in the ANSI code page).
+        function ConvertFrom-CodePoint { param([int[]] $CodePoint) -join ($CodePoint | ForEach-Object { [char]::ConvertFromUtf32($_) }) }
+        $script:Names = @{
+            Japanese = ConvertFrom-CodePoint 0x65E5, 0x672C, 0x8A9E
+            Arabic   = ConvertFrom-CodePoint 0x0645, 0x0644, 0x0641
+            Cyrillic = ConvertFrom-CodePoint 0x0444, 0x0430, 0x0439, 0x043B
+            Emoji    = ConvertFrom-CodePoint 0x1F600, 0x1F4F7
+        }
+        $script:Composed   = ConvertFrom-CodePoint 0x63, 0x61, 0x66, 0xE9           # cafe with e-acute as one character
+        $script:Decomposed = ConvertFrom-CodePoint 0x63, 0x61, 0x66, 0x65, 0x301    # e followed by a combining accent
+    }
+
+    It 'finds, saves, reads back and validates duplicates named in <_>' -ForEach @('Japanese', 'Arabic', 'Cyrillic', 'Emoji') {
+        $name = $script:Names[$_]
+        $root = Add-TestRoot
+        $null = Add-TestFile $root "$name/$name.txt"
+        $null = Add-TestFile $root "copy/$name.txt"
+        $report = Join-Path (Add-TestRoot) "$name.xlsx"
+
+        $found = @(Find-DuplicateFile -File @(Get-FileInventory -Path $root))
+        Export-DuplicateReport -DuplicateSet $found -Path $report
+        $read = @(Import-DuplicateReport -Path $report)
+        $result = Update-DuplicateReport -Path $report
+
+        $found.Count | Should -Be 1
+        $read[0].FileName | Should -BeExactly "$name.txt"
+        $read[0].Folders | Should -Contain ([System.IO.Path]::GetFullPath((Join-Path $root $name)))
+        $result.CopiesRemoved | Should -Be 0
+    }
+
+    It 'matches names stored in different Unicode forms' {
+        $root = Add-TestRoot
+        $files = @(
+            Add-TestFile $root "a/$($script:Composed).txt"
+            Add-TestFile $root "b/$($script:Decomposed).txt"
+        )
+        if ($files[0].Name -eq $files[1].Name) { Set-ItResult -Skipped -Because 'this file system normalises names itself'; return }
+
+        @(Find-DuplicateFile -File $files).Count | Should -Be 1
+    }
+
+    It 'keeps a copy whose name is stored in another Unicode form when validating' {
+        $root = Add-TestRoot
+        $null = Add-TestFile $root "a/$($script:Composed).txt"
+        $second = Add-TestFile $root "b/$($script:Decomposed).txt"
+        if ($second.Name -eq "$($script:Composed).txt") { Set-ItResult -Skipped -Because 'this file system normalises names itself'; return }
+        $report = "$root.xlsx"
+        Export-DuplicateReport -DuplicateSet @(Find-DuplicateFile -File @(Get-FileInventory -Path $root)) -Path $report
+
+        (Update-DuplicateReport -Path $report).CopiesRemoved | Should -Be 0
+    }
+
+    It 'finds duplicate folders with Unicode names' {
+        $root = Add-TestRoot
+        foreach ($parent in 'one', 'two') {
+            $null = Add-TestFile $root "$parent/$($script:Names.Japanese)/$($script:Names.Emoji).jpg"
+        }
+        $info = [System.Collections.Generic.List[object]]::new()
+        $files = @(Get-FileInventory -Path $root -FolderInfo $info)
+
+        $result = @(Find-DuplicateFolder -File $files -Folder $info.ToArray())
+
+        $result.Count | Should -Be 1
+        $result[0].FolderName | Should -BeExactly $script:Names.Japanese
+    }
+
+    It 'handles Unicode names end to end through the script' {
+        $root = Add-TestRoot
+        foreach ($parent in 'one', 'two') { $null = Add-TestFile $root "$parent/$($script:Names.Arabic)/$($script:Names.Cyrillic).txt" }
+        $out = Join-Path (Add-TestRoot) "$($script:Names.Emoji).xlsx"
+
+        $result = @(& $script:ScriptPath -Path $root -OutputFile $out -IncludeFolders -PassThru 6>$null)
+
+        $out | Should -Exist
+        @($result | Where-Object { $_.PSObject.Properties['FileName'] }).FileName | Should -Be "$($script:Names.Cyrillic).txt"
+        @(Import-DuplicateFolderReport -Path $out).FolderName | Should -Be $script:Names.Arabic
     }
 }
 
@@ -977,7 +1139,7 @@ Describe 'Validating duplicate folders' {
             $path
         }
 
-        function Add-ThreeCopies {
+        function Add-CopiedTree {
             param([string] $Root)
             foreach ($folder in 'one', 'two', 'three') {
                 $null = Add-TestFile $Root "$folder/Photos/a.jpg" -Content 'a'
@@ -988,7 +1150,7 @@ Describe 'Validating duplicate folders' {
 
     It 'removes a folder copy that no longer exists' {
         $root = Add-TestRoot
-        Add-ThreeCopies $root
+        Add-CopiedTree $root
         $report = Export-FolderReport $root
         Remove-Item -LiteralPath (Join-Path $root 'two/Photos') -Recurse
 
@@ -1002,7 +1164,7 @@ Describe 'Validating duplicate folders' {
 
     It 'removes a folder copy whose contents changed' {
         $root = Add-TestRoot
-        Add-ThreeCopies $root
+        Add-CopiedTree $root
         $report = Export-FolderReport $root
         $null = Add-TestFile $root 'three/Photos/sub/new.jpg'
 
@@ -1014,7 +1176,7 @@ Describe 'Validating duplicate folders' {
 
     It 'keeps an empty folder sheet when every folder row is removed' {
         $root = Add-TestRoot
-        Add-ThreeCopies $root
+        Add-CopiedTree $root
         $report = Export-FolderReport $root
         foreach ($folder in 'one', 'two') { Remove-Item -LiteralPath (Join-Path $root "$folder/Photos") -Recurse }
 
@@ -1028,7 +1190,7 @@ Describe 'Validating duplicate folders' {
 
     It 'keeps folder copies that cannot be reached' {
         $root = Add-TestRoot
-        Add-ThreeCopies $root
+        Add-CopiedTree $root
         $report = Export-FolderReport $root
         Mock -ModuleName DuplicateFinder Test-DuplicateFolderCopy { 'Unavailable' }
 
@@ -1040,7 +1202,7 @@ Describe 'Validating duplicate folders' {
 
     It 'leaves reports without a folder sheet without one' {
         $root = Add-TestRoot
-        Add-ThreeCopies $root
+        Add-CopiedTree $root
         $report = "$root.xlsx"
         Export-DuplicateReport -DuplicateSet @(Find-DuplicateFile -File @(Get-FileInventory -Path $root)) -Path $report
         Remove-Item -LiteralPath (Join-Path $root 'one/Photos/a.jpg')
@@ -1136,6 +1298,15 @@ Describe 'Find-Duplicates.ps1' {
             Where-Object { $_ -is [System.Management.Automation.VerboseRecord] }
 
         $verbose.Message | Should -Contain "Scanning $(Join-Path $script:Root 'data/backup' | ForEach-Object { [System.IO.Path]::GetFullPath($_) })"
+    }
+
+    It 'leaves files of 0 bytes out with -IgnoreEmptyFiles' {
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b') { $null = Add-TestFile $root "$folder/empty.txt" -Content '' }
+        $out = Join-Path (Add-TestRoot) 'empty.xlsx'
+
+        @(& $script:ScriptPath -Path $root -OutputFile $out -PassThru 6>$null).Count | Should -Be 1
+        @(& $script:ScriptPath -Path $root -OutputFile $out -IgnoreEmptyFiles -PassThru 6>$null).Count | Should -Be 0
     }
 
     It 'saves no report with -WhatIf' {

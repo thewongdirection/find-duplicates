@@ -13,7 +13,9 @@
 
     MD5 is only calculated for files whose name and saved date already match
     another file (and whose size matches too), so most files are never read.
+    Files of 0 bytes are included unless -IgnoreEmptyFiles is used.
 
+    Each sheet of the report starts with the matching rules, then the table.
     The report has one row per duplicated file with the columns
     File Name | Last Modified | Size (bytes) | MD5 | Copies | Location 1 | Location 2 | ...
     where each "Location" column holds the full folder path of one copy.
@@ -53,6 +55,10 @@
 .PARAMETER ThrottleLimit
     How many files to hash at the same time (1-64, default 1). Try 4-8 for SSDs,
     network shares and cloud folders; keep 1 for a single spinning hard disk.
+
+.PARAMETER IgnoreEmptyFiles
+    Leave files of 0 bytes out of the duplicate files (they all have the same
+    contents). Off by default. Duplicate folders still compare every file.
 
 .PARAMETER IncludeFolders
     Also find duplicate folders and save them on the "Duplicate Folders" sheet.
@@ -99,6 +105,9 @@ param(
     [Parameter(ParameterSetName = 'Scan')]
     [ValidateRange(1, 64)]
     [int] $ThrottleLimit = 1,
+
+    [Parameter(ParameterSetName = 'Scan')]
+    [switch] $IgnoreEmptyFiles,
 
     [Parameter(ParameterSetName = 'Scan')]
     [switch] $IncludeFolders,
@@ -166,7 +175,7 @@ Write-Host "Found $($files.Count) files. Checking for duplicates ..."
 $md5Cache = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
 $matchOptions = @{ SkipCloudOnly = $SkipCloudOnly; ThrottleLimit = $ThrottleLimit; Md5Cache = $md5Cache } + $verbose
 
-$duplicates = @(Find-DuplicateFile -File $files @matchOptions)
+$duplicates = @(Find-DuplicateFile -File $files -IgnoreEmptyFiles:$IgnoreEmptyFiles @matchOptions)
 $copies = 0
 foreach ($set in $duplicates) { $copies += $set.Count }
 Write-Host "Found $($duplicates.Count) duplicated files ($copies copies in total)."

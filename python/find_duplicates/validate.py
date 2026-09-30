@@ -9,13 +9,13 @@ from __future__ import annotations
 import logging
 import os
 import stat
-import sys
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Sequence, TypeVar
 
 from .folders import DuplicateFolderSet
-from .matcher import DuplicateSet, ordinal_ignore_case
+from .matcher import DuplicateSet
+from .names import name_key
 from .scanner import FolderRecord, iter_files
 from .xlsx import export_duplicate_report, read_duplicate_workbook
 
@@ -71,7 +71,7 @@ def root_reachable(folder: str, cache: Optional[RootCache] = None) -> bool:
     root = _path_root(folder)
     if not root:
         return True
-    key = ordinal_ignore_case(root)
+    key = name_key(root)
     if cache is not None and key in cache:
         return cache[key]
     reachable = os.path.isdir(root)
@@ -80,16 +80,15 @@ def root_reachable(folder: str, cache: Optional[RootCache] = None) -> bool:
     return reachable
 
 
-def _find_ignoring_case(folder: str, file_name: str) -> Optional[str]:
-    # Only needed on case-sensitive file systems (Linux, some macOS volumes); on Windows
-    # the plain lookup already ignores case, so the folder is not listed.
-    if sys.platform == "win32":
-        return None
-    wanted = ordinal_ignore_case(file_name)
+def _find_by_name_key(folder: str, file_name: str) -> Optional[str]:
+    # The file whose name matches ignoring case and Unicode form. Used when the plain
+    # lookup fails: case-sensitive file systems (Linux), and names stored in another
+    # Unicode form (Windows and Linux keep both forms apart).
+    wanted = name_key(file_name)
     try:
         with os.scandir(folder) as entries:
             for entry in entries:
-                if entry.is_file() and ordinal_ignore_case(entry.name) == wanted:
+                if entry.is_file() and name_key(entry.name) == wanted:
                     return entry.path
     except (FileNotFoundError, NotADirectoryError):
         pass
@@ -108,7 +107,7 @@ def check_copy(
             return UNAVAILABLE
         path: Optional[str] = os.path.join(folder, file_name)
         if not os.path.isfile(path):
-            path = _find_ignoring_case(folder, file_name)
+            path = _find_by_name_key(folder, file_name)
         if path is None:
             return MISSING
         info = os.stat(path)

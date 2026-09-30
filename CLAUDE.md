@@ -9,10 +9,11 @@ that must behave identically:
 | Command line        | `Find-Duplicates.ps1`                | `python/find_duplicates/cli.py`        |
 | Folder scanning     | `Get-FileInventory`, `Test-FolderLink`, `Test-CloudOnlyFile`, `Get-SortedByName` | `python/find_duplicates/scanner.py` |
 | Duplicate matching  | `Find-DuplicateFile`, `Get-FileMd5`, `Get-FileMd5Map`, `Get-SortedFolder` | `python/find_duplicates/matcher.py` |
+| Name comparison     | `ConvertTo-NameKey`, .NET ordinal comparers | `python/find_duplicates/names.py` |
 | Excel output/input  | `Export-DuplicateReport`, `Import-DuplicateReport` and helpers | `python/find_duplicates/xlsx.py` |
 | Duplicate folders   | `Find-DuplicateFolder`, `Get-FolderTree`, `Get-FolderSignature` | `python/find_duplicates/folders.py` |
 | Validation          | `Update-DuplicateReport`, `Invoke-CopyCheck`, `Test-DuplicateCopy`, `Test-DuplicateFolderCopy`, `Test-PathRootReachable` | `python/find_duplicates/validate.py` |
-| Tests               | `tests/DuplicateFinder.Tests.ps1`    | `python/tests/test_find_duplicates.py`, `python/tests/test_folders.py` |
+| Tests               | `tests/DuplicateFinder.Tests.ps1`    | `python/tests/test_find_duplicates.py`, `test_folders.py`, `test_unicode.py` |
 | Cross-language test | —                                    | `python/tests/test_parity.py`          |
 
 All PowerShell functions live in `src/DuplicateFinder.psm1`.
@@ -32,7 +33,7 @@ Every new feature, behaviour change or bug fix is done in this order:
 
 Command-line options map one to one: `-Path` ↔ `path`,
 `-OutputFile` ↔ `output` / `-o`, `-ThrottleLimit` ↔ `-j` / `--throttle-limit`,
-`-IncludeFolders` ↔ `--folders`,
+`-IncludeFolders` ↔ `--folders`, `-IgnoreEmptyFiles` ↔ `--ignore-empty-files`,
 `-SkipCloudOnly` ↔ `--skip-cloud-only`, `-Validate` ↔ `--validate`,
 `-WhatIf` ↔ `--dry-run`, `-Verbose` ↔ `--verbose`. `-PassThru` corresponds to
 calling `find_duplicate_files()` / `validate_report()` from Python. Console
@@ -42,6 +43,15 @@ Keep orderings identical: folders and files are visited in ordinal name order,
 locations are sorted ordinal-ignore-case, rows by file name
 (ordinal-ignore-case), saved date, then MD5. Excel dates are truncated to the
 millisecond when written and rounded to it when read, as .NET does.
+
+Names are matched in NFC form, ignoring case (`ConvertTo-NameKey` / `name_key`),
+and ordered by UTF-16 code units (`sort_key`), which is how .NET's ordinal
+comparers order characters beyond U+FFFF. The rules text written above each
+table (`$script:FileRules` / `FILE_RULES`, `$script:FolderRules` / `FOLDER_RULES`)
+must be identical in both languages; the parity test compares it.
+
+PowerShell source files must stay ASCII: Windows PowerShell 5.1 reads BOM-less
+files in the ANSI code page. Build non-ASCII test data from code points.
 
 PowerShell pitfalls this code base has hit: never assign a collection with
 `$x = if (...) { ... }` (an empty or one-item array is unrolled); return

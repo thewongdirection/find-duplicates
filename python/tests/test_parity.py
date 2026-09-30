@@ -24,6 +24,7 @@ from xml.etree import ElementTree
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from find_duplicates import cli  # noqa: E402
+from find_duplicates.xlsx import FILE_RULES  # noqa: E402
 from tests.helpers import SAVED, add_file, read_worksheet  # noqa: E402
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -55,6 +56,16 @@ TREE = [
     ("y/Holiday/p1.jpg", "h1", 0),
     ("y/Holiday/inner/p2.jpg", "h2", 0),
     ("z/inner/p2.jpg", "h2", 0),            # a third copy of "inner", outside Holiday
+    ("x/Holiday/deep/d.jpg", "d", 0),       # "deep" only exists inside Holiday: implied, not listed
+    ("y/Holiday/deep/d.jpg", "d", 0),
+    # Unicode: locations ordered by UTF-16 (full-width A sorts after an emoji there, before
+    # it by code point), one name in two Unicode forms, and folders named in Japanese.
+    (chr(0xFF21) + "/uni.txt", "u", 0),
+    (chr(0x1F600) + "/uni.txt", "u", 0),
+    ("n1/caf" + chr(0xE9) + ".txt", "cafe", 0),
+    ("n2/cafe" + chr(0x301) + ".txt", "cafe", 0),
+    ("u1/" + chr(0x65E5) + chr(0x672C) + "/p.jpg", "jp", 0),
+    ("u2/" + chr(0x65E5) + chr(0x672C) + "/p.jpg", "jp", 0),
 ]
 if os.name != "nt":  # characters Windows does not allow in file names
     TREE += [("a/less <than>.txt", "lt", 0), ("b/less <than>.txt", "lt", 0)]
@@ -93,12 +104,14 @@ class ParityTests(unittest.TestCase):
             self.assertEqual(cli.main(list(args)), 0)
 
     def assert_same_report(self, ps_report, py_report):
-        self.assertEqual(read_worksheet(py_report, FOLDER_SHEET), read_worksheet(ps_report, FOLDER_SHEET))
-        ps_rows, py_rows = read_worksheet(ps_report), read_worksheet(py_report)
+        self.assertEqual(read_worksheet(py_report, FOLDER_SHEET, include_rules=True),
+                         read_worksheet(ps_report, FOLDER_SHEET, include_rules=True))
+        ps_rows = read_worksheet(ps_report, include_rules=True)
+        py_rows = read_worksheet(py_report, include_rules=True)
         self.assertEqual(len(py_rows), len(ps_rows))
         for number, (ps_row, py_row) in enumerate(zip(ps_rows, py_rows), start=1):
             with self.subTest(row=number):
-                if number > 1:
+                if number > len(FILE_RULES) + 1:  # data rows, below the rules and the header
                     # Both are the same instant; allow float formatting differences.
                     self.assertTrue(math.isclose(float(ps_row[DATE_COLUMN]), float(py_row[DATE_COLUMN]), abs_tol=1e-8))
                     ps_row, py_row = _without(ps_row, DATE_COLUMN), _without(py_row, DATE_COLUMN)
@@ -112,6 +125,7 @@ class ParityTests(unittest.TestCase):
         folder_names = [row[0] for row in read_worksheet(self.report("ps.xlsx"), FOLDER_SHEET)[1:]]
         self.assertIn("Holiday", folder_names)
         self.assertIn("inner", folder_names, "the nested set with a copy outside Holiday is kept")
+        self.assertNotIn("deep", folder_names, "a nested set that only exists inside Holiday is left out")
         self.assert_same_report(self.report("ps.xlsx"), self.report("py.xlsx"))
 
     def test_parallel_hashing_reports_match(self):

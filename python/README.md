@@ -30,7 +30,7 @@ Built-in help: `python -m find_duplicates --help`.
 ## Command reference
 
 ```text
-python -m find_duplicates [path] [output] [-o FILE] [-j N] [--folders] [--skip-cloud-only] [--dry-run] [-v]
+python -m find_duplicates [path] [output] [-o FILE] [-j N] [--folders] [--ignore-empty-files] [--skip-cloud-only] [--dry-run] [-v]
 python -m find_duplicates --validate [report] [--dry-run] [-v]
 ```
 
@@ -42,6 +42,7 @@ python -m find_duplicates --validate [report] [--dry-run] [-v]
 | `output`, `-o FILE`, `--output-file FILE` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced. |
 | `-j N`, `--throttle-limit N` | `1` | How many files to hash at the same time (1-64). Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk. |
 | `--folders` | off | Also find [duplicate folders](../README.md#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
+| `--ignore-empty-files` | off | Leave files of 0 bytes out of the duplicate files. |
 | `--skip-cloud-only` | off | Never download online-only cloud files to hash them. Duplicates among such files are then not reported. |
 | `--dry-run` | off | Scan and report the totals, but do not save the report. |
 | `-v`, `--verbose` | off | Print every folder as it is scanned, and every link or online-only file skipped. |
@@ -62,6 +63,9 @@ python -m find_duplicates \\nas\photos -j 8
 
 # Also find duplicate folders (second sheet)
 python -m find_duplicates D:\Backups --folders
+
+# Leave out empty (0-byte) files
+python -m find_duplicates D:\Photos --ignore-empty-files
 
 # OneDrive without downloading online-only files
 python -m find_duplicates "%OneDrive%" --skip-cloud-only
@@ -88,7 +92,7 @@ drive or share that cannot be reached are kept. See the
 | `--dry-run` | off | Report what would be removed, but do not change the report. |
 | `-v`, `--verbose` | off | Print every copy that is removed and why. |
 
-`--skip-cloud-only`, `--throttle-limit` and `--folders` only apply to a scan.
+`--skip-cloud-only`, `--throttle-limit`, `--folders` and `--ignore-empty-files` only apply to a scan.
 Duplicate folders, when the report has them, are re-checked too.
 
 ```sh
@@ -132,6 +136,7 @@ result = validate_report("duplicates.xlsx", dry_run=True)        # summary: remo
 | `-OutputFile` | `output` (second argument) or `-o` |
 | `-ThrottleLimit N` | `-j N` / `--throttle-limit N` |
 | `-IncludeFolders` | `--folders` |
+| `-IgnoreEmptyFiles` | `--ignore-empty-files` |
 | `-SkipCloudOnly` | `--skip-cloud-only` |
 | `-Validate` | `--validate` |
 | `-WhatIf` | `--dry-run` |
@@ -144,6 +149,14 @@ result = validate_report("duplicates.xlsx", dry_run=True)        # summary: remo
 | `Import-DuplicateReport` | `read_duplicate_report()` |
 | `Import-DuplicateFolderReport` | `read_duplicate_folder_report()` |
 | `Update-DuplicateReport` | `validate_report()` |
+
+## Unicode
+
+File and folder names in any language work the same as in PowerShell: they are
+compared ignoring case and Unicode form (NFC), and sorted in the same (UTF-16)
+order as .NET, so both tools produce identical reports. If the console cannot
+show a character (for example output redirected to a file in a Windows code
+page), it is printed as an escape such as `\u65e5` instead of stopping the run.
 
 ## Running the tests
 

@@ -30,7 +30,9 @@ The tool comes in two versions with the same features and the same output: a
 | Parallel hashing | `-ThrottleLimit N` hashes up to N files at the same time (1-64). |
 | Every copy recorded | One row per duplicated file, one column per copy, with the full folder path of each. |
 | Duplicate folders | `-IncludeFolders` also finds whole folders with the same name and identical contents (every file and sub folder), on a second sheet. |
-| Excel output without Excel | Writes a real `.xlsx` (frozen, filterable header; real dates). Excel does not need to be installed. |
+| Excel output without Excel | Writes a real `.xlsx`: each sheet starts with the matching rules in plain words, then a table with a frozen, filterable header and real dates. Excel does not need to be installed. |
+| Empty files optional | `-IgnoreEmptyFiles` leaves files of 0 bytes out of the file duplicates. |
+| Any language | File and folder names in any script (Chinese, Arabic, Cyrillic, emoji ...) are matched and stored correctly; a name typed on a Mac matches the same name saved on Windows. |
 | Validate without rescanning | `-Validate` re-checks every copy listed in an existing report (files with a quick lookup, folders by re-listing them, never reading contents) and removes those that are gone or changed. |
 | Network shares | UNC paths (`\\server\share`) and mapped drives. Unreachable folders are skipped with a warning; an unreachable share never wipes report entries. |
 | Cloud drives | OneDrive, Google Drive, Dropbox, iCloud, Box. Online-only files are downloaded only if they must be hashed, or never with `-SkipCloudOnly`. |
@@ -53,6 +55,16 @@ saved date; groups are split by size (files of different sizes cannot have the
 same MD5); only files left in a group of two or more are read and hashed. A file
 can have any number of duplicates, in any folders.
 
+Files of 0 bytes all have the same contents, so every same-named empty file
+with the same saved date is a duplicate. They are included by default; add
+`-IgnoreEmptyFiles` to leave them out. (Duplicate folders always compare every
+file, empty ones included.)
+
+Names are compared the way people read them: ignoring upper/lower case, and
+ignoring how accented letters are encoded. macOS often stores "é" as "e" plus a
+separate accent, where Windows stores one character; both count as the same
+name. Otherwise names must match exactly, in any language or script.
+
 ## Duplicate folders
 
 With `-IncludeFolders`, whole folders are compared too. Two folders are
@@ -67,14 +79,16 @@ duplicates when:
 Their total sizes therefore match too. The checks again run cheapest first:
 folder trees are compared by names, sizes and saved dates from the scan
 itself, and only files inside folders that still match are hashed. Hashes
-already calculated for the file duplicates are reused, so no file is read twice.
+already calculated for the file duplicates are reused, so files are not read again.
 
 - **Top-most only.** When `D:\Photos` and `E:\Backup\Photos` are duplicates,
   their matching sub folders (`2024`, `2024\Jan`, ...) are not listed again. A
   nested set *is* listed when at least one of its copies is outside a
   duplicate folder (e.g. a third copy of `2024` somewhere else).
-- A folder with an unreadable sub folder, or (with `-SkipCloudOnly`) an
-  online-only file, is never reported: a match must be proven.
+- A folder with an unreadable sub folder, a folder link (symlink or
+  junction, which is not followed), the report file itself, or (with
+  `-SkipCloudOnly`) an online-only file is never reported: a match must be
+  proven.
 - Folders with no files anywhere inside them are not reported.
 - The file rows are unaffected: files inside duplicate folders are still
   listed on the *Duplicates* sheet.
@@ -92,7 +106,7 @@ Here each `Location` is the full path of the duplicate folder itself.
 
 ```text
 Find-Duplicates.ps1 [[-Path] <folder>] [[-OutputFile] <report>] [-ThrottleLimit <1-64>]
-                    [-IncludeFolders] [-SkipCloudOnly] [-PassThru] [-WhatIf] [-Verbose]
+                    [-IncludeFolders] [-IgnoreEmptyFiles] [-SkipCloudOnly] [-PassThru] [-WhatIf] [-Verbose]
 
 Find-Duplicates.ps1 -Validate [[-OutputFile] <report>] [-PassThru] [-WhatIf] [-Verbose]
 ```
@@ -110,6 +124,7 @@ If Windows blocks the script, run it as
 | `-OutputFile <report>` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced. Also the second positional argument. |
 | `-ThrottleLimit <1-64>` | `1` | How many files to hash at the same time. See [Performance](#performance). |
 | `-IncludeFolders` | off | Also find [duplicate folders](#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
+| `-IgnoreEmptyFiles` | off | Leave files of 0 bytes out of the duplicate files. |
 | `-SkipCloudOnly` | off | Never download online-only cloud files to hash them. Duplicates among such files are then not reported. |
 | `-PassThru` | off | Also return the duplicates as PowerShell objects (for piping or scripting): file sets, then folder sets (which have a `FolderName` property). |
 | `-WhatIf` | off | Scan and report the totals, but do not save the report. |
@@ -132,6 +147,9 @@ If Windows blocks the script, run it as
 
 # Also find duplicate folders (second sheet)
 .\Find-Duplicates.ps1 -Path D:\Backups -IncludeFolders
+
+# Leave out empty (0-byte) files
+.\Find-Duplicates.ps1 -Path D:\Photos -IgnoreEmptyFiles
 
 # OneDrive without downloading online-only files
 .\Find-Duplicates.ps1 -Path "$env:OneDrive" -SkipCloudOnly
@@ -203,7 +221,11 @@ formatting is dropped when it is rewritten.
 
 ## The report
 
-One row per duplicated file, one column per copy:
+Each sheet starts with the rules used to decide on matches, written out in
+plain words (rows 1-4), then a blank row, then the table. The rules and the
+table's header row stay visible while you scroll.
+
+Below the rules: one row per duplicated file, one column per copy:
 
 | File Name  | Last Modified       | Size (bytes) | MD5     | Copies | Location 1     | Location 2        | Location 3 |
 |------------|---------------------|--------------|---------|--------|----------------|-------------------|------------|
@@ -273,8 +295,8 @@ Export-DuplicateReport -DuplicateSet $dupes -Path .\dupes.xlsx   # write the wor
 # Duplicate folders need the folder records from the scan
 $info    = [System.Collections.Generic.List[object]]::new()
 $files   = Get-FileInventory -Path D:\Photos -FolderInfo $info
-$folders = Find-DuplicateFolder -File $files -Folder $info.ToArray()
-Export-DuplicateReport -DuplicateSet (Find-DuplicateFile -File $files) -FolderSet $folders -Path .\dupes.xlsx
+$folders = @(Find-DuplicateFolder -File $files -Folder $info.ToArray())   # @(): an empty result stays a list
+Export-DuplicateReport -DuplicateSet @(Find-DuplicateFile -File $files) -FolderSet $folders -Path .\dupes.xlsx
 
 $rows   = Import-DuplicateReport -Path .\dupes.xlsx              # read the file rows back
 $frows  = Import-DuplicateFolderReport -Path .\dupes.xlsx        # read the folder rows back

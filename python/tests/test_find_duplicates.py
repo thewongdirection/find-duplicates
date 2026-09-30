@@ -222,6 +222,16 @@ class FindDuplicateFilesTests(TempDirTestCase):
         result = find_duplicate_files(list(iter_files(self.root)))
         self.assertEqual(result[0].file_name, "Photo.JPG")
 
+    def test_includes_files_of_0_bytes_by_default(self):
+        paths = [add_file(self.root, "a/empty.txt", ""), add_file(self.root, "b/empty.txt", "")]
+        self.assertEqual(len(find_duplicate_files(self.records(*paths))), 1)
+
+    def test_leaves_files_of_0_bytes_out_with_ignore_empty_files(self):
+        paths = [add_file(self.root, "a/empty.txt", ""), add_file(self.root, "b/empty.txt", ""),
+                 add_file(self.root, "a/full.txt"), add_file(self.root, "b/full.txt")]
+        result = find_duplicate_files(self.records(*paths), ignore_empty_files=True)
+        self.assertEqual([d.file_name for d in result], ["full.txt"])
+
     def test_returns_nothing_for_an_empty_list(self):
         self.assertEqual(find_duplicate_files([]), [])
 
@@ -320,6 +330,17 @@ class ExportDuplicateReportTests(TempDirTestCase):
         bad = DuplicateSet("f" + chr(0xDC80) + ".txt", datetime(2024, 1, 1), 1, "A", 2, ["/x", "/y"])
         rows = read_worksheet(self.export(sets=[bad]))
         self.assertEqual(rows[1][0], "f" + chr(0xFFFD) + ".txt")
+
+    def test_writes_the_matching_rules_above_the_table(self):
+        path = self.export()
+        rows = read_worksheet(path, include_rules=True)
+        self.assertEqual(rows[0][0], "Duplicate files")
+        self.assertRegex(rows[1][0], "^A file is listed when another file has ALL of.*MD5")
+        self.assertEqual(rows[4][0], "File Name", "rules, then one blank row (not written), then the table")
+        with zipfile.ZipFile(path) as archive:
+            sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        self.assertIn('<pane ySplit="6" topLeftCell="A7"', sheet)
+        self.assertIn('<autoFilter ref="A6:H8"', sheet)
 
     def test_header_only_workbook_when_no_duplicates(self):
         rows = read_worksheet(self.export("empty.xlsx", sets=[]))
@@ -454,6 +475,15 @@ class ReadDuplicateReportTests(TempDirTestCase):
         path = os.path.join(self.root, "gap.xlsx")
         write_excel_saved_workbook(path, [["File Name", None, "Size (bytes)", "MD5", "Copies"]])
         with self.assertRaisesRegex(ValueError, "is not a duplicates report"):
+            read_duplicate_report(path)
+
+    def test_reports_a_blank_number_cell_as_a_clear_error(self):
+        path = os.path.join(self.root, "blank.xlsx")
+        write_excel_saved_workbook(path, [
+            ["File Name", "Last Modified", "Size (bytes)", "MD5", "Copies", "Location 1", "Location 2"],
+            ["x.txt", None, 10, "CCCC", 2, "C:\\a", "C:\\b"],
+        ])
+        with self.assertRaisesRegex(ValueError, "could not be read as a duplicates report"):
             read_duplicate_report(path)
 
     def test_rejects_a_report_containing_a_dtd(self):
@@ -657,6 +687,16 @@ class CliTests(TempDirTestCase):
         code, _ = self.run_cli(self.data, report, "--throttle-limit", "4")
         self.assertEqual(code, 0)
         self.assertEqual(read_duplicate_report(report)[0].count, 3)
+
+    def test_leaves_files_of_0_bytes_out_with_ignore_empty_files(self):
+        root = self.new_dir("empty")
+        for folder in ("a", "b"):
+            add_file(root, f"{folder}/empty.txt", "")
+        report = os.path.join(self.new_dir("work"), "empty.xlsx")
+        self.run_cli(root, report)
+        self.assertEqual(len(read_duplicate_report(report)), 1)
+        self.run_cli(root, report, "--ignore-empty-files")
+        self.assertEqual(read_duplicate_report(report), [])
 
     def test_saves_no_report_with_dry_run(self):
         report = os.path.join(self.new_dir("work"), "dry.xlsx")

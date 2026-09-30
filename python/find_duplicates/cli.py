@@ -27,7 +27,9 @@ SCAN (default): two files are duplicates only when ALL three of these match:
 file name (case-insensitive), saved date (last modified time, to the whole
 second) and MD5 hash of the contents. MD5 is only calculated for files whose
 name and saved date already match another file (and whose size matches too),
-so most files are never read.
+so most files are never read. Files of 0 bytes are included unless
+--ignore-empty-files is used. Each sheet of the report starts with the
+matching rules, then the table.
 
 DUPLICATE FOLDERS (--folders): also finds folders with the same name and
 exactly the same contents: the same tree of file and sub folder names, where
@@ -131,6 +133,12 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         "network shares and cloud folders; keep 1 for a single spinning hard disk.",
     )
     parser.add_argument(
+        "--ignore-empty-files",
+        action="store_true",
+        help="Leave files of 0 bytes out of the duplicate files (they all have the same contents). "
+        "Duplicate folders still compare every file.",
+    )
+    parser.add_argument(
         "--folders", action="store_true", help='Also find duplicate folders and save them on the "Duplicate Folders" sheet.'
     )
     parser.add_argument("--validate", action="store_true", help="Re-check an existing report instead of scanning.")
@@ -141,8 +149,11 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     args = parser.parse_args(argv)
 
     if args.validate:
-        if args.skip_cloud_only or args.throttle_limit != 1 or args.folders:
-            parser.error("--skip-cloud-only, --throttle-limit and --folders only apply to a scan, not to --validate")
+        if args.skip_cloud_only or args.throttle_limit != 1 or args.folders or args.ignore_empty_files:
+            parser.error(
+                "--skip-cloud-only, --throttle-limit, --folders and --ignore-empty-files only apply to a scan, "
+                "not to --validate"
+            )
         if len([value for value in (args.path, args.output, args.output_option) if value]) > 1:
             parser.error("--validate takes a single report")
     return args
@@ -188,7 +199,13 @@ def _validate(report: str, dry_run: bool) -> int:
 
 
 def _scan(
-    folder: str, report: str, skip_cloud_only: bool, throttle_limit: int, include_folders: bool, dry_run: bool
+    folder: str,
+    report: str,
+    skip_cloud_only: bool,
+    throttle_limit: int,
+    include_folders: bool,
+    ignore_empty_files: bool,
+    dry_run: bool,
 ) -> int:
     scan_root = full_path(folder)
     if not os.path.isdir(scan_root):
@@ -217,7 +234,7 @@ def _scan(
         md5_cache=md5_cache,
         on_hash=lambda path, done, total: progress.show(f"Comparing MD5 {done}/{total}  {path}"),
     )
-    duplicates = find_duplicate_files(files, **options)
+    duplicates = find_duplicate_files(files, ignore_empty_files=ignore_empty_files, **options)
     progress.clear()
     copies = sum(dup.count for dup in duplicates)
     print(f"Found {len(duplicates)} duplicated files ({copies} copies in total).")
@@ -238,7 +255,17 @@ def _scan(
     return 0
 
 
+def _safe_console() -> None:
+    # A console or redirected output that cannot show every character (e.g. a Windows
+    # code page) would otherwise crash on the first Unicode file name; escape instead.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="backslashreplace")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    _safe_console()
     args = _parse_args(argv)
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
@@ -255,5 +282,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.skip_cloud_only,
         args.throttle_limit,
         args.folders,
+        args.ignore_empty_files,
         args.dry_run,
     )

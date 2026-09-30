@@ -15,7 +15,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set
 
-from .matcher import HashCallback, NS_PER_SECOND, groups_of_many, md5_map, ordinal_ignore_case
+from .matcher import HashCallback, NS_PER_SECOND, groups_of_many, md5_map
+from .names import name_key, sort_key
 from .scanner import FileRecord, FolderRecord, is_cloud_only
 
 log = logging.getLogger("find_duplicates")
@@ -53,14 +54,16 @@ def _folder_tree(files: Sequence[FileRecord], folders: Sequence[FolderRecord]) -
     """Index a scan: the sub folders and files of every folder, and which were readable."""
     tree = _FolderTree()
     for record in folders:
-        tree.children[record.path] = []
-        tree.files[record.path] = []
-        if record.readable:
-            tree.readable.add(record.path)
-    for record in folders:
-        parent = os.path.dirname(record.path)
-        if parent != record.path and parent in tree.children:
-            tree.children[parent].append(record.path)
+        tree.children.setdefault(record.path, [])
+        tree.files.setdefault(record.path, [])
+    # A folder may be recorded more than once; recorded as not readable anywhere (an
+    # excluded file, a skipped link) means not readable.
+    unreadable = {record.path for record in folders if not record.readable}
+    tree.readable = {path for path in tree.children if path not in unreadable}
+    for path in list(tree.children):
+        parent = os.path.dirname(path)
+        if parent != path and parent in tree.children:
+            tree.children[parent].append(path)
     for record in files:
         if record.folder in tree.files:
             tree.files[record.folder].append(record)
@@ -90,7 +93,7 @@ def _signatures(
         lines = []
         complete = True
         for record in tree.files[folder]:
-            line = f"F|{ordinal_ignore_case(record.name)}|{record.mtime_ns // NS_PER_SECOND}|{record.size}"
+            line = f"F|{name_key(record.name)}|{record.mtime_ns // NS_PER_SECOND}|{record.size}"
             if md5 is not None:
                 if record.path not in md5:
                     complete = False
@@ -104,7 +107,7 @@ def _signatures(
             if child.signature is None:
                 complete = False
                 break
-            lines.append(f"D|{ordinal_ignore_case(os.path.basename(sub))}|{child.signature}")
+            lines.append(f"D|{name_key(os.path.basename(sub))}|{child.signature}")
             info.file_count += child.file_count
             info.folder_count += child.folder_count + 1
             info.size_bytes += child.size_bytes
@@ -115,7 +118,7 @@ def _signatures(
 
 
 def _name_key(path: str, signature: str) -> str:
-    return f"{ordinal_ignore_case(os.path.basename(path))}|{signature}"
+    return f"{name_key(os.path.basename(path))}|{signature}"
 
 
 def find_duplicate_folders(
@@ -130,7 +133,7 @@ def find_duplicate_folders(
 
     Files are only hashed inside folders whose names, sizes and saved dates already
     match. Only the top-most duplicates are reported: a set is left out when every
-    one of its folders sits inside a folder that is itself a reported duplicate.
+    one of its folders sits inside a folder that is itself a duplicate.
     Folders with no files anywhere below them are not reported.
     """
     tree = _folder_tree(files, folders)
@@ -143,12 +146,13 @@ def find_duplicate_folders(
         return []
 
     # Pass 2: hash every file below the candidates (hashes from the file scan are reused).
-    scope: Set[str] = set()
+    # A dict keeps insertion order, so files are hashed in the same order as in PowerShell.
+    scope: Dict[str, None] = {}
     pending = [p for group in candidate_groups for p in group]
     while pending:
         path = pending.pop()
         if path not in scope:
-            scope.add(path)
+            scope[path] = None
             pending.extend(tree.children[path])
 
     to_hash = []
@@ -164,7 +168,7 @@ def find_duplicate_folders(
         log.warning(
             "%d online-only cloud file(s) were not checked; folders containing them are not reported.", skipped
         )
-    full = _signatures(tree, md5_map(to_hash, throttle_limit, on_hash, md5_cache), scope)
+    full = _signatures(tree, md5_map(to_hash, throttle_limit, on_hash, md5_cache), set(scope))
 
     # Group the candidates again, now by contents.
     confirmed = [p for group in candidate_groups for p in group if full[p].signature]
@@ -176,7 +180,7 @@ def find_duplicate_folders(
     for members in sets:
         if all(os.path.dirname(p) in duplicated for p in members):
             continue
-        ordered = sorted(members, key=ordinal_ignore_case)
+        ordered = sorted(members, key=lambda p: sort_key(p, True))
         info = full[ordered[0]]
         results.append(
             DuplicateFolderSet(
@@ -188,5 +192,5 @@ def find_duplicate_folders(
                 folders=ordered,
             )
         )
-    results.sort(key=lambda s: (ordinal_ignore_case(s.folder_name), s.size_bytes, ordinal_ignore_case(s.folders[0])))
+    results.sort(key=lambda s: (sort_key(s.folder_name, True), s.size_bytes, sort_key(s.folders[0], True)))
     return results

@@ -23,8 +23,13 @@ def add_file(root: str, relative: str, content: str = "same content", saved: dat
     return path
 
 
-def read_worksheet(path: str, part: str = "xl/worksheets/sheet1.xml") -> List[List[str]]:
-    """A worksheet written by this tool as a list of rows, each row a list of cell texts."""
+TABLE_HEADERS = ("File Name", "Folder Name")
+
+
+def read_worksheet(path: str, part: str = "xl/worksheets/sheet1.xml", include_rules: bool = False) -> List[List[str]]:
+    """A worksheet written by this tool as a list of rows, each row a list of cell texts:
+    from the table's header row down, or with ``include_rules`` every row including the
+    rules above it."""
     with zipfile.ZipFile(path) as archive:
         root = ElementTree.fromstring(archive.read(part))
     rows = []
@@ -32,6 +37,9 @@ def read_worksheet(path: str, part: str = "xl/worksheets/sheet1.xml") -> List[Li
         cells = []
         for cell in row.findall("s:c", NS):
             text = cell.find("s:is/s:t", NS)
-            cells.append(text.text or "" if text is not None else cell.find("s:v", NS).text)
+            cells.append((text.text or "") if text is not None else cell.find("s:v", NS).text)
         rows.append(cells)
-    return rows
+    if include_rules:
+        return rows
+    start = next(i for i, row in enumerate(rows) if row and row[0] in TABLE_HEADERS)
+    return rows[start:]

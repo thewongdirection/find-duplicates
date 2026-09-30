@@ -40,6 +40,20 @@ $script:FolderColumns      = @(
 $script:FileSheetName   = 'Duplicates'
 $script:FolderSheetName = 'Duplicate Folders'
 
+# The matching rules, written above each table. Shared word for word with the Python port.
+$script:FileRules = @(
+    'Duplicate files'
+    'A file is listed when another file has ALL of: the same name (ignoring upper/lower case), the same saved date (last modified, to the whole second) and the same contents (MD5 hash).'
+    'Each row is one duplicated file. Each Location column is the full path of a folder that holds a copy.'
+    'Files of 0 bytes are included unless the scan used -IgnoreEmptyFiles (Python: --ignore-empty-files).'
+)
+$script:FolderRules = @(
+    'Duplicate folders'
+    'A folder is listed when another folder has ALL of: the same name (ignoring upper/lower case), the same tree of files and sub folders (empty sub folders included), and every file matching the file at the same place in the other folder (same name, saved date and MD5).'
+    'Only the top-most duplicates are listed: a sub folder is listed on its own only when one of its copies is outside a duplicate folder. Folders that contain no files are not listed.'
+    'Each row is one duplicated folder. Each Location column is the full path of one copy.'
+)
+
 # Attributes Windows sets on cloud placeholders (OneDrive "Files On-Demand" and other
 # Cloud Files providers) whose contents are not stored locally. Reading them downloads them.
 $script:CloudOnlyAttributes = 0x1000 -bor 0x40000 -bor 0x400000  # Offline | RecallOnOpen | RecallOnDataAccess
@@ -77,7 +91,10 @@ function Get-FileInventory {
         [string[]] $ExcludeFile = @(),
 
         # When given, receives one record per folder listed: Path and Readable.
-        # Needed to compare folder trees, including empty and unreadable folders.
+        # Needed to compare folder trees, including empty and unreadable folders. A
+        # folder that holds an excluded file, and each folder link that is not followed,
+        # is recorded as not readable: its contents are not fully known, so it can never
+        # be proven identical to another folder.
         [System.Collections.Generic.List[object]] $FolderInfo
     )
 
@@ -122,7 +139,10 @@ function Get-FileInventory {
         if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder.FullName; Readable = $true }) }
 
         foreach ($file in $files) {
-            if ($excluded.Contains($file.FullName)) { continue }
+            if ($excluded.Contains($file.FullName)) {
+                if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder.FullName; Readable = $false }) }
+                continue
+            }
             $fileCount++
             $file
         }
@@ -132,6 +152,7 @@ function Get-FileInventory {
             $sub = $subFolders[$i]
             if (Test-FolderLink -Folder $sub) {
                 Write-Verbose "Not following link '$($sub.FullName)'"
+                if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $sub.FullName; Readable = $false }) }
                 continue
             }
             $pending.Push($sub)
@@ -186,6 +207,19 @@ $script:ComputeMd5 = {
         finally { $stream.Dispose() }
     }
     finally { $md5.Dispose() }
+}
+
+function ConvertTo-NameKey {
+    <#
+        The form in which names are compared: Unicode-normalised (NFC, so "e + accent"
+        as macOS often stores it equals the single character Windows stores) and upper
+        case (so the comparison ignores case). Names that are not valid UTF-16 cannot
+        be normalised and are compared as they are.
+    #>
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Name)
+    try { if (-not $Name.IsNormalized()) { $Name = $Name.Normalize() } }
+    catch [System.ArgumentException] { }
+    $Name.ToUpperInvariant()
 }
 
 function Get-InnermostMessage {
@@ -322,8 +356,13 @@ function Find-DuplicateFile {
         [int] $ThrottleLimit = 1,
 
         # Hashes shared with Find-DuplicateFolder so no file is read twice.
-        [System.Collections.Generic.Dictionary[string, string]] $Md5Cache
+        [System.Collections.Generic.Dictionary[string, string]] $Md5Cache,
+
+        # Leave files of 0 bytes out (they all share one MD5).
+        [switch] $IgnoreEmptyFiles
     )
+
+    if ($IgnoreEmptyFiles) { $File = [System.IO.FileInfo[]] @($File | Where-Object { $_.Length -gt 0 }) }
 
     # Stage 1: name + saved date (UTC, whole second: copies made to network shares or
     # other file systems often lose sub-second precision). The date key is all digits,
@@ -332,7 +371,11 @@ function Find-DuplicateFile {
     $keys = [System.Collections.Generic.List[string]]::new($File.Count)
     foreach ($f in $File) {
         $ticks = $f.LastWriteTimeUtc.Ticks
-        $keys.Add([string] ($ticks - ($ticks % $ticksPerSecond)) + '|' + $f.Name)
+        # Inline rather than ConvertTo-NameKey: this loop runs once per file. The dictionary
+        # in Group-ByKey ignores case; only Unicode normalisation is needed here.
+        $name = $f.Name
+        try { if (-not $name.IsNormalized()) { $name = $name.Normalize() } } catch [System.ArgumentException] { }
+        $keys.Add([string] ($ticks - ($ticks % $ticksPerSecond)) + '|' + $name)
     }
     $nameDateGroups = @(Group-ByKey -InputItems $File -Key $keys.ToArray())
 
@@ -419,14 +462,18 @@ function Get-FolderTree {
     $filesIn  = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[System.IO.FileInfo]]]::new([System.StringComparer]::Ordinal)
     $readable = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 
+    # A folder may be recorded more than once; recorded as not readable anywhere (an
+    # excluded file, a skipped link) means not readable.
+    $unreadable = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     foreach ($record in $Folder) {
         $children[$record.Path] = [System.Collections.Generic.List[string]]::new()
         $filesIn[$record.Path]  = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
-        if ($record.Readable) { $null = $readable.Add($record.Path) }
+        if (-not $record.Readable) { $null = $unreadable.Add($record.Path) }
     }
-    foreach ($record in $Folder) {
-        $parent = [System.IO.Path]::GetDirectoryName($record.Path)
-        if ($parent -and $children.ContainsKey($parent)) { $children[$parent].Add($record.Path) }
+    foreach ($path in @($children.Keys)) {
+        if (-not $unreadable.Contains($path)) { $null = $readable.Add($path) }
+        $parent = [System.IO.Path]::GetDirectoryName($path)
+        if ($parent -and $children.ContainsKey($parent)) { $children[$parent].Add($path) }
     }
     foreach ($f in $File) {
         if ($filesIn.ContainsKey($f.DirectoryName)) { $filesIn[$f.DirectoryName].Add($f) }
@@ -468,7 +515,7 @@ function Get-FolderSignature {
             $complete = $true
             foreach ($f in $Tree.Files[$folder]) {
                 $ticks = $f.LastWriteTimeUtc.Ticks
-                $line = "F|$($f.Name.ToUpperInvariant())|$($ticks - ($ticks % $ticksPerSecond))|$($f.Length)"
+                $line = "F|$(ConvertTo-NameKey $f.Name)|$($ticks - ($ticks % $ticksPerSecond))|$($f.Length)"
                 if ($null -ne $Md5) {
                     if (-not $Md5.ContainsKey($f.FullName)) { $complete = $false; break }
                     $line += "|$($Md5[$f.FullName])"
@@ -480,7 +527,7 @@ function Get-FolderSignature {
             foreach ($sub in $Tree.Children[$folder]) {
                 $child = $result[$sub]
                 if (-not $child.Signature) { $complete = $false; break }
-                $lines.Add("D|$([System.IO.Path]::GetFileName($sub).ToUpperInvariant())|$($child.Signature)")
+                $lines.Add("D|$(ConvertTo-NameKey ([System.IO.Path]::GetFileName($sub)))|$($child.Signature)")
                 $info.FileCount   += $child.FileCount
                 $info.FolderCount += $child.FolderCount + 1
                 $info.SizeBytes   += $child.SizeBytes
@@ -507,7 +554,7 @@ function Find-DuplicateFolder {
         a duplicate by the file rule (name, saved date and MD5). Their total sizes therefore
         match too. Files are only hashed inside folders whose names, sizes and saved dates
         already match. Only the top-most duplicates are reported: a set is left out when
-        every one of its folders sits inside a folder that is itself a reported duplicate.
+        every one of its folders sits inside a folder that is itself a duplicate.
         Folders with no files anywhere below them are not reported.
     .OUTPUTS
         One object per duplicate set: FolderName, FileCount, FolderCount, SizeBytes, Count
@@ -538,7 +585,7 @@ function Find-DuplicateFolder {
         $info = $cheap[$path]
         if ($info.Signature -and $info.FileCount -gt 0) {
             $candidates.Add($path)
-            $keys.Add("$([System.IO.Path]::GetFileName($path).ToUpperInvariant())|$($info.Signature)")
+            $keys.Add("$(ConvertTo-NameKey ([System.IO.Path]::GetFileName($path)))|$($info.Signature)")
         }
     }
     $candidateGroups = @(Group-ByKey -InputItems $candidates.ToArray() -Key $keys.ToArray())
@@ -577,7 +624,7 @@ function Find-DuplicateFolder {
         foreach ($path in $group) {
             if ($full[$path].Signature) {
                 $confirmed.Add($path)
-                $keys.Add("$([System.IO.Path]::GetFileName($path).ToUpperInvariant())|$($full[$path].Signature)")
+                $keys.Add("$(ConvertTo-NameKey ([System.IO.Path]::GetFileName($path)))|$($full[$path].Signature)")
             }
         }
     }
@@ -719,10 +766,14 @@ function ConvertTo-WorksheetData {
     # Lays out one sheet: fixed columns, then as many "Location N" columns as the longest row needs.
     param(
         [Parameter(Mandatory)] [string] $Name,
+        [Parameter(Mandatory)] [string[]] $Rule,
         [Parameter(Mandatory)] [object[]] $Column,
         [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Row,
         [Parameter(Mandatory)] [string] $Noun
     )
+
+    # The rules fill the first rows, then one blank row, then the table's header row.
+    $headerRow = $Rule.Count + 2
 
     $maxCopies = 1
     foreach ($values in $Row) { $maxCopies = [Math]::Max($maxCopies, $values.Count - $Column.Count) }
@@ -731,17 +782,19 @@ function ConvertTo-WorksheetData {
     if ($columnCount -gt $script:ExcelMaxColumns) {
         throw "A $Noun has $maxCopies copies; Excel supports at most $($script:ExcelMaxColumns - $Column.Count) location columns."
     }
-    if ($Row.Count + 1 -gt $script:ExcelMaxRows) {
-        throw "Found $($Row.Count) duplicated $($Noun)s; Excel supports at most $($script:ExcelMaxRows - 1) rows."
+    if ($Row.Count + $headerRow -gt $script:ExcelMaxRows) {
+        throw "Found $($Row.Count) duplicated $($Noun)s; Excel supports at most $($script:ExcelMaxRows - $headerRow) rows."
     }
 
     [pscustomobject] @{
         Name       = $Name
+        Rules      = $Rule
+        HeaderRow  = $headerRow
         Headers    = [string[]] (@($Column | ForEach-Object { $_.Header }) + @(1..$maxCopies | ForEach-Object { "Location $_" }))
         Widths     = [int[]] (@($Column | ForEach-Object { $_.Width }) + @(1..$maxCopies | ForEach-Object { $script:LocationColumnWidth }))
         Rows       = $Row
         LastColumn = ConvertTo-ColumnName $columnCount
-        LastRow    = $Row.Count + 1
+        LastRow    = $Row.Count + $headerRow
     }
 }
 
@@ -757,13 +810,13 @@ function Write-WorksheetXml {
 
     $Writer.WriteStartElement('worksheet', $ns)
 
-    # Frozen header row.
+    # Frozen rules and header row.
     $Writer.WriteStartElement('sheetViews', $ns)
     $Writer.WriteStartElement('sheetView', $ns)
     $Writer.WriteAttributeString('workbookViewId', '0')
     $Writer.WriteStartElement('pane', $ns)
-    $Writer.WriteAttributeString('ySplit', '1')
-    $Writer.WriteAttributeString('topLeftCell', 'A2')
+    $Writer.WriteAttributeString('ySplit', [string] $Sheet.HeaderRow)
+    $Writer.WriteAttributeString('topLeftCell', "A$($Sheet.HeaderRow + 1)")
     $Writer.WriteAttributeString('activePane', 'bottomLeft')
     $Writer.WriteAttributeString('state', 'frozen')
     $Writer.WriteEndElement()
@@ -784,16 +837,25 @@ function Write-WorksheetXml {
 
     $Writer.WriteStartElement('sheetData', $ns)
 
+    # The matching rules: a bold title, then one sentence per row.
+    for ($r = 0; $r -lt $Sheet.Rules.Count; $r++) {
+        $Writer.WriteStartElement('row', $ns)
+        $Writer.WriteAttributeString('r', [string] ($r + 1))
+        $style = if ($r -eq 0) { $styleBold } else { 0 }
+        Write-Cell -Writer $Writer -Reference "A$($r + 1)" -Value $Sheet.Rules[$r] -Style $style
+        $Writer.WriteEndElement()
+    }
+
     # Header row.
     $Writer.WriteStartElement('row', $ns)
-    $Writer.WriteAttributeString('r', '1')
+    $Writer.WriteAttributeString('r', [string] $Sheet.HeaderRow)
     for ($c = 0; $c -lt $Sheet.Headers.Count; $c++) {
-        Write-Cell -Writer $Writer -Reference "$(ConvertTo-ColumnName ($c + 1))1" -Value $Sheet.Headers[$c] -Style $styleBold
+        Write-Cell -Writer $Writer -Reference "$(ConvertTo-ColumnName ($c + 1))$($Sheet.HeaderRow)" -Value $Sheet.Headers[$c] -Style $styleBold
     }
     $Writer.WriteEndElement()
 
     # One row per duplicated item; one column per copy.
-    $rowNumber = 1
+    $rowNumber = $Sheet.HeaderRow
     foreach ($values in $Sheet.Rows) {
         $rowNumber++
         $Writer.WriteStartElement('row', $ns)
@@ -808,7 +870,7 @@ function Write-WorksheetXml {
     $Writer.WriteEndElement()  # sheetData
 
     $Writer.WriteStartElement('autoFilter', $ns)
-    $Writer.WriteAttributeString('ref', "A1:$($Sheet.LastColumn)$($Sheet.LastRow)")
+    $Writer.WriteAttributeString('ref', "A$($Sheet.HeaderRow):$($Sheet.LastColumn)$($Sheet.LastRow)")
     $Writer.WriteEndElement()
 
     $Writer.WriteEndElement()  # worksheet
@@ -846,13 +908,13 @@ function Export-DuplicateReport {
             , (@($set.FileName, $set.LastWriteTime, [long] $set.SizeBytes, $set.MD5, [int] $set.Count) + @($set.Folders))
         })
     $sheets = [System.Collections.Generic.List[object]]::new()
-    $sheets.Add((ConvertTo-WorksheetData -Name $script:FileSheetName -Column $script:FixedColumns -Row $fileRows -Noun 'file'))
+    $sheets.Add((ConvertTo-WorksheetData -Name $script:FileSheetName -Rule $script:FileRules -Column $script:FixedColumns -Row $fileRows -Noun 'file'))
 
     if ($PSBoundParameters.ContainsKey('FolderSet') -and $null -ne $FolderSet) {
         $folderRows = @(foreach ($set in $FolderSet) {
                 , (@($set.FolderName, [int] $set.FileCount, [int] $set.FolderCount, [long] $set.SizeBytes, [int] $set.Count) + @($set.Folders))
             })
-        $sheets.Add((ConvertTo-WorksheetData -Name $script:FolderSheetName -Column $script:FolderColumns -Row $folderRows -Noun 'folder'))
+        $sheets.Add((ConvertTo-WorksheetData -Name $script:FolderSheetName -Rule $script:FolderRules -Column $script:FolderColumns -Row $folderRows -Noun 'folder'))
     }
 
     $sheetEntries = ''; $overrides = ''; $sheetRels = ''; $filters = ''
@@ -861,7 +923,7 @@ function Export-DuplicateReport {
         $sheetEntries += "<sheet name=`"$($sheet.Name)`" sheetId=`"$i`" r:id=`"rId$i`"/>"
         $overrides += "<Override PartName=`"/xl/worksheets/sheet$i.xml`" ContentType=`"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml`"/>"
         $sheetRels += "<Relationship Id=`"rId$i`" Type=`"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet`" Target=`"worksheets/sheet$i.xml`"/>"
-        $filters += "<definedName name=`"_xlnm._FilterDatabase`" localSheetId=`"$($i - 1)`" hidden=`"1`">'$($sheet.Name)'!`$A`$1:`$$($sheet.LastColumn)`$$($sheet.LastRow)</definedName>"
+        $filters += "<definedName name=`"_xlnm._FilterDatabase`" localSheetId=`"$($i - 1)`" hidden=`"1`">'$($sheet.Name)'!`$A`$$($sheet.HeaderRow):`$$($sheet.LastColumn)`$$($sheet.LastRow)</definedName>"
     }
     $stylesId = "rId$($sheets.Count + 1)"
 
@@ -997,6 +1059,7 @@ function Get-WorkbookSheet {
     }
     foreach ($sheet in $workbook.SelectNodes('/s:workbook/s:sheets/s:sheet', (Get-SpreadsheetNamespace -Xml $workbook))) {
         $target = $targets[$sheet.GetAttribute('id', $relNs)]
+        if (-not $target) { throw "The workbook part for sheet '$($sheet.GetAttribute('name'))' is missing." }
         [pscustomobject] @{
             Name = $sheet.GetAttribute('name')
             Path = if ($target.StartsWith('/')) { $target.TrimStart('/') } else { "xl/$target" }
@@ -1053,7 +1116,8 @@ function Get-WorksheetRow {
 }
 
 function Select-ReportRow {
-    # Checks a sheet's header row and returns its data rows as (fixed values, folders) pairs.
+    # Finds a sheet's table header row (below the rules; row 1 in older reports) and returns
+    # the data rows under it as (fixed values, folders) pairs.
     param(
         [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Row,
         [Parameter(Mandatory)] [object[]] $Column,
@@ -1061,14 +1125,18 @@ function Select-ReportRow {
     )
 
     $expected = @($Column | ForEach-Object { $_.Header })
-    $headerOk = $Row.Count -gt 0 -and $Row[0].Count -ge $expected.Count
-    for ($c = 0; $headerOk -and $c -lt $expected.Count; $c++) {
-        $headerOk = [System.StringComparer]::OrdinalIgnoreCase.Equals([string] $Row[0][$c], $expected[$c])
+    $headerAt = -1
+    for ($r = 0; $headerAt -lt 0 -and $r -lt $Row.Count; $r++) {
+        $headerOk = $Row[$r].Count -ge $expected.Count
+        for ($c = 0; $headerOk -and $c -lt $expected.Count; $c++) {
+            $headerOk = [System.StringComparer]::OrdinalIgnoreCase.Equals([string] $Row[$r][$c], $expected[$c])
+        }
+        if ($headerOk) { $headerAt = $r }
     }
-    if (-not $headerOk) { throw "$ErrorMessage '$($expected -join ', ')'." }
+    if ($headerAt -lt 0) { throw "$ErrorMessage '$($expected -join ', ')'." }
 
     $firstLocation = $expected.Count
-    for ($r = 1; $r -lt $Row.Count; $r++) {
+    for ($r = $headerAt + 1; $r -lt $Row.Count; $r++) {
         $values = $Row[$r]
         if ($values.Count -lt $firstLocation -or -not $values[0]) { continue }
         # (Not "$x = if ...": that would unroll an empty or one-item array.)
@@ -1076,6 +1144,17 @@ function Select-ReportRow {
         for ($c = $firstLocation; $c -lt $values.Count; $c++) { if ($values[$c]) { $folders.Add($values[$c]) } }
         [pscustomobject] @{ Values = $values; Folders = $folders.ToArray() }
     }
+}
+
+function ConvertFrom-CellNumber {
+    # A numeric cell's text as a number, or a clear error naming the report.
+    param([AllowNull()] [AllowEmptyString()] [string] $Text, [Parameter(Mandatory)] [string] $Path)
+    $number = 0.0
+    if (-not [double]::TryParse($Text, [System.Globalization.NumberStyles]::Float,
+            [System.Globalization.CultureInfo]::InvariantCulture, [ref] $number)) {
+        throw "'$Path' could not be read as a duplicates report: '$Text' is not a number."
+    }
+    $number
 }
 
 function Read-DuplicateWorkbook {
@@ -1102,13 +1181,12 @@ function Read-DuplicateWorkbook {
     finally { $stream.Dispose() }
 
     # Numbers go through [double] then [long]/[int], which rounds half to even like Python's round().
-    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     $files = @(foreach ($row in (Select-ReportRow -Row $fileRows -Column $script:FixedColumns `
-                    -ErrorMessage "'$Path' is not a duplicates report: its header row is not")) {
+                    -ErrorMessage "'$Path' is not a duplicates report: it has no header row")) {
             [pscustomobject] @{
                 FileName      = $row.Values[0]
-                LastWriteTime = [datetime]::FromOADate([double]::Parse($row.Values[1], $invariant))
-                SizeBytes     = [long] [double]::Parse($row.Values[2], $invariant)
+                LastWriteTime = [datetime]::FromOADate((ConvertFrom-CellNumber $row.Values[1] -Path $Path))
+                SizeBytes     = [long] (ConvertFrom-CellNumber $row.Values[2] -Path $Path)
                 MD5           = $row.Values[3]
                 Count         = $row.Folders.Count
                 Folders       = $row.Folders
@@ -1118,12 +1196,12 @@ function Read-DuplicateWorkbook {
     $folders = $null
     if ($folderSheet) {
         $folders = @(foreach ($row in (Select-ReportRow -Row $folderRows -Column $script:FolderColumns `
-                        -ErrorMessage "'$Path' is not a duplicates report: the header row of sheet '$($script:FolderSheetName)' is not")) {
+                        -ErrorMessage "'$Path' is not a duplicates report: sheet '$($script:FolderSheetName)' has no header row")) {
                 [pscustomobject] @{
                     FolderName  = $row.Values[0]
-                    FileCount   = [int] [double]::Parse($row.Values[1], $invariant)
-                    FolderCount = [int] [double]::Parse($row.Values[2], $invariant)
-                    SizeBytes   = [long] [double]::Parse($row.Values[3], $invariant)
+                    FileCount   = [int] (ConvertFrom-CellNumber $row.Values[1] -Path $Path)
+                    FolderCount = [int] (ConvertFrom-CellNumber $row.Values[2] -Path $Path)
+                    SizeBytes   = [long] (ConvertFrom-CellNumber $row.Values[3] -Path $Path)
                     Count       = $row.Folders.Count
                     Folders     = $row.Folders
                 }
@@ -1178,15 +1256,15 @@ function Test-PathRootReachable {
     $reachable
 }
 
-function Find-FileIgnoringCase {
-    # The file in $Folder whose name matches $FileName ignoring case, or $null.
-    # Only needed on case-sensitive file systems (Linux, some macOS volumes); on Windows
-    # File.Exists already ignores case, so the folder is not listed.
+function Find-FileByNameKey {
+    # The file in $Folder whose name matches $FileName ignoring case and Unicode form, or
+    # $null. Used when the plain lookup fails: case-sensitive file systems (Linux), and
+    # names stored in another Unicode form (Windows and Linux keep both forms apart).
     param([Parameter(Mandatory)] [string] $Folder, [Parameter(Mandatory)] [string] $FileName)
-    if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) { return $null }
     if (-not [System.IO.Directory]::Exists($Folder)) { return $null }
+    $wanted = ConvertTo-NameKey $FileName
     foreach ($candidate in [System.IO.Directory]::GetFiles($Folder)) {
-        if ([System.StringComparer]::OrdinalIgnoreCase.Equals([System.IO.Path]::GetFileName($candidate), $FileName)) {
+        if ((ConvertTo-NameKey ([System.IO.Path]::GetFileName($candidate))) -ceq $wanted) {
             return [System.IO.FileInfo] $candidate
         }
     }
@@ -1212,7 +1290,7 @@ function Test-DuplicateCopy {
     try {
         if (-not (Test-PathRootReachable -Folder $Folder -Cache $RootCache)) { return 'Unavailable' }
         $path = [System.IO.Path]::Combine($Folder, $FileName)
-        $file = if ([System.IO.File]::Exists($path)) { [System.IO.FileInfo] $path } else { Find-FileIgnoringCase -Folder $Folder -FileName $FileName }
+        $file = if ([System.IO.File]::Exists($path)) { [System.IO.FileInfo] $path } else { Find-FileByNameKey -Folder $Folder -FileName $FileName }
         if (-not $file) { return 'Missing' }
         $size  = $file.Length
         $ticks = $file.LastWriteTime.Ticks

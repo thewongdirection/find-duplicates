@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, Hashable, Iterable, List, Optional, Sequence, TypeVar
 
+from .names import name_key, sort_key
 from .scanner import FileRecord, is_cloud_only
 
 log = logging.getLogger("find_duplicates")
@@ -142,6 +143,7 @@ def find_duplicate_files(
     on_hash: Optional[HashCallback] = None,
     throttle_limit: int = 1,
     md5_cache: Optional[Dict[str, str]] = None,
+    ignore_empty_files: bool = False,
 ) -> List[DuplicateSet]:
     """Find sets of files whose name, saved date and MD5 hash all match.
 
@@ -149,9 +151,13 @@ def find_duplicate_files(
     would download them); duplicates among such files are then not reported.
     ``throttle_limit`` is how many files to hash at the same time (1-64).
     ``md5_cache`` is shared with find_duplicate_folders so no file is read twice.
+    ``ignore_empty_files`` leaves files of 0 bytes out (they all share one MD5).
     """
+    if ignore_empty_files:
+        files = [f for f in files if f.size > 0]
+
     # Stage 1: name + saved date.
-    name_date_groups = groups_of_many(files, lambda f: (ordinal_ignore_case(f.name), _saved_date_key(f)))
+    name_date_groups = groups_of_many(files, lambda f: (name_key(f.name), _saved_date_key(f)))
 
     # Stage 2: size. A cheap check that avoids hashing files that cannot match.
     candidate_groups = [
@@ -193,19 +199,10 @@ def find_duplicate_files(
                     size_bytes=first.size,
                     md5=md5,
                     count=len(same),
-                    folders=sorted((record.folder for record, _ in same), key=ordinal_ignore_case),
+                    folders=sorted((record.folder for record, _ in same), key=lambda p: sort_key(p, True)),
                 )
             )
 
-    results.sort(key=lambda s: (ordinal_ignore_case(s.file_name), s.last_write_time, s.md5))
+    results.sort(key=lambda s: (sort_key(s.file_name, True), s.last_write_time, sort_key(s.md5)))
     return results
 
-
-def ordinal_ignore_case(text: str) -> str:
-    """Key matching .NET StringComparer.OrdinalIgnoreCase, used by the PowerShell tool.
-
-    Upper-cases one character at a time and leaves characters whose upper case
-    is longer (such as German sharp s) alone, so "straße" and "STRASSE" differ,
-    exactly as they do in .NET.
-    """
-    return "".join(upper if len(upper := char.upper()) == 1 else char for char in text)

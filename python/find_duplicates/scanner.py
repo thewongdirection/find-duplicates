@@ -13,6 +13,8 @@ import sys
 from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator, List, Optional
 
+from .names import sort_key
+
 log = logging.getLogger("find_duplicates")
 
 # Windows attributes of cloud placeholders (OneDrive "Files On-Demand" and other
@@ -106,7 +108,9 @@ def iter_files(
     prevents infinite loops; cloud-synced folders are. Listing folders never
     downloads cloud files. When ``folders`` is given, it receives a record for
     every folder listed (needed to compare folder trees, including empty and
-    unreadable folders).
+    unreadable folders). A folder that holds an excluded file, and each folder
+    link that is not followed, is recorded as not readable: its contents are not
+    fully known, so it can never be proven identical to another folder.
     """
     if not os.path.isdir(root):
         raise NotADirectoryError(f"'{root}' is not a folder.")
@@ -128,7 +132,7 @@ def iter_files(
             with os.scandir(folder) as it:
                 # File systems list entries in different orders (alphabetical on NTFS,
                 # arbitrary on ext4); ordinal order matches the PowerShell tool.
-                entries = sorted(it, key=lambda e: e.name)
+                entries = sorted(it, key=lambda e: sort_key(e.name))
         except OSError as exc:
             log.warning("Skipping '%s': %s", folder, exc.strerror or exc)
             if folders is not None:
@@ -143,10 +147,16 @@ def iter_files(
                 if entry.is_dir():
                     if is_folder_link(entry):
                         log.info("Not following link '%s'", entry.path)
+                        if folders is not None:
+                            folders.append(FolderRecord(entry.path, readable=False))
                     else:
                         sub_folders.append(entry.path)
                     continue
-                if not entry.is_file() or _same_path_key(entry.path) in excluded:
+                if not entry.is_file():
+                    continue
+                if _same_path_key(entry.path) in excluded:
+                    if folders is not None:
+                        folders.append(FolderRecord(folder, readable=False))
                     continue
                 st = entry.stat()
             except OSError as exc:
