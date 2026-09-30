@@ -1,0 +1,171 @@
+# find-duplicates (Python)
+
+The Python version of the PowerShell tool in the repository root. It has the
+same features, defaults and report layout, and an automated test checks that
+both produce the same spreadsheet. It uses only the standard library
+(Python 3.9+), so there is nothing to install.
+
+See the [main README](../README.md) for the full list of capabilities, what
+counts as a duplicate, the report layout, network and cloud drive behaviour,
+and performance advice. Everything there applies here; only the command
+syntax differs.
+
+## Running it
+
+From this `python` folder:
+
+```sh
+python -m find_duplicates [options]
+```
+
+Or install it once to get a `find-duplicates` command anywhere:
+
+```sh
+pip install ./python
+find-duplicates [options]
+```
+
+Built-in help: `python -m find_duplicates --help`.
+
+## Command reference
+
+```text
+python -m find_duplicates [path] [output] [-o FILE] [-j N] [--folders] [--ignore-empty-files] [--skip-cloud-only] [--dry-run] [-v]
+python -m find_duplicates --validate [report] [--dry-run] [-v]
+```
+
+### Scan (the default)
+
+| Option | Default | What it does |
+|---|---|---|
+| `path` | current folder | Folder to scan, including all sub folders. |
+| `output`, `-o FILE`, `--output-file FILE` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced. |
+| `-j N`, `--throttle-limit N` | `1` | How many files to hash at the same time (1-64). Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk. |
+| `--folders` | off | Also find [duplicate folders](../README.md#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
+| `--ignore-empty-files` | off | Leave files of 0 bytes out of the duplicate files. |
+| `--skip-cloud-only` | off | Never download online-only cloud files to hash them. Duplicates among such files are then not reported. |
+| `--dry-run` | off | Scan and report the totals, but do not save the report. |
+| `-v`, `--verbose` | off | Print every folder as it is scanned, and every link or online-only file skipped. |
+
+```sh
+# Scan the current folder, save ./duplicates.xlsx
+python -m find_duplicates
+
+# Scan a folder, save ./duplicates.xlsx
+python -m find_duplicates D:\Photos
+
+# Choose where to save the report (".xlsx" is added when missing)
+python -m find_duplicates D:\Photos C:\Reports\photo-dupes
+python -m find_duplicates D:\Photos -o C:\Reports\photo-dupes.xlsx
+
+# Hash 8 files at a time (SSD, network share or cloud folder)
+python -m find_duplicates \\nas\photos -j 8
+
+# Also find duplicate folders (second sheet)
+python -m find_duplicates D:\Backups --folders
+
+# Leave out empty (0-byte) files
+python -m find_duplicates D:\Photos --ignore-empty-files
+
+# OneDrive without downloading online-only files
+python -m find_duplicates "%OneDrive%" --skip-cloud-only
+
+# See the totals without writing a report
+python -m find_duplicates D:\Photos --dry-run
+
+# Log every folder scanned
+python -m find_duplicates D:\Photos --verbose
+```
+
+### Validate an existing report (`--validate`)
+
+Re-checks every copy listed in a report without rescanning, and updates the
+report in place: copies that are missing, or whose size or saved date changed,
+are removed; rows left with fewer than two copies are removed; copies on a
+drive or share that cannot be reached are kept. See the
+[main README](../README.md#validate-an-existing-report--validate) for details.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--validate` | — | Switches to validation. |
+| `report`, `-o FILE` | `duplicates.xlsx` in the current folder | Report to check and update. |
+| `--dry-run` | off | Report what would be removed, but do not change the report. |
+| `-v`, `--verbose` | off | Print every copy that is removed and why. |
+
+`--skip-cloud-only`, `--throttle-limit`, `--folders` and `--ignore-empty-files` only apply to a scan.
+Duplicate folders, when the report has them, are re-checked too.
+
+```sh
+# Check ./duplicates.xlsx
+python -m find_duplicates --validate
+
+# Check a named report
+python -m find_duplicates --validate C:\Reports\photo-dupes.xlsx
+
+# Preview what would be removed, listing each copy
+python -m find_duplicates --validate C:\Reports\photo-dupes.xlsx --dry-run --verbose
+```
+
+## Using it from Python
+
+```python
+from find_duplicates import (
+    iter_files, find_duplicate_files, find_duplicate_folders, export_duplicate_report,
+    read_duplicate_report, read_duplicate_folder_report, validate_report,
+)
+
+records = []                                                     # folder records, for folders
+files = list(iter_files(r"D:\Photos", folders=records))          # every file, recursively
+cache = {}                                                       # share hashes between the two
+duplicates = find_duplicate_files(files, throttle_limit=4, md5_cache=cache)   # like -PassThru
+folders = find_duplicate_folders(files, records, md5_cache=cache)
+for dup in duplicates:
+    print(dup.file_name, dup.count, dup.folders)
+export_duplicate_report(duplicates, "duplicates.xlsx", folders)  # omit folders: no folder sheet
+
+rows = read_duplicate_report("duplicates.xlsx")                  # read the file rows back
+folder_rows = read_duplicate_folder_report("duplicates.xlsx")    # read the folder rows back
+result = validate_report("duplicates.xlsx", dry_run=True)        # summary: removed, kept...
+```
+
+## PowerShell ↔ Python
+
+| PowerShell | Python |
+|---|---|
+| `-Path` | `path` (first argument) |
+| `-OutputFile` | `output` (second argument) or `-o` |
+| `-ThrottleLimit N` | `-j N` / `--throttle-limit N` |
+| `-IncludeFolders` | `--folders` |
+| `-IgnoreEmptyFiles` | `--ignore-empty-files` |
+| `-SkipCloudOnly` | `--skip-cloud-only` |
+| `-Validate` | `--validate` |
+| `-WhatIf` | `--dry-run` |
+| `-Verbose` | `-v` / `--verbose` |
+| `-PassThru` | `find_duplicate_files()` / `validate_report()` |
+| `Get-FileInventory` | `iter_files()` |
+| `Find-DuplicateFile` | `find_duplicate_files()` |
+| `Find-DuplicateFolder` | `find_duplicate_folders()` |
+| `Export-DuplicateReport` | `export_duplicate_report()` |
+| `Import-DuplicateReport` | `read_duplicate_report()` |
+| `Import-DuplicateFolderReport` | `read_duplicate_folder_report()` |
+| `Update-DuplicateReport` | `validate_report()` |
+
+## Unicode
+
+File and folder names in any language work the same as in PowerShell: they are
+compared ignoring case and Unicode form (NFC), and sorted in the same (UTF-16)
+order as .NET, so both tools produce identical reports. If the console cannot
+show a character (for example output redirected to a file in a Windows code
+page), it is printed as an escape such as `\u65e5` instead of stopping the run.
+
+## Running the tests
+
+```sh
+cd python
+python -m unittest discover -s tests -t .
+```
+
+`tests/test_parity.py` runs both tools on the same folder tree (plain scan,
+parallel hashing, and validation, all with duplicate folders) and requires
+identical reports, sheet by sheet. It needs
+PowerShell 7 (`pwsh`) and is skipped without it; CI always runs it.

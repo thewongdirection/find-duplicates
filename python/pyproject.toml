@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "find-duplicates"
+version = "1.0.0"
+description = "Find duplicate files (same name, saved date and MD5) and save them to an Excel workbook."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+find-duplicates = "find_duplicates.cli:main"
+
+[tool.setuptools]
+packages = ["find_duplicates"]
