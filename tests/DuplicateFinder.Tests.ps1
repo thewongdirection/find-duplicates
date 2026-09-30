@@ -12,6 +12,7 @@ BeforeAll {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
 
     $script:Saved = [datetime]::new(2024, 5, 17, 10, 30, 0, [System.DateTimeKind]::Utc)
+    $script:OnWindows = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
 
     function Add-TestFile {
         param(
@@ -94,6 +95,17 @@ Describe 'Get-FileInventory' {
         (Get-FileInventory -Path $root).Name | Should -Be 'file[1].txt'
     }
 
+    It 'does not follow a folder link that loops back to the root' {
+        $root = Add-TestRoot
+        $null = Add-TestFile $root 'sub/a.txt'
+        $link = Join-Path $root 'sub/loop'
+        try { $null = New-Item -ItemType SymbolicLink -Path $link -Target $root -ErrorAction Stop }
+        catch { Set-ItResult -Skipped -Because "symbolic links cannot be created here: $_"; return }
+
+        $found = @(Get-FileInventory -Path $root)
+        $found.Name | Should -Be @('a.txt')
+    }
+
     It 'rejects a path that is not a folder' {
         $root = Add-TestRoot
         $file = Add-TestFile $root 'a.txt'
@@ -107,6 +119,43 @@ Describe 'Get-FileInventory' {
         $verbose = Get-FileInventory -Path $root -Verbose 4>&1 |
             Where-Object { $_ -is [System.Management.Automation.VerboseRecord] }
         $verbose.Message | Should -Contain "Scanning $(Join-Path $root 'sub')"
+    }
+}
+
+Describe 'Folder and cloud file detection' {
+    It 'follows a <Case>' -ForEach @(
+        @{ Case = 'plain folder'; Attributes = [System.IO.FileAttributes]::Directory; LinkType = $null }
+        @{ Case = 'cloud-synced (OneDrive) folder'
+           Attributes = [System.IO.FileAttributes] 'Directory, ReparsePoint'; LinkType = $null }
+    ) {
+        InModuleScope DuplicateFinder -Parameters $_ {
+            Test-FolderLink -Folder ([pscustomobject] @{ Attributes = $Attributes; LinkType = $LinkType }) |
+                Should -BeFalse
+        }
+    }
+
+    It 'does not follow a <LinkType>' -ForEach @(
+        @{ LinkType = 'SymbolicLink' }
+        @{ LinkType = 'Junction' }
+    ) {
+        InModuleScope DuplicateFinder -Parameters $_ {
+            $folder = [pscustomobject] @{ Attributes = [System.IO.FileAttributes] 'Directory, ReparsePoint'; LinkType = $LinkType }
+            Test-FolderLink -Folder $folder | Should -BeTrue
+        }
+    }
+
+    It 'treats attributes 0x<Hex> as online-only: <Expected>' -ForEach @(
+        @{ Hex = '20'; Expected = $false }       # Archive: a normal local file
+        @{ Hex = '420'; Expected = $false }      # Archive + ReparsePoint: pinned / locally available
+        @{ Hex = '1020'; Expected = $true }      # Offline
+        @{ Hex = '40020'; Expected = $true }     # RecallOnOpen
+        @{ Hex = '400420'; Expected = $true }    # RecallOnDataAccess (OneDrive Files On-Demand)
+    ) {
+        InModuleScope DuplicateFinder -Parameters $_ {
+            # A plain number: .NET Framework's FileAttributes enum does not define the cloud bits.
+            $file = [pscustomobject] @{ Attributes = [Convert]::ToInt32($Hex, 16) }
+            Test-CloudOnlyFile -File $file | Should -Be $Expected
+        }
     }
 }
 
@@ -229,6 +278,35 @@ Describe 'Find-DuplicateFile' {
                 (Add-TestFile $root 'c/y.txt'))
             Should -Invoke -ModuleName DuplicateFinder Get-FileHash -Times 2 -Exactly
         }
+    }
+
+    It 'downloads (hashes) online-only cloud files by default' {
+        $root = Add-TestRoot
+        $files = @(
+            Add-TestFile $root 'cloud/x.txt'
+            Add-TestFile $root 'local/x.txt'
+        )
+        Mock -ModuleName DuplicateFinder Test-CloudOnlyFile { $true }
+
+        @(Find-DuplicateFile -File $files).Count | Should -Be 1
+    }
+
+    It 'does not download online-only cloud files with -SkipCloudOnly' {
+        $root = Add-TestRoot
+        $files = @(
+            Add-TestFile $root 'cloud/x.txt'
+            Add-TestFile $root 'local1/x.txt'
+            Add-TestFile $root 'local2/x.txt'
+        )
+        Mock -ModuleName DuplicateFinder Test-CloudOnlyFile { "$($File.FullName)" -like '*cloud*' }
+        Mock -ModuleName DuplicateFinder Get-FileHash { [pscustomobject] @{ Hash = 'SAME' } }
+
+        $result = @(Find-DuplicateFile -File $files -SkipCloudOnly -WarningVariable warnings -WarningAction SilentlyContinue)
+
+        Should -Invoke -ModuleName DuplicateFinder Get-FileHash -Times 2 -Exactly
+        Should -Invoke -ModuleName DuplicateFinder Get-FileHash -Times 0 -Exactly -ParameterFilter { "$LiteralPath" -like '*cloud*' }
+        $result[0].Folders | Should -Be @($files[1..2].DirectoryName | Sort-Object)
+        "$($warnings[0])" | Should -BeLike '1 online-only*'
     }
 
     It 'skips a file it cannot hash and keeps the rest' {
@@ -375,6 +453,23 @@ Describe 'Find-Duplicates.ps1' {
         $workDir = Add-TestRoot
         $null = & $script:ScriptPath -Path $script:Root -OutputFile (Join-Path $workDir 'my-report') 6>$null
         Join-Path $workDir 'my-report.xlsx' | Should -Exist
+    }
+
+    It 'scans a network share given as a UNC path' {
+        if (-not $script:OnWindows) { Set-ItResult -Skipped -Because 'UNC paths are Windows-only'; return }
+        $root = Add-TestRoot
+        $null = Add-TestFile $root 'a/x.txt'
+        $null = Add-TestFile $root 'b/x.txt'
+        # Reach the local test folder through the administrative share, e.g. \\localhost\C$\...
+        $unc = '\\localhost\' + $root.Substring(0, 1) + '$' + $root.Substring(2)
+        if (-not (Test-Path -LiteralPath $unc)) { Set-ItResult -Skipped -Because 'the administrative share is not available'; return }
+
+        $out = Join-Path (Add-TestRoot) 'unc.xlsx'
+        $result = @(& $script:ScriptPath -Path $unc -OutputFile $out -PassThru 6>$null)
+
+        $result.Count | Should -Be 1
+        $result[0].Folders | Should -Be @("$unc\a", "$unc\b")
+        $out | Should -Exist
     }
 
     It 'does not scan its own report when it is saved inside the scanned folder' {

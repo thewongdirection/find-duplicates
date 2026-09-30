@@ -12,6 +12,11 @@
     MD5 is only calculated for files whose name and saved date already match
     another file (and whose size matches too), so most files are never read.
 
+    Local folders, network shares (\\server\share or mapped drives) and synced
+    cloud folders (OneDrive, Google Drive, Dropbox ...) are all supported.
+    Cloud files that are only stored online are downloaded when they have to
+    be hashed, unless -SkipCloudOnly is used.
+
     The report has one row per duplicated file with the columns
     File Name | Last Modified | Size (bytes) | MD5 | Copies | Location 1 | Location 2 | ...
     where each "Location" column holds the full folder path of one copy.
@@ -25,6 +30,10 @@
     Workbook to write. Defaults to "duplicates.xlsx" in the current folder.
     ".xlsx" is appended when no extension is given.
 
+.PARAMETER SkipCloudOnly
+    Never download online-only cloud files to hash them. Duplicates among
+    such files are then not reported.
+
 .PARAMETER PassThru
     Also return the duplicate sets as objects.
 
@@ -33,6 +42,9 @@
 
 .EXAMPLE
     .\Find-Duplicates.ps1 -Path \\server\share -OutputFile C:\Reports\share-dupes.xlsx -Verbose
+
+.EXAMPLE
+    .\Find-Duplicates.ps1 -Path "$env:OneDrive" -SkipCloudOnly
 #>
 [CmdletBinding()]
 param(
@@ -43,6 +55,8 @@ param(
     [Parameter(Position = 1)]
     [ValidateNotNullOrEmpty()]
     [string] $OutputFile = 'duplicates.xlsx',
+
+    [switch] $SkipCloudOnly,
 
     [switch] $PassThru
 )
@@ -62,7 +76,7 @@ Write-Host "Scanning '$scanRoot' ..."
 $files = @(Get-FileInventory -Path $scanRoot -ExcludeFile $reportPath)
 Write-Host "Found $($files.Count) files. Checking for duplicates ..."
 
-$duplicates = @(Find-DuplicateFile -File $files)
+$duplicates = @(Find-DuplicateFile -File $files -SkipCloudOnly:$SkipCloudOnly)
 Export-DuplicateReport -DuplicateSet $duplicates -Path $reportPath
 
 $copies = 0

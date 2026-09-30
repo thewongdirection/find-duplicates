@@ -10,6 +10,10 @@
     MD5 is only computed for files whose name and saved date already match
     another file (and whose size matches, since files of different sizes can
     never share an MD5), so most files are never read.
+
+    Works on local folders, network shares (UNC paths or mapped drives) and
+    synced cloud folders (OneDrive, Google Drive, Dropbox ...). No network
+    access is needed beyond reading the folders themselves.
 #>
 Set-StrictMode -Version Latest
 
@@ -27,6 +31,10 @@ $script:FixedColumns       = @(
 )
 $script:LocationColumnWidth = 60
 
+# Attributes Windows sets on cloud placeholders (OneDrive "Files On-Demand" and other
+# Cloud Files providers) whose contents are not stored locally. Reading them downloads them.
+$script:CloudOnlyAttributes = 0x1000 -bor 0x40000 -bor 0x400000  # Offline | RecallOnOpen | RecallOnDataAccess
+
 #region Scanning
 
 function Get-FileInventory {
@@ -35,8 +43,10 @@ function Get-FileInventory {
         Recursively lists every file below a folder, reporting the folder being scanned.
     .DESCRIPTION
         Walks the tree iteratively so that deep trees cannot overflow the call stack.
-        Folders that cannot be read are reported as warnings and skipped. Directory
-        symlinks / junctions are not followed, which prevents infinite loops.
+        Folders that cannot be read (permissions, dropped network connection) are
+        reported as warnings and skipped. Symbolic links and junctions are not
+        followed, which prevents infinite loops; cloud-synced folders are followed.
+        Listing folders never downloads cloud files.
     #>
     [CmdletBinding()]
     [OutputType([System.IO.FileInfo])]
@@ -94,7 +104,7 @@ function Get-FileInventory {
         # Push in reverse so folders are visited in alphabetical order.
         for ($i = $subFolders.Count - 1; $i -ge 0; $i--) {
             $sub = $subFolders[$i]
-            if ($sub.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            if (Test-FolderLink -Folder $sub) {
                 Write-Verbose "Not following link '$($sub.FullName)'"
                 continue
             }
@@ -103,6 +113,23 @@ function Get-FileInventory {
     }
 
     Write-Progress -Id 1 -Activity 'Scanning folders' -Completed
+}
+
+function Test-FolderLink {
+    # True for symbolic links and junctions, which could loop back on the tree.
+    # Other reparse points are ordinary folders to the user: OneDrive and other
+    # cloud-synced folders, deduplicated volumes, DFS links. Those are scanned.
+    # LinkType is added to DirectoryInfo by PowerShell on every platform.
+    param([Parameter(Mandatory)] [object] $Folder)
+
+    if (-not ($Folder.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $false }
+    $Folder.LinkType -in 'SymbolicLink', 'Junction'
+}
+
+function Test-CloudOnlyFile {
+    # True for cloud placeholders whose contents would have to be downloaded to hash them.
+    param([Parameter(Mandatory)] [object] $File)
+    ([long] $File.Attributes -band $script:CloudOnlyAttributes) -ne 0
 }
 
 #endregion
@@ -158,7 +185,11 @@ function Find-DuplicateFile {
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [System.IO.FileInfo[]] $File
+        [System.IO.FileInfo[]] $File,
+
+        # Do not hash cloud files that are not stored locally (hashing would download them).
+        # Duplicates among such files are then not reported.
+        [switch] $SkipCloudOnly
     )
 
     # Stage 1: name + saved date. The date key is all digits, so '|' is a safe separator.
@@ -170,6 +201,23 @@ function Find-DuplicateFile {
     $candidateGroups = @(foreach ($group in $nameDateGroups) {
             Group-ByKey -InputItems $group -KeySelector { param($f) $f.Length }
         })
+
+    if ($SkipCloudOnly) {
+        $skipped = 0
+        $candidateGroups = @(foreach ($group in $candidateGroups) {
+                $local = @(foreach ($f in $group) {
+                        if (Test-CloudOnlyFile -File $f) {
+                            $skipped++
+                            Write-Verbose "Not downloading online-only file '$($f.FullName)'"
+                        }
+                        else { $f }
+                    })
+                if ($local.Count -gt 1) { , $local }
+            })
+        if ($skipped) {
+            Write-Warning "$skipped online-only cloud file(s) were not checked; duplicates among them are not reported."
+        }
+    }
 
     $toHash = 0
     foreach ($group in $candidateGroups) { $toHash += $group.Count }

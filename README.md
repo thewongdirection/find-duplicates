@@ -52,11 +52,35 @@ Each `Location` column holds the full folder path of one copy. The header row
 is frozen and filtered. Microsoft Excel does **not** need to be installed to
 create the file.
 
+## Network folders and cloud drives
+
+The tool needs no internet or network access of its own: it only reads the
+folders you point it at, wherever they live.
+
+- **Network shares**: use a UNC path (`\\server\share\folder`) or a mapped
+  drive (`Z:\`). Folders that become unreachable mid-scan are reported as
+  warnings and skipped; the rest of the scan carries on.
+- **OneDrive, Google Drive, Dropbox, iCloud, Box**: point it at the synced
+  folder or drive letter, e.g. `-Path "$env:OneDrive"` or `-Path G:\`.
+  Listing folders never downloads anything. Files that are only stored online
+  are downloaded **only** when they have to be hashed, i.e. when another file
+  already has the same name, saved date and size. Add `-SkipCloudOnly` to
+  never download them (duplicates among online-only files are then not
+  reported).
+- Reading over a network or from the cloud is slower than a local disk; the
+  progress bar shows each file as it is hashed.
+
+```powershell
+.\Find-Duplicates.ps1 -Path \\nas\photos
+.\Find-Duplicates.ps1 -Path "$env:OneDrive" -SkipCloudOnly
+```
+
 ## Notes
 
 - Works with Windows PowerShell 5.1 and PowerShell 7+ (Windows, Linux, macOS).
 - Folders that cannot be read are reported as warnings and skipped.
 - Folder links (symlinks and junctions) are not followed, to avoid loops.
+  Cloud-synced folders are followed.
 - A report saved inside the scanned folder is not counted as a file.
 
 ## Running the tests
