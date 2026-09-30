@@ -830,6 +830,15 @@ Describe 'Update-DuplicateReport' {
         }
     }
 
+    It 'keeps a copy whose size and saved date cannot be read' {
+        # As for a file named NUL on Windows, which the system treats as a device.
+        $folder = Join-Path (Add-TestRoot) 'a'
+        InModuleScope DuplicateFinder -Parameters @{ Folder = $folder; Saved = $script:Saved } {
+            Mock Find-FileByNameKey { [pscustomobject] @{ Length = [long] 1; LastWriteTime = $null } }
+            Test-DuplicateCopy -Folder $Folder -FileName 'NUL' -SizeBytes 1 -LastWriteTime $Saved | Should -Be 'Unavailable'
+        }
+    }
+
     It 'checks each drive or share only once' {
         InModuleScope DuplicateFinder -Parameters @{ Folder = (Add-TestRoot) } {
             $cache = [System.Collections.Generic.Dictionary[string, bool]]::new()

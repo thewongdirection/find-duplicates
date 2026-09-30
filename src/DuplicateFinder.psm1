@@ -1408,7 +1408,8 @@ function Test-DuplicateCopy {
           Present     - still there with the same size and saved date
           Missing     - no longer there
           Changed     - still there but its size or saved date changed
-          Unavailable - its drive or network share cannot be reached (kept as is)
+          Unavailable - its drive or network share cannot be reached, or its size and saved
+                        date cannot be read, as for names Windows reserves for devices (kept as is)
     #>
     param(
         [Parameter(Mandatory)] [string] $Folder,
@@ -1423,16 +1424,20 @@ function Test-DuplicateCopy {
         $path = [System.IO.Path]::Combine($Folder, $FileName)
         $file = if ([System.IO.File]::Exists($path)) { [System.IO.FileInfo] $path } else { Find-FileByNameKey -Folder $Folder -FileName $FileName }
         if (-not $file) { return 'Missing' }
-        $size  = $file.Length
-        $ticks = $file.LastWriteTime.Ticks
+        $size    = $file.Length
+        $written = $file.LastWriteTime
     }
     catch [System.IO.FileNotFoundException] { return 'Missing' }  # deleted while being checked
     catch [System.UnauthorizedAccessException], [System.IO.IOException], [System.Security.SecurityException] {
         return 'Unavailable'
     }
 
+    # Something that cannot be checked is kept, never removed.
+    if ($size -isnot [long] -or $written -isnot [datetime]) { return 'Unavailable' }
+
     # Whole seconds, in exact integer arithmetic (as when scanning).
     $ticksPerSecond = [System.TimeSpan]::TicksPerSecond
+    $ticks = $written.Ticks
     $savedTicks = $LastWriteTime.Ticks
     if ($size -ne $SizeBytes -or
         ($ticks - ($ticks % $ticksPerSecond)) -ne ($savedTicks - ($savedTicks % $ticksPerSecond))) { return 'Changed' }

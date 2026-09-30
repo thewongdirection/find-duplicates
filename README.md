@@ -280,7 +280,7 @@ Each of these is covered by an automated test on Windows, Linux and macOS
 | A file that cannot be read (permissions, locked by another program) | Reported as a warning and left out; its other copies are still matched. |
 | The scanned folder is itself a symbolic link | Scanned through the link; locations show the link's path. |
 | Two files in one folder whose names differ only in case (Linux, or case-sensitive folders on Windows) | Reported as duplicates; the row lists that folder twice. |
-| Names Windows reserves or trims (`NUL`, `PRN.txt`, names ending in a dot or space) | Ordinary names on Linux and macOS. On Windows such files can only be made by special tools; the scan never fails on them, but may skip them with a warning. |
+| Names Windows reserves or trims (`NUL`, `PRN.txt`, names ending in a dot or space) | Ordinary names on Linux and macOS. On Windows such files can only be made by special tools; the scan never fails on them, but may skip them with a warning, and `-Validate` keeps such copies rather than guess. |
 | Excel limits | A file with more than 16,379 copies, more than 1,048,575 duplicated files, or a cell longer than 32,767 characters stops the tool with an error, rather than writing a report Excel would reject or cut short. |
 | Reports opened and saved in Excel or LibreOffice | Still read and validated (shared strings and re-numbered sheet parts are handled). |
 

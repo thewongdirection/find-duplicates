@@ -633,6 +633,14 @@ class ValidateReportTests(TempDirTestCase):
                 os.environ["TZ"] = previous
             time.tzset()
 
+    def test_keeps_a_copy_whose_size_and_saved_date_cannot_be_read(self):
+        # As for a file named NUL on Windows, which the system treats as a device.
+        device = os.stat_result((stat.S_IFCHR | 0o666, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        with mock.patch.object(validate.os.path, "isfile", return_value=True), \
+                mock.patch.object(validate.os, "stat", return_value=device):
+            state = validate.check_copy(self.root, "NUL", 0, datetime.now())
+        self.assertEqual(state, validate.UNAVAILABLE)
+
     def test_checks_each_drive_or_share_only_once(self):
         root_cache = {}
         with mock.patch.object(validate, "_path_root", return_value="Z:\\"), \

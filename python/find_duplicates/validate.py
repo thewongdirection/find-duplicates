@@ -100,7 +100,9 @@ def check_copy(
 ) -> str:
     """Check one recorded file copy without reading its contents.
 
-    PRESENT when it is still there with the same size and saved date (to the second).
+    PRESENT when it is still there with the same size and saved date (to the second);
+    UNAVAILABLE (kept) when its drive or share cannot be reached, or it cannot be checked,
+    as for names Windows reserves for devices.
     """
     try:
         if not root_reachable(folder, root_cache):
@@ -111,6 +113,10 @@ def check_copy(
         if path is None:
             return MISSING
         info = os.stat(path)
+        if not stat.S_ISREG(info.st_mode):
+            # Not a plain file: a name Windows reserves for a device (NUL, CON ...). It cannot
+            # be checked, so it is kept, never removed.
+            return UNAVAILABLE
         # Compare local wall-clock seconds, as PowerShell does; this is also correct in the
         # repeated hour when daylight saving time ends (naive comparisons ignore "fold").
         saved = local_time(info.st_mtime_ns // 1_000_000_000)
@@ -119,8 +125,6 @@ def check_copy(
     except (OSError, OverflowError, ValueError):
         return UNAVAILABLE
 
-    if not stat.S_ISREG(info.st_mode):
-        return MISSING
     same = info.st_size == size_bytes and saved == last_write_time.replace(microsecond=0)
     return PRESENT if same else CHANGED
 
