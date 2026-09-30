@@ -49,7 +49,7 @@ def path_depth(path: str) -> int:
 
 def depth_sort_key(path: str) -> tuple:
     """The least nested path first, paths equally deep in path_sort_key order (as
-    Get-SortedFolder -ByDepth in PowerShell)."""
+    Get-SortedFolder in PowerShell)."""
     return (path_depth(path),) + path_sort_key(path)
 
 

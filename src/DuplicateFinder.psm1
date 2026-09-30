@@ -72,7 +72,7 @@ $script:FolderRulesTitle = "Sheet '$script:FolderSheetName': duplicate folders"
 $script:FolderRules = @(
     'A folder is listed when another folder has ALL of: the same name (ignoring upper/lower case), the same tree of files and sub folders (empty sub folders included), and every file matching the file at the same place in the other folder (same name, saved date and MD5).'
     'Only the top-most duplicates are listed: a sub folder is listed on its own only when one of its copies is outside a duplicate folder. Folders that contain no files are not listed.'
-    'Each row is one duplicated folder. Each Location column is the full path of one copy.'
+    'Each row is one duplicated folder. Each Location column is the full path of one copy: Location 1 is the least nested (fewest folders deep), the last Location the most nested; folders equally deep are in alphabetical order.'
 )
 # Written only when the scan left names or small files out. The label rows are read back, so
 # validating leaves the same names out and rewriting the report keeps the settings.
@@ -818,7 +818,7 @@ function Find-DuplicateFile {
                 SizeBytes     = $first.Length
                 MD5           = $md5ByPath[$first.FullName]
                 Count         = $set.Count
-                Folders       = Get-SortedFolder -Path @(foreach ($f in $set) { $f.DirectoryName }) -ByDepth
+                Folders       = Get-SortedFolder -Path @(foreach ($f in $set) { $f.DirectoryName })
             })
         }
     }
@@ -868,20 +868,19 @@ function Get-PathDepth {
 
 function Get-SortedFolder {
     <#
-        Folder paths in case-insensitive order (see Compare-IgnoringCase), paths differing only
-        in case in a fixed order: $script:ByPathIgnoringCase's order. With -ByDepth, the least
-        nested first (fewest folders deep, see Get-PathDepth) and paths equally deep in that
-        order. Sorted on precomputed keys compared ordinally (the depth as fixed-width digits,
-        upper case, a separator that sorts first, then the path as it is): a script block
-        comparer would be slow for files with thousands of copies.
+        The locations of a duplicate, the least nested first (fewest folders deep, see
+        Get-PathDepth); paths equally deep in case-insensitive order (see Compare-IgnoringCase),
+        and paths differing only in case in a fixed order: $script:ByPathIgnoringCase's order.
+        Sorted on precomputed keys compared ordinally (the depth as fixed-width digits, upper
+        case, a separator that sorts first, then the path as it is): a script block comparer
+        would be slow for files with thousands of copies.
     #>
-    param([Parameter(Mandatory)] [string[]] $Path, [switch] $ByDepth)
+    param([Parameter(Mandatory)] [string[]] $Path)
     $sorted = [string[]] $Path.Clone()
     if ($sorted.Count -gt 1) {
         $separator = [string] [char] 0
         $keys = [string[]] @(foreach ($p in $sorted) {
-                $depth = ''
-                if ($ByDepth) { $depth = (Get-PathDepth -Path $p).ToString('D5', [System.Globalization.CultureInfo]::InvariantCulture) }
+                $depth = (Get-PathDepth -Path $p).ToString('D5', [System.Globalization.CultureInfo]::InvariantCulture)
                 $depth + $p.ToUpperInvariant() + $separator + $p
             })
         [System.Array]::Sort([System.Array] $keys, [System.Array] $sorted, [System.Collections.IComparer] [System.StringComparer]::Ordinal)
