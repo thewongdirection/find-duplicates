@@ -6,7 +6,7 @@ param()
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
     $script:ScriptPath = Join-Path $repoRoot 'Find-Duplicates.ps1'
-    Import-Module (Join-Path $repoRoot 'src/DuplicateFinder.psm1') -Force
+    Import-Module (Join-Path $repoRoot 'DuplicateFinder.psm1') -Force
 
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem

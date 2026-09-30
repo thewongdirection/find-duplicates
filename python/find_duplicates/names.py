@@ -1,7 +1,7 @@
 """How names are compared and ordered, identically to the PowerShell tool.
 
 Mirrors ConvertTo-NameKey and the .NET ordinal comparers used in
-src/DuplicateFinder.psm1.
+DuplicateFinder.psm1.
 """
 
 from __future__ import annotations

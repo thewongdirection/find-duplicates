@@ -1,7 +1,7 @@
 """Duplicate folder matching.
 
 Mirrors Find-DuplicateFolder, Get-FolderTree and Get-FolderSignature in
-src/DuplicateFinder.psm1. Two folders are duplicates when their names match
+DuplicateFinder.psm1. Two folders are duplicates when their names match
 (ignoring case), they contain the same tree of file and sub folder names, and
 every file at the same relative path is a duplicate by the file rule (name,
 saved date and MD5). Their total sizes therefore match too.

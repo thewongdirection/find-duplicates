@@ -161,7 +161,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-Import-Module (Join-Path $PSScriptRoot 'src/DuplicateFinder.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'DuplicateFinder.psm1') -Force
 
 # Preference variables such as -Verbose do not flow into module functions, so pass it on.
 $verbose = @{ Verbose = $VerbosePreference -eq 'Continue' }

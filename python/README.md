@@ -18,12 +18,21 @@ From this `python` folder:
 python -m find_duplicates [options]
 ```
 
-Or install it once to get a `find-duplicates` command anywhere:
+Or install it once, from the repository root, to get a `find-duplicates` command
+anywhere:
 
 ```sh
 pip install ./python
 find-duplicates [options]
 ```
+
+## Deployment
+
+Python 3.9 or later is all it needs: no packages, no internet access. Copy the
+`find_duplicates` folder to the computer (or install it with `pip` as above), and
+make sure the account that runs it can read the folders to scan and write the
+report. Scheduled runs, network shares and cloud drives are covered in the
+[main README](../README.md#deployment).
 
 Built-in help: `python -m find_duplicates --help`.
 

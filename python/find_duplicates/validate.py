@@ -1,7 +1,7 @@
 """Re-check an existing report without rescanning.
 
 Mirrors Update-DuplicateReport, Invoke-CopyCheck, Test-DuplicateCopy,
-Test-DuplicateFolderCopy and Test-PathRootReachable in src/DuplicateFinder.psm1.
+Test-DuplicateFolderCopy and Test-PathRootReachable in DuplicateFinder.psm1.
 """
 
 from __future__ import annotations
