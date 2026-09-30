@@ -1713,7 +1713,8 @@ function Test-CopyInFolder {
     }
     # Names searched by .NET (Array.IndexOf) rather than indexed in a PowerShell loop:
     # folders can hold thousands of files and only a few copies.
-    $names = [string[]] @($files.Name)
+    # (A loop, not $files.Name: under strict mode that fails when the folder is empty.)
+    $names = [string[]] @(foreach ($file in $files) { $file.Name })
 
     $keys = $null  # name keys, worked out only when a name is not found as it is
     foreach ($c in $Check) {
@@ -1941,7 +1942,7 @@ function Test-DuplicateFolderCopy {
 
 function Invoke-CopyCheck {
     <#
-        Runs $TestCopy (row, location, row number) on every copy of every row. Keeps copies that are Present or
+        Runs $TestCopy (location, row number) on every copy of every row. Keeps copies that are Present or
         Unavailable, drops Missing and Changed ones, and drops rows left with fewer than
         two copies. Returns the rows kept and the counts.
     #>
@@ -1970,7 +1971,7 @@ function Invoke-CopyCheck {
         $present = [System.Collections.Generic.List[string]]::new()
         foreach ($location in $row.Folders) {
             $checked++
-            $state = & $TestCopy $row $location $i
+            $state = & $TestCopy $location $i
             if ($state -eq 'Present') { $present.Add($location); continue }
             if ($state -eq 'Unavailable') {
                 $unavailable++
@@ -2029,7 +2030,7 @@ function Update-DuplicateReport {
 
     $fileStates = Get-FileCopyState -Row $workbook.Files -ThrottleLimit $ThrottleLimit -RootCache $rootCache
     $files = Invoke-CopyCheck -Set $workbook.Files -NameProperty FileName -Noun '' -TestCopy {
-        param($row, $location, $number)
+        param($location, $number)
         $fileStates["$number|$location"]
     }
 
@@ -2037,7 +2038,7 @@ function Update-DuplicateReport {
     if ($null -ne $workbook.Folders) {
         $folderStates = Get-FolderCopyState -Row $workbook.Folders -ThrottleLimit $ThrottleLimit -RootCache $rootCache
         $folders = Invoke-CopyCheck -Set $workbook.Folders -NameProperty FolderName -Noun 'folder ' -LocationIsItem -TestCopy {
-            param($row, $location, $number)
+            param($location, $number)
             $folderStates["$number|$location"]
         }
     }
