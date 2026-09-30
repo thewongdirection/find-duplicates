@@ -1095,8 +1095,11 @@ Describe 'Unicode names' {
         $emoji = [char]::ConvertFromUtf32(0x1F600)
         $fullWidthA = [string] [char] 0xFF21
         InModuleScope DuplicateFinder -Parameters @{ Emoji = $emoji; FullWidthA = $fullWidthA } {
-            Get-SortedFolder -Path @("/x/$FullWidthA", "/x/$Emoji") | Should -Be @("/x/$Emoji", "/x/$FullWidthA")
-            Get-SortedFolder -Path @('/x/photos', '/x/Photos') | Should -Be @('/x/Photos', '/x/photos') -Because 'names differing only in case keep a fixed order'
+            # Assigned first, as the module's callers do: the function returns its array as one object.
+            $sorted = Get-SortedFolder -Path @("/x/$FullWidthA", "/x/$Emoji")
+            $sorted | Should -Be @("/x/$Emoji", "/x/$FullWidthA")
+            $sorted = Get-SortedFolder -Path @('/x/photos', '/x/Photos')
+            $sorted | Should -Be @('/x/Photos', '/x/photos') -Because 'names differing only in case keep a fixed order'
         }
     }
 
