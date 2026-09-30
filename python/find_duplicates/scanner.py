@@ -11,6 +11,7 @@ import os
 import stat
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Iterator, List, Optional
 
 from .names import sort_key
@@ -88,6 +89,25 @@ def full_path(path: str) -> str:
         if 0 < length < len(buffer):
             return buffer.value
     return path
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def local_time(seconds: float) -> datetime:
+    """Seconds since 1970-01-01 UTC as a naive local date and time, like .NET's LastWriteTime.
+
+    On Windows, datetime.fromtimestamp rejects times before 1970. Those are converted
+    with the UTC offset in force on the same date in 1972 (a leap year, so 29 February
+    exists): the same seasonal rule .NET applies to dates older than its time zone data.
+    """
+    try:
+        return datetime.fromtimestamp(seconds)
+    except (OSError, OverflowError, ValueError):
+        utc = _EPOCH + timedelta(seconds=seconds)
+        probe = utc.replace(year=1972)
+        offset = datetime.fromtimestamp(probe.timestamp()) - probe.replace(tzinfo=None)
+        return (utc + offset).replace(tzinfo=None)
 
 
 def _same_path_key(path: str) -> str:

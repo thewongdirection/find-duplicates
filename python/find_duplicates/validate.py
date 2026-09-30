@@ -16,7 +16,7 @@ from typing import Callable, Dict, List, Optional, Sequence, TypeVar
 from .folders import DuplicateFolderSet
 from .matcher import DuplicateSet
 from .names import name_key
-from .scanner import FolderRecord, iter_files
+from .scanner import FolderRecord, iter_files, local_time
 from .xlsx import export_duplicate_report, read_duplicate_workbook
 
 log = logging.getLogger("find_duplicates")
@@ -113,7 +113,7 @@ def check_copy(
         info = os.stat(path)
         # Compare local wall-clock seconds, as PowerShell does; this is also correct in the
         # repeated hour when daylight saving time ends (naive comparisons ignore "fold").
-        saved = datetime.fromtimestamp(info.st_mtime_ns // 1_000_000_000)
+        saved = local_time(info.st_mtime_ns // 1_000_000_000)
     except FileNotFoundError:
         return MISSING  # deleted while being checked
     except (OSError, OverflowError, ValueError):

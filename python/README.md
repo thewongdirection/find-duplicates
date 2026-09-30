@@ -158,6 +158,18 @@ order as .NET, so both tools produce identical reports. If the console cannot
 show a character (for example output redirected to a file in a Windows code
 page), it is printed as an escape such as `\u65e5` instead of stopping the run.
 
+## Limits and edge cases
+
+The same as for PowerShell: see
+[Limits and edge cases](../README.md#limits-and-edge-cases). Specific to Python:
+
+- On Windows, paths longer than 260 characters need the system's *long paths*
+  setting (`LongPathsEnabled`); without it such folders are skipped with a
+  warning.
+- On Windows, saved dates before 1970 are converted to local time with the rule
+  for the same date in 1972 (Python's own conversion cannot handle them there),
+  which is also what PowerShell does for dates older than Windows' time zone data.
+
 ## Running the tests
 
 ```sh
@@ -169,3 +181,7 @@ python -m unittest discover -s tests -t .
 parallel hashing, and validation, all with duplicate folders) and requires
 identical reports, sheet by sheet. It needs
 PowerShell 7 (`pwsh`) and is skipped without it; CI always runs it.
+
+`tests/test_edge_cases.py` mirrors the PowerShell *Edge cases* tests. The
+LibreOffice round trip needs LibreOffice Calc (`soffice`) and is skipped
+without it, unless `FIND_DUPLICATES_REQUIRE_LIBREOFFICE` is set (as in CI).

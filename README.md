@@ -262,6 +262,31 @@ folders you point it at, wherever they live.
 - Folder links (symlinks and junctions) are not followed, to avoid loops.
   Cloud-synced folders are followed.
 
+## Limits and edge cases
+
+Each of these is covered by an automated test on Windows, Linux and macOS
+(see [Running the tests](#running-the-tests)).
+
+| Situation | What happens |
+|---|---|
+| Paths longer than 260 characters | Scanned and validated normally by PowerShell 7 and Python. Windows PowerShell 5.1 may be unable to reach them; it then says so in a warning and carries on. Python on Windows needs the system's *long paths* setting (`LongPathsEnabled`), which current Windows versions usually have on. |
+| Files larger than 4 GB | Fully supported, including their sizes in the report. |
+| Hidden and system files and folders | Included, like any other file. |
+| Saved dates before 1970 or after 2038 | Fully supported. |
+| Copies on FAT/exFAT drives (USB sticks, memory cards) | These store saved times in 2-second steps, so a copy of a file saved at 10:30:01 shows 10:30:02 there. Such copies are **not** matched: the saved date must agree to the second. |
+| Daylight saving time | Makes no difference: dates are compared as instants. |
+| Changing the computer's time zone between the scan and `-Validate` | The report stores local times, so every copy would look changed and be removed. Validate in the time zone the scan used (a preview with `-WhatIf` shows this). |
+| A folder that is deleted, or cannot be read, during the scan | Reported as a warning and skipped; the scan carries on. |
+| A file that cannot be read (permissions, locked by another program) | Reported as a warning and left out; its other copies are still matched. |
+| The scanned folder is itself a symbolic link | Scanned through the link; locations show the link's path. |
+| Two files in one folder whose names differ only in case (Linux, or case-sensitive folders on Windows) | Reported as duplicates; the row lists that folder twice. |
+| Names Windows reserves or trims (`NUL`, `PRN.txt`, names ending in a dot or space) | Ordinary names on Linux and macOS. On Windows such files can only be made by special tools; the scan never fails on them, but may skip them with a warning. |
+| Excel limits | A file with more than 16,379 copies, more than 1,048,575 duplicated files, or a cell longer than 32,767 characters stops the tool with an error, rather than writing a report Excel would reject or cut short. |
+| Reports opened and saved in Excel or LibreOffice | Still read and validated (shared strings and re-numbered sheet parts are handled). |
+
+Some situations need real equipment and are checked by hand before a release:
+see [tests/MANUAL-TESTS.md](tests/MANUAL-TESTS.md).
+
 ## Performance
 
 Reading files is what takes the time, not the MD5 calculation: one CPU core
@@ -277,9 +302,13 @@ around reading as little as possible, and these options help further:
 | Run it on the file server | Local disk reads instead of network transfers. | Very large network shares. |
 | Scan the narrowest folder | Fewer files to list. | Always worthwhile. |
 
-Also built in: large read buffers with sequential-read hints, and plain loops
-instead of per-file script blocks when grouping (this matters on trees with
-millions of files).
+Also built in: large read buffers with sequential-read hints; plain loops
+instead of per-file script blocks when grouping and sorting; a progress display
+redrawn a few times a second rather than per file; parallel hashing through a
+fixed set of workers rather than a new job per file (which matters when there
+are many small files); and a report writer and reader that handle hundreds of
+thousands of rows. A tree of 10,000 files, all duplicated, is scanned, saved
+and validated in a few seconds.
 
 GPU/CUDA acceleration would not help: MD5 cannot be split across GPU cores
 within a single file, the bottleneck is reading the data, and copying it to
@@ -318,3 +347,12 @@ The tests also run on every push via GitHub Actions (Windows, Linux, macOS,
 and Windows PowerShell 5.1), together with the Python tests and a parity test
 that runs both versions on the same folders, with and without parallel
 hashing and validation, and requires identical reports.
+
+The *Edge cases* tests cover the situations under
+[Limits and edge cases](#limits-and-edge-cases). Some need particular
+conditions and are skipped without them: a file system that keeps case
+(Linux), symbolic links, a non-administrator account for unreadable files,
+Linux or macOS for 4 GB sparse files and time zone changes, and LibreOffice
+Calc (`soffice`) for the round trip through another spreadsheet program. CI
+installs LibreOffice on Linux and sets `FIND_DUPLICATES_REQUIRE_LIBREOFFICE=1`
+so that test cannot be skipped there.

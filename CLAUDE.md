@@ -13,7 +13,7 @@ that must behave identically:
 | Excel output/input  | `Export-DuplicateReport`, `Import-DuplicateReport` and helpers | `python/find_duplicates/xlsx.py` |
 | Duplicate folders   | `Find-DuplicateFolder`, `Get-FolderTree`, `Get-FolderSignature` | `python/find_duplicates/folders.py` |
 | Validation          | `Update-DuplicateReport`, `Invoke-CopyCheck`, `Test-DuplicateCopy`, `Test-DuplicateFolderCopy`, `Test-PathRootReachable` | `python/find_duplicates/validate.py` |
-| Tests               | `tests/DuplicateFinder.Tests.ps1`    | `python/tests/test_find_duplicates.py`, `test_folders.py`, `test_unicode.py` |
+| Tests               | `tests/DuplicateFinder.Tests.ps1`    | `python/tests/test_find_duplicates.py`, `test_folders.py`, `test_unicode.py`, `test_edge_cases.py` |
 | Cross-language test | —                                    | `python/tests/test_parity.py`          |
 
 All PowerShell functions live in `src/DuplicateFinder.psm1`.
@@ -61,7 +61,19 @@ PowerShell pitfalls this code base has hit: never assign a collection with
 `$x = if (...) { ... }` (an empty or one-item array is unrolled); return
 enumerable objects (XmlDocument, namespace managers, lists) with `, $x`;
 pass `-WhatIf`/`-Verbose` explicitly into module functions; keep
-`Array.Sort` calls on their non-generic overloads for Windows PowerShell 5.1.
+`Array.Sort` calls on their non-generic overloads, by casting the arguments to
+`[System.Array]` and `[System.Collections.IComparer]` (otherwise PowerShell
+may pick the generic overload and sort a copy of the items); remember that
+`,` binds tighter than `+` (`@('/' + $a, $b)` is `'/' + ($a, $b)`).
+
+Code that runs per file, per cell or per row (scanning, hashing, the Excel
+writer and reader) avoids pipelines, script block comparers and advanced
+function calls in the inner loop, and throttles `Write-Progress`: PowerShell's
+per-call overhead dominates on large trees and reports.
+
+Situations that need real equipment (network shares, cloud drives, Excel
+itself) are listed in `tests/MANUAL-TESTS.md`; extend it when adding such a
+feature.
 
 ## Constraints
 

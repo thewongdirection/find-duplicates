@@ -22,6 +22,8 @@ Add-Type -AssemblyName System.IO.Compression
 $script:ProgressIntervalMs = 250
 $script:ExcelMaxRows       = 1048576
 $script:ExcelMaxColumns    = 16384
+$script:ExcelMaxCellText   = 32767
+$script:SpreadsheetMain    = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'  # the SpreadsheetML namespace
 $script:FixedColumns       = @(
     @{ Header = 'File Name';     Width = 40 }
     @{ Header = 'Last Modified'; Width = 20 }
@@ -81,12 +83,22 @@ $script:ByPathIgnoringCase = [System.Comparison[string]] {
     $order
 }
 
-$script:ByDuplicateSet = [System.Comparison[object]] {
-    param($x, $y)
-    $order = Compare-IgnoringCase $x.FileName $y.FileName
-    if ($order -eq 0) { $order = $x.LastWriteTime.CompareTo($y.LastWriteTime) }
-    if ($order -eq 0) { $order = [string]::CompareOrdinal($x.MD5, $y.MD5) }
-    $order
+function Get-SortedDuplicateSet {
+    # Duplicate sets ordered by file name (ignoring case, as Compare-IgnoringCase does), then
+    # saved date, then MD5. Sorted on precomputed keys compared ordinally: a script block
+    # comparer would run far too often for large results. The separator cannot occur in file
+    # names and sorts before every other character, so a name sorts before its extensions.
+    param([Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $DuplicateSet)
+    if ($DuplicateSet.Count -gt 1) {
+        $separator = [string] [char] 0
+        $keys = [string[]] @(foreach ($set in $DuplicateSet) {
+                $set.FileName.ToUpperInvariant() + $separator + $set.LastWriteTime.Ticks.ToString('D19') + $separator + $set.MD5
+            })
+        # The casts pick the non-generic overload: with the generic one, PowerShell passes a
+        # copy of the items array and only the keys end up sorted.
+        [System.Array]::Sort([System.Array] $keys, [System.Array] $DuplicateSet, [System.Collections.IComparer] [System.StringComparer]::Ordinal)
+    }
+    , $DuplicateSet
 }
 
 #region Scanning
@@ -188,7 +200,7 @@ function Get-SortedByName {
     param([Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Item)
     if ($Item.Count -gt 1) {
         $names = [string[]] $Item.Name
-        [System.Array]::Sort($names, $Item, [System.StringComparer]::Ordinal)
+        [System.Array]::Sort([System.Array] $names, [System.Array] $Item, [System.Collections.IComparer] [System.StringComparer]::Ordinal)
     }
     , $Item
 }
@@ -256,6 +268,19 @@ function Get-FileMd5 {
     & $script:ComputeMd5 $Path
 }
 
+# Runs in each parallel runspace: hashes paths taken from a shared queue until it is empty,
+# so each worker's runspace is set up once rather than once per file. Failures are passed
+# back with the path, to be reported by the caller.
+$script:HashWorker = {
+    param($Queue, $Results, [string] $ComputeMd5)
+    $compute = [scriptblock]::Create($ComputeMd5)
+    $path = $null
+    while ($Queue.TryDequeue([ref] $path)) {
+        try { $Results.Enqueue([pscustomobject] @{ Path = $path; Md5 = [string] (& $compute $path); Error = $null }) }
+        catch { $Results.Enqueue([pscustomobject] @{ Path = $path; Md5 = $null; Error = $_.Exception }) }
+    }
+}
+
 function Get-FileMd5Map {
     <#
         Hashes files, up to $ThrottleLimit at a time, returning a map of full path -> MD5.
@@ -273,49 +298,64 @@ function Get-FileMd5Map {
 
     $map = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
     $activity = 'Comparing MD5 hashes'
+    $status = if ($ThrottleLimit -eq 1) { '' } else { " ($ThrottleLimit at a time)" }
     $done = 0
+    # Progress is shown a few times a second, not per file: drawing it costs more than
+    # hashing a small file.
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastShownMs = - $script:ProgressIntervalMs
 
     if ($ThrottleLimit -eq 1) {
         foreach ($p in $Path) {
             $done++
-            Write-Progress -Id 2 -Activity $activity -Status "File $done of $($Path.Count)" -CurrentOperation $p `
-                -PercentComplete ([int] (100 * $done / $Path.Count))
+            if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
+                $lastShownMs = $timer.ElapsedMilliseconds
+                Write-Progress -Id 2 -Activity $activity -Status "File $done of $($Path.Count)$status" -CurrentOperation $p `
+                    -PercentComplete ([int] (100 * $done / $Path.Count))
+            }
             try { $map[$p] = Get-FileMd5 -Path $p }
             catch { Write-Warning "Could not hash '$p': $(Get-InnermostMessage $_.Exception)" }
         }
     }
     else {
-        # A bounded window of jobs keeps memory flat however many files there are.
-        $window = $ThrottleLimit * 4
-        $inFlight = [System.Collections.Generic.Queue[object]]::new()
+        $queue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new($Path)
+        $results = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+        $workers = [System.Collections.Generic.List[object]]::new()
         $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ThrottleLimit)
         $pool.Open()
         try {
-            $next = 0
-            while ($next -lt $Path.Count -or $inFlight.Count -gt 0) {
-                while ($next -lt $Path.Count -and $inFlight.Count -lt $window) {
-                    $shell = [System.Management.Automation.PowerShell]::Create()
-                    $shell.RunspacePool = $pool
-                    $null = $shell.AddScript($script:ComputeMd5.ToString()).AddArgument($Path[$next])
-                    $inFlight.Enqueue([pscustomobject] @{ Path = $Path[$next]; Shell = $shell; Handle = $shell.BeginInvoke() })
-                    $next++
-                }
-
-                $job = $inFlight.Dequeue()
-                $done++
-                Write-Progress -Id 2 -Activity $activity -Status "File $done of $($Path.Count) ($ThrottleLimit at a time)" `
-                    -CurrentOperation $job.Path -PercentComplete ([int] (100 * $done / $Path.Count))
-                try {
-                    $output = $job.Shell.EndInvoke($job.Handle)
-                    if ($job.Shell.Streams.Error.Count -gt 0) { throw $job.Shell.Streams.Error[0].Exception }
-                    $map[$job.Path] = [string] $output[0]
-                }
-                catch { Write-Warning "Could not hash '$($job.Path)': $(Get-InnermostMessage $_.Exception)" }
-                finally { $job.Shell.Dispose() }
+            for ($w = 0; $w -lt [Math]::Min($ThrottleLimit, $Path.Count); $w++) {
+                $shell = [System.Management.Automation.PowerShell]::Create()
+                $shell.RunspacePool = $pool
+                $null = $shell.AddScript($script:HashWorker.ToString()).AddArgument($queue).AddArgument($results).AddArgument($script:ComputeMd5.ToString())
+                $workers.Add([pscustomobject] @{ Shell = $shell; Handle = $shell.BeginInvoke() })
             }
+
+            while ($done -lt $Path.Count) {
+                $result = $null
+                if (-not $results.TryDequeue([ref] $result)) {
+                    $busy = $false
+                    foreach ($worker in $workers) { if (-not $worker.Handle.IsCompleted) { $busy = $true } }
+                    if (-not $busy -and $results.IsEmpty) { break }  # a worker failed; EndInvoke below says why
+                    Start-Sleep -Milliseconds 5
+                    continue
+                }
+                $done++
+                if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
+                    $lastShownMs = $timer.ElapsedMilliseconds
+                    Write-Progress -Id 2 -Activity $activity -Status "File $done of $($Path.Count)$status" -CurrentOperation $result.Path `
+                        -PercentComplete ([int] (100 * $done / $Path.Count))
+                }
+                if ($null -eq $result.Error) { $map[$result.Path] = $result.Md5 }
+                else { Write-Warning "Could not hash '$($result.Path)': $(Get-InnermostMessage $result.Error)" }
+            }
+            foreach ($worker in $workers) { $null = $worker.Shell.EndInvoke($worker.Handle) }
         }
         finally {
-            foreach ($job in $inFlight) { $job.Shell.Dispose() }
+            # Leave the workers nothing more to do (on an error or Ctrl+C), then clean up.
+            $unused = $null
+            while ($queue.TryDequeue([ref] $unused)) { $unused = $null }
+            foreach ($worker in $workers) { $worker.Shell.Dispose() }
             $pool.Dispose()
         }
     }
@@ -432,8 +472,9 @@ function Find-DuplicateFile {
 
     $results = [System.Collections.Generic.List[object]]::new()
     foreach ($group in $candidateGroups) {
-        $hashed = @($group | Where-Object { $md5ByPath.ContainsKey($_.FullName) })
-        $md5s = [string[]] @($hashed | ForEach-Object { $md5ByPath[$_.FullName] })
+        # Loops rather than pipelines: large trees have thousands of groups.
+        $hashed = @(foreach ($f in $group) { if ($md5ByPath.ContainsKey($f.FullName)) { $f } })
+        $md5s = [string[]] @(foreach ($f in $hashed) { $md5ByPath[$f.FullName] })
 
         foreach ($set in @(Group-ByKey -InputItems $hashed -Key $md5s)) {
             $first = $set[0]
@@ -443,13 +484,13 @@ function Find-DuplicateFile {
                 SizeBytes     = $first.Length
                 MD5           = $md5ByPath[$first.FullName]
                 Count         = $set.Count
-                Folders       = Get-SortedFolder -Path @($set | ForEach-Object { $_.DirectoryName })
+                Folders       = Get-SortedFolder -Path @(foreach ($f in $set) { $f.DirectoryName })
             })
         }
     }
 
-    $results.Sort($script:ByDuplicateSet)
-    $results
+    $sorted = Get-SortedDuplicateSet -DuplicateSet $results.ToArray()
+    $sorted
 }
 
 function Get-SortedFolder {
@@ -699,13 +740,10 @@ function ConvertTo-ColumnName {
     $name
 }
 
-function ConvertTo-XmlSafeText {
-    # File names may contain control characters (Linux) or unpaired surrogates (NTFS)
-    # that XML 1.0 cannot represent; replace them with U+FFFD.
-    param([AllowEmptyString()] [string] $Text)
-    $invalid = '[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]'
-    [regex]::Replace($Text, $invalid, [string] [char] 0xFFFD)
-}
+# File names may contain control characters (Linux) or unpaired surrogates (NTFS) that
+# XML 1.0 cannot represent; Write-RowXml replaces them with U+FFFD. Built once: it runs per cell.
+$script:InvalidXmlChars = [regex]::new(
+    '[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]')
 
 function Write-ZipXmlEntry {
     # Creates a zip entry and passes an XmlWriter for it to $Body.
@@ -751,34 +789,47 @@ function Write-ZipTextEntry {
     finally { $stream.Dispose() }
 }
 
-function Write-Cell {
-    # Writes one <c> element. Strings are inline, numbers/dates are numeric.
-    param(
-        [Parameter(Mandatory)] [System.Xml.XmlWriter] $Writer,
-        [Parameter(Mandatory)] [string] $Reference,
-        [Parameter(Mandatory)] [AllowNull()] [AllowEmptyString()] [object] $Value,
-        [int] $Style = 0
-    )
+# Cell styles, as defined in xl/styles.xml.
+$script:StyleBold = 1
+$script:StyleDate = 2
 
-    $ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-    $Writer.WriteStartElement('c', $ns)
-    $Writer.WriteAttributeString('r', $Reference)
-    if ($Style) { $Writer.WriteAttributeString('s', [string] $Style) }
+function Write-RowXml {
+    # Writes one <row> element and its cells: strings inline, numbers and dates numeric.
+    # Called once per row and writing the cells itself, with no parameter validation:
+    # it runs for every row of reports that can hold millions of cells.
+    param([System.Xml.XmlWriter] $Writer, [int] $Number, [object[]] $Values, [string[]] $Letters, [switch] $Bold)
 
+    $ns = $script:SpreadsheetMain
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
-    if ($Value -is [datetime]) {
-        $Writer.WriteElementString('v', $ns, $Value.ToOADate().ToString('R', $invariant))
-    }
-    elseif ($Value -is [int] -or $Value -is [long] -or $Value -is [double]) {
-        $Writer.WriteElementString('v', $ns, $Value.ToString($invariant))
-    }
-    else {
-        $Writer.WriteAttributeString('t', 'inlineStr')
-        $Writer.WriteStartElement('is', $ns)
-        $Writer.WriteStartElement('t', $ns)
-        $Writer.WriteAttributeString('xml', 'space', 'http://www.w3.org/XML/1998/namespace', 'preserve')
-        $Writer.WriteString((ConvertTo-XmlSafeText ([string] $Value)))
-        $Writer.WriteEndElement()
+    $Writer.WriteStartElement('row', $ns)
+    $Writer.WriteAttributeString('r', [string] $Number)
+    for ($c = 0; $c -lt $Values.Count; $c++) {
+        $value = $Values[$c]
+        $Writer.WriteStartElement('c', $ns)
+        $Writer.WriteAttributeString('r', $Letters[$c] + $Number)
+        if ($value -is [datetime]) {
+            $Writer.WriteAttributeString('s', [string] $script:StyleDate)
+            $Writer.WriteElementString('v', $ns, $value.ToOADate().ToString('R', $invariant))
+        }
+        else {
+            if ($Bold) { $Writer.WriteAttributeString('s', [string] $script:StyleBold) }
+            if ($value -is [int] -or $value -is [long] -or $value -is [double]) {
+                $Writer.WriteElementString('v', $ns, $value.ToString($invariant))
+            }
+            else {
+                $text = [string] $value
+                if ($text.Length -gt $script:ExcelMaxCellText) {
+                    throw "Cell $($Letters[$c])$Number would hold $($text.Length) characters; Excel allows at most $($script:ExcelMaxCellText)."
+                }
+                $Writer.WriteAttributeString('t', 'inlineStr')
+                $Writer.WriteStartElement('is', $ns)
+                $Writer.WriteStartElement('t', $ns)
+                $Writer.WriteAttributeString('xml', 'space', 'http://www.w3.org/XML/1998/namespace', 'preserve')
+                $Writer.WriteString($script:InvalidXmlChars.Replace($text, [string] [char] 0xFFFD))
+                $Writer.WriteEndElement()
+                $Writer.WriteEndElement()
+            }
+        }
         $Writer.WriteEndElement()
     }
     $Writer.WriteEndElement()
@@ -825,9 +876,7 @@ function Write-WorksheetXml {
         [Parameter(Mandatory)] [object] $Sheet
     )
 
-    $ns        = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-    $styleBold = 1
-    $styleDate = 2
+    $ns = $script:SpreadsheetMain
 
     $Writer.WriteStartElement('worksheet', $ns)
 
@@ -858,25 +907,15 @@ function Write-WorksheetXml {
 
     $Writer.WriteStartElement('sheetData', $ns)
 
-    # Header row.
-    $Writer.WriteStartElement('row', $ns)
-    $Writer.WriteAttributeString('r', [string] $Sheet.HeaderRow)
-    for ($c = 0; $c -lt $Sheet.Headers.Count; $c++) {
-        Write-Cell -Writer $Writer -Reference "$(ConvertTo-ColumnName ($c + 1))$($Sheet.HeaderRow)" -Value $Sheet.Headers[$c] -Style $styleBold
-    }
-    $Writer.WriteEndElement()
+    # Column letters, worked out once rather than per cell (large reports have millions of cells).
+    $letters = [string[]] @(for ($c = 1; $c -le $Sheet.Headers.Count; $c++) { ConvertTo-ColumnName $c })
+    Write-RowXml -Writer $Writer -Number $Sheet.HeaderRow -Values $Sheet.Headers -Letters $letters -Bold
 
     # One row per duplicated item; one column per copy.
     $rowNumber = $Sheet.HeaderRow
     foreach ($values in $Sheet.Rows) {
         $rowNumber++
-        $Writer.WriteStartElement('row', $ns)
-        $Writer.WriteAttributeString('r', [string] $rowNumber)
-        for ($c = 0; $c -lt $values.Count; $c++) {
-            $style = if ($values[$c] -is [datetime]) { $styleDate } else { 0 }
-            Write-Cell -Writer $Writer -Reference "$(ConvertTo-ColumnName ($c + 1))$rowNumber" -Value $values[$c] -Style $style
-        }
-        $Writer.WriteEndElement()
+        Write-RowXml -Writer $Writer -Number $rowNumber -Values $values -Letters $letters
     }
 
     $Writer.WriteEndElement()  # sheetData
@@ -911,7 +950,7 @@ function Write-RulesSheetXml {
         [Parameter(Mandatory)] [object] $Sheet
     )
 
-    $ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    $ns = $script:SpreadsheetMain
     $Writer.WriteStartElement('worksheet', $ns)
     $Writer.WriteStartElement('cols', $ns)
     $Writer.WriteStartElement('col', $ns)
@@ -926,11 +965,7 @@ function Write-RulesSheetXml {
     for ($r = 0; $r -lt $Sheet.Lines.Count; $r++) {
         $line = $Sheet.Lines[$r]
         if ($null -eq $line) { continue }  # a blank row
-        $Writer.WriteStartElement('row', $ns)
-        $Writer.WriteAttributeString('r', [string] ($r + 1))
-        $style = if ($line.Bold) { 1 } else { 0 }
-        Write-Cell -Writer $Writer -Reference "A$($r + 1)" -Value $line.Text -Style $style
-        $Writer.WriteEndElement()
+        Write-RowXml -Writer $Writer -Number ($r + 1) -Values @($line.Text) -Letters @('A') -Bold:$line.Bold
     }
     $Writer.WriteEndElement()  # sheetData
     $Writer.WriteEndElement()  # worksheet
@@ -1023,7 +1058,7 @@ function Export-DuplicateReport {
                     "<Relationship Id=`"$stylesId`" Type=`"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles`" Target=`"styles.xml`"/>" +
                     '</Relationships>')
 
-                # Style 0 = default, 1 = bold header, 2 = date/time.
+                # Style 0 = default, 1 = bold ($script:StyleBold), 2 = date/time ($script:StyleDate).
                 Write-ZipTextEntry -Archive $zip -EntryName 'xl/styles.xml' -Content (
                     '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
                     '<numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/></numFmts>' +
@@ -1098,15 +1133,27 @@ function Get-SpreadsheetNamespace {
     # A namespace manager for one parsed part (s: SpreadsheetML, p: package relationships).
     param([Parameter(Mandatory)] [System.Xml.XmlDocument] $Xml)
     $ns = [System.Xml.XmlNamespaceManager]::new($Xml.NameTable)
-    $ns.AddNamespace('s', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main')
+    $ns.AddNamespace('s', $script:SpreadsheetMain)
     $ns.AddNamespace('p', 'http://schemas.openxmlformats.org/package/2006/relationships')
     , $ns  # a namespace manager would otherwise be enumerated into its prefixes
 }
 
 function Get-CellText {
-    # Text of an inline or shared string, including rich-text runs (phonetic runs excluded).
-    param([Parameter(Mandatory)] [System.Xml.XmlNode] $Node, [Parameter(Mandatory)] [System.Xml.XmlNamespaceManager] $Ns)
-    -join @($Node.SelectNodes('s:t | s:r/s:t', $Ns) | ForEach-Object { $_.InnerText })
+    # Text of an inline (<is>) or shared (<si>) string, including rich-text runs (<r>);
+    # phonetic runs (<rPh>) are left out. Walks child nodes rather than running XPath
+    # queries, and has no parameter validation: this runs for every text cell.
+    param([System.Xml.XmlNode] $Node)
+    $text = ''
+    if ($null -eq $Node) { return $text }
+    foreach ($child in $Node.ChildNodes) {
+        if ($child.NamespaceURI -ne $script:SpreadsheetMain) { continue }
+        if ($child.LocalName -eq 't') { $text += $child.InnerText }
+        elseif ($child.LocalName -eq 'r') {
+            $run = $child.Item('t', $script:SpreadsheetMain)
+            if ($run) { $text += $run.InnerText }
+        }
+    }
+    $text
 }
 
 function Get-WorkbookSheet {
@@ -1140,7 +1187,7 @@ function Get-SharedString {
     $sharedXml = Read-ZipXml -Archive $Archive -EntryName 'xl/sharedStrings.xml'
     if ($sharedXml) {
         $ns = Get-SpreadsheetNamespace -Xml $sharedXml
-        foreach ($item in $sharedXml.SelectNodes('/s:sst/s:si', $ns)) { $shared.Add((Get-CellText -Node $item -Ns $ns)) }
+        foreach ($item in $sharedXml.SelectNodes('/s:sst/s:si', $ns)) { $shared.Add((Get-CellText -Node $item)) }
     }
     , $shared
 }
@@ -1157,19 +1204,37 @@ function Get-WorksheetRow {
     $sheet = Read-ZipXml -Archive $Archive -EntryName $SheetPath
     $sheetNs = Get-SpreadsheetNamespace -Xml $sheet
 
+    # Column numbers by letters, worked out once per sheet: a sheet has few distinct columns
+    # but may have millions of cells.
+    $columnOf = [System.Collections.Generic.Dictionary[string, int]]::new()
+    $digits = '0123456789'.ToCharArray()
+
     foreach ($row in $sheet.SelectNodes('/s:worksheet/s:sheetData/s:row', $sheetNs)) {
         $cells = [System.Collections.Generic.Dictionary[int, string]]::new()
         $column = 0
-        foreach ($cell in $row.SelectNodes('s:c', $sheetNs)) {
+        foreach ($cell in $row.ChildNodes) {
+            if ($cell.LocalName -ne 'c' -or $cell.NamespaceURI -ne $script:SpreadsheetMain) { continue }
             $reference = $cell.GetAttribute('r')
             # Excel may leave out empty cells, so place each by its reference when present.
-            $column = if ($reference) { ConvertFrom-ColumnName ($reference -replace '\d', '') } else { $column + 1 }
-            $value = $cell.SelectSingleNode('s:v', $sheetNs)
-            $cells[$column] = switch ($cell.GetAttribute('t')) {
-                's'         { $SharedString[[int] $value.InnerText] }
-                'inlineStr' { Get-CellText -Node $cell.SelectSingleNode('s:is', $sheetNs) -Ns $sheetNs }
-                default     { if ($value) { $value.InnerText } else { '' } }
+            if ($reference) {
+                $letters = $reference.TrimEnd($digits)
+                if (-not $columnOf.ContainsKey($letters)) { $columnOf[$letters] = ConvertFrom-ColumnName $letters }
+                $column = $columnOf[$letters]
             }
+            else { $column++ }
+            $value = $cell.Item('v', $script:SpreadsheetMain)
+            $type = $cell.GetAttribute('t')
+            if ($type -eq 's') { $cells[$column] = $SharedString[[int] $value.InnerText] }
+            elseif ($type -eq 'inlineStr') {
+                # Plain text is a lone <t>; take it directly (a function call per cell is slow).
+                $inline = $cell.Item('is', $script:SpreadsheetMain)
+                $only = $null
+                if ($null -ne $inline -and $inline.ChildNodes.Count -eq 1) { $only = $inline.FirstChild }
+                if ($null -ne $only -and $only.LocalName -eq 't') { $cells[$column] = $only.InnerText }
+                else { $cells[$column] = Get-CellText -Node $inline }
+            }
+            elseif ($value) { $cells[$column] = $value.InnerText }
+            else { $cells[$column] = '' }
         }
 
         $width = 0
@@ -1212,8 +1277,9 @@ function Select-ReportRow {
 }
 
 function ConvertFrom-CellNumber {
-    # A numeric cell's text as a number, or a clear error naming the report.
-    param([AllowNull()] [AllowEmptyString()] [string] $Text, [Parameter(Mandatory)] [string] $Path)
+    # A numeric cell's text as a number, or a clear error naming the report. A simple
+    # function (no parameter validation): it runs for several cells of every row.
+    param([string] $Text, [string] $Path)
     $number = 0.0
     if (-not [double]::TryParse($Text, [System.Globalization.NumberStyles]::Float,
             [System.Globalization.CultureInfo]::InvariantCulture, [ref] $number)) {

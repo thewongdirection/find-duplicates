@@ -30,6 +30,7 @@ from .matcher import DuplicateSet
 
 EXCEL_MAX_ROWS = 1_048_576
 EXCEL_MAX_COLUMNS = 16_384
+EXCEL_MAX_CELL_TEXT = 32_767  # in UTF-16 code units, as Excel and .NET count them
 FIXED_COLUMNS = (
     ("File Name", 40),
     ("Last Modified", 20),
@@ -151,6 +152,13 @@ def _cell(reference: str, value: CellValue, style: int = 0) -> str:
         return f'<c r="{reference}"{style_attr}><v>{excel_serial(value)!r}</v></c>'
     if isinstance(value, int):
         return f'<c r="{reference}"{style_attr}><v>{value}</v></c>'
+    # Only long text needs its UTF-16 length measured (it is at most twice len()).
+    if len(value) > EXCEL_MAX_CELL_TEXT // 2:
+        length = len(value.encode("utf-16-le", "surrogatepass")) // 2
+        if length > EXCEL_MAX_CELL_TEXT:
+            raise ValueError(
+                f"Cell {reference} would hold {length} characters; Excel allows at most {EXCEL_MAX_CELL_TEXT}."
+            )
     return (
         f'<c r="{reference}"{style_attr} t="inlineStr"><is>'
         f'<t xml:space="preserve">{xml_safe_text(value)}</t></is></c>'
@@ -402,19 +410,29 @@ def _worksheet_rows(archive: zipfile.ZipFile, sheet_path: str, shared: List[str]
     """
     rows = []
     sheet = _read_xml(archive, sheet_path)
+    cell_tag, value_tag, inline_tag = f"{{{MAIN_NS}}}c", f"{{{MAIN_NS}}}v", f"{{{MAIN_NS}}}is"
+    # Column numbers by letters, worked out once per sheet: a sheet has few distinct
+    # columns but may have millions of cells.
+    column_of: Dict[str, int] = {}
     for row in sheet.findall(f"{{{MAIN_NS}}}sheetData/{{{MAIN_NS}}}row"):
         cells: Dict[int, str] = {}
         column = 0
-        for cell in row.findall(f"{{{MAIN_NS}}}c"):
+        for cell in row.findall(cell_tag):
             reference = cell.get("r")
             # Excel may leave out empty cells, so place each by its reference when present.
-            column = column_index(re.sub(r"\d", "", reference)) if reference else column + 1
-            value = cell.find(f"{{{MAIN_NS}}}v")
+            if reference:
+                letters = reference.rstrip("0123456789")
+                if letters not in column_of:
+                    column_of[letters] = column_index(letters)
+                column = column_of[letters]
+            else:
+                column += 1
+            value = cell.find(value_tag)
             kind = cell.get("t")
             if kind == "s":
                 cells[column] = shared[int(value.text)]
             elif kind == "inlineStr":
-                cells[column] = _cell_text(cell.find(f"{{{MAIN_NS}}}is"))
+                cells[column] = _cell_text(cell.find(inline_tag))
             else:
                 cells[column] = (value.text or "") if value is not None else ""
         width = max(cells, default=0)

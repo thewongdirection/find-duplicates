@@ -23,7 +23,7 @@ from datetime import datetime
 from typing import Callable, Dict, Hashable, Iterable, List, Optional, Sequence, TypeVar
 
 from .names import name_key, path_sort_key, sort_key
-from .scanner import FileRecord, is_cloud_only
+from .scanner import FileRecord, is_cloud_only, local_time
 
 log = logging.getLogger("find_duplicates")
 
@@ -195,7 +195,7 @@ def find_duplicate_files(
             results.append(
                 DuplicateSet(
                     file_name=first.name,
-                    last_write_time=datetime.fromtimestamp(first.mtime_ns / NS_PER_SECOND),
+                    last_write_time=local_time(first.mtime_ns / NS_PER_SECOND),
                     size_bytes=first.size,
                     md5=md5,
                     count=len(same),
