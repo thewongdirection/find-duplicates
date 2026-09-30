@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from find_duplicates import cli, matcher, scanner, validate  # noqa: E402
 from find_duplicates.folders import find_duplicate_folders  # noqa: E402
 from find_duplicates.matcher import DuplicateSet, find_duplicate_files, md5_file  # noqa: E402
+from find_duplicates.names import path_depth  # noqa: E402
 from find_duplicates.scanner import FileRecord, iter_files, local_time, utc_offset  # noqa: E402
 from find_duplicates.validate import validate_report  # noqa: E402
 from find_duplicates.xlsx import (  # noqa: E402
@@ -401,6 +402,19 @@ class FindDuplicateFilesTests(TempDirTestCase):
                       add_file(self.root, f"{folder}/large.txt", "l" * 11)]
         result = find_duplicate_files(self.records(*paths), minimum_size=10)
         self.assertEqual([d.file_name for d in result], ["exact.txt", "large.txt"])
+
+    def test_orders_each_rows_locations_from_the_least_to_the_most_nested(self):
+        paths = [add_file(self.root, f"{folder}/x.txt") for folder in ("z", "a/b/c", "a/b", "B", "a/C/c")]
+
+        (result,) = find_duplicate_files(self.records(*paths))
+
+        expected = [os.path.join(self.root, *folder.split("/")) for folder in ("B", "z", "a/b", "a/b/c", "a/C/c")]
+        self.assertEqual(result.folders, expected, "equally deep folders keep their alphabetical order")
+
+    def test_counts_how_many_folders_deep_a_path_is(self):
+        self.assertEqual(path_depth("C:\\a\\b"), 3)
+        self.assertEqual(path_depth("/home/a/"), 2)
+        self.assertEqual(path_depth("\\\\server\\share\\a"), 3)
 
     def test_returns_nothing_for_an_empty_list(self):
         self.assertEqual(find_duplicate_files([]), [])
@@ -1000,6 +1014,11 @@ class ValidateReportTests(TempDirTestCase):
             recorded = datetime.fromtimestamp(saved.timestamp())
             state = validate.check_copy(os.path.dirname(path), "x.txt", os.path.getsize(path), recorded)
             self.assertEqual(state, validate.PRESENT)
+
+    def test_reports_a_copy_deleted_while_being_checked_as_missing(self):
+        path = add_file(self.root, "gone.txt")
+        os.remove(path)
+        self.assertEqual(validate._copy_state(lambda: os.stat(path), 1, datetime.now(), None), validate.MISSING)
 
     def test_keeps_a_copy_whose_size_and_saved_date_cannot_be_read(self):
         # As for a file named NUL on Windows, which the system treats as a device.

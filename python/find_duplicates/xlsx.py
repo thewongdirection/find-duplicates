@@ -68,7 +68,9 @@ FILE_RULES_TITLE = f"Sheet '{FILE_SHEET_NAME}': duplicate files"
 FILE_RULES = (
     "A file is listed when another file has ALL of: the same name (ignoring upper/lower case), the same saved date "
     "(last modified, to the whole second) and the same contents (MD5 hash).",
-    "Each row is one duplicated file. Each Location column is the full path of a folder that holds a copy.",
+    "Each row is one duplicated file. Each Location column is the full path of a folder that holds a copy: Location 1 "
+    "is the least nested (fewest folders deep), the last Location the most nested; folders equally deep are in "
+    "alphabetical order.",
     "Last Modified is local time on the computer that ran the scan, and UTC Offset its difference from UTC then, "
     "so the report can be checked in any time zone.",
     "Files of 0 bytes are included unless the scan used -IgnoreEmptyFiles (Python: --ignore-empty-files).",

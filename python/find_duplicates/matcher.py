@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Dict, Hashable, Iterable, List, Optional, Sequence, TypeVar
 
-from .names import name_key, path_sort_key, sort_key
+from .names import depth_sort_key, name_key, sort_key
 from . import scanner
 from .scanner import FileRecord, is_cloud_only, local_time, utc_offset
 
@@ -285,7 +285,7 @@ def find_duplicate_files(
                     size_bytes=first.size,
                     md5=md5,
                     count=len(same),
-                    folders=sorted((record.folder for record, _ in same), key=path_sort_key),
+                    folders=sorted((record.folder for record, _ in same), key=depth_sort_key),
                 )
             )
 

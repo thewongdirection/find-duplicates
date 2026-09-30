@@ -20,7 +20,8 @@
     A "Rules" sheet in the report states the matching rules in plain words.
     The report has one row per duplicated file with the columns
     File Name | Last Modified | UTC Offset | Size (bytes) | MD5 | Copies | Location 1 | ...
-    where each "Location" column holds the full folder path of one copy. Last Modified
+    where each "Location" column holds the full folder path of one copy, from the least
+    nested (Location 1) to the most nested. Last Modified
     is local time and UTC Offset its difference from UTC, so -Validate works in any
     time zone.
 

@@ -73,6 +73,15 @@ Needs Excel on Windows or macOS.
    smallest size, and save. `-Validate` warns that it ignores the size, leaves
    out the added names too, and keeps the names row when it rewrites the report.
 
+## Locked-down Windows
+
+1. **Constrained Language Mode or AppLocker.** On a computer where PowerShell
+   runs in Constrained Language Mode, importing the module fails with a clear
+   error from `Add-Type` (its compiled helpers cannot be built there); use the
+   Python tool on such computers.
+2. **No writable temp folder.** Windows PowerShell 5.1 compiles the helpers in
+   `%TEMP%`; with it read-only, importing fails with a clear error.
+
 ## Very long paths on Windows PowerShell 5.1
 
 1. On Windows with the *long paths* setting on and off, scan a folder whose

@@ -445,6 +445,24 @@ Describe 'Find-DuplicateFile' {
         (Find-DuplicateFile -File $scanned).FileName | Should -BeExactly 'Photo.JPG'
     }
 
+    It 'orders each row''s locations from the least to the most nested' {
+        $root = Add-TestRoot
+        $files = @(foreach ($folder in 'z', 'a/b/c', 'a/b', 'B', 'a/C/c') { Add-TestFile $root "$folder/x.txt" })
+
+        $result = @(Find-DuplicateFile -File $files)
+
+        $expected = @('B', 'z', 'a/b', 'a/b/c', 'a/C/c') | ForEach-Object { [System.IO.Path]::GetFullPath((Join-Path $root $_)) }
+        $result[0].Folders | Should -BeExactly $expected -Because 'equally deep folders keep their alphabetical order'
+    }
+
+    It 'counts how many folders deep a path is' {
+        InModuleScope DuplicateFinder {
+            Get-PathDepth -Path 'C:\a\b' | Should -Be 3
+            Get-PathDepth -Path '/home/a/' | Should -Be 2
+            Get-PathDepth -Path '\\server\share\a' | Should -Be 3
+        }
+    }
+
     It 'includes files of 0 bytes by default' {
         $root = Add-TestRoot
         $files = @(
@@ -1199,6 +1217,15 @@ Describe 'Update-DuplicateReport' {
         InModuleScope DuplicateFinder -Parameters @{ Folder = "${free}:\photos" } {
             Test-DuplicateCopy -Folder $Folder -FileName 'x.txt' -SizeBytes 1 -LastWriteTime ([datetime]::Now) |
                 Should -Be 'Unavailable'
+        }
+    }
+
+    It 'reports a copy deleted while being checked as missing' {
+        $path = (Add-TestFile (Add-TestRoot) 'gone.txt').FullName
+        $file = [System.IO.FileInfo] $path  # reads nothing up front, as on Linux and macOS
+        Remove-Item -LiteralPath $path
+        InModuleScope DuplicateFinder -Parameters @{ File = $file } {
+            Get-CopyState -File $File -SizeBytes 1 -LastWriteTime ([datetime]::Now) -UtcOffset $null | Should -Be 'Missing'
         }
     }
 

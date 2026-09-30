@@ -257,17 +257,20 @@ On the *Duplicates* sheet: one row per duplicated file, one column per copy:
 
 | File Name  | Last Modified       | UTC Offset | Size (bytes) | MD5     | Copies | Location 1     | Location 2        | Location 3 |
 |------------|---------------------|------------|--------------|---------|--------|----------------|-------------------|------------|
-| report.doc | 2024-05-17 10:30:00 | +10:00     | 48128        | 9A0F... | 3      | D:\Docs\2024   | D:\Backup\Docs    | E:\Old     |
+| report.doc | 2024-05-17 10:30:00 | +10:00     | 48128        | 9A0F... | 3      | E:\Old         | D:\Backup\Docs    | D:\Docs\2024 |
 
 - Each `Location` column holds the full folder path of one copy; there are as
-  many columns as the file with the most copies needs.
+  many columns as the file with the most copies needs. *Location 1* is the least
+  nested copy (fewest folders deep) and the last one the most nested, so the
+  copy furthest right is usually the one to delete; copies equally deep are in
+  alphabetical order.
 - The header row is frozen and has filters; *Last Modified* is a real Excel
   date; *Size* and *Copies* are numbers.
 - *Last Modified* is local time on the computer that ran the scan, and *UTC
   Offset* its difference from UTC at that date (daylight saving included), so
   the moment each file was saved is known in any time zone.
-- Rows are sorted by file name, then saved date, then MD5; locations are sorted
-  by path. Where copies' names differ only in case, the row shows the name of
+- Rows are sorted by file name, then saved date, then MD5; locations from the
+  least to the most nested, as above. Where copies' names differ only in case, the row shows the name of
   the copy in the alphabetically first folder.
 - A report saved inside the scanned folder is not counted as a file.
 
@@ -342,6 +345,11 @@ fixed set of workers rather than a new job per file (which matters when there
 are many small files); and a report writer and reader that handle hundreds of
 thousands of rows. A tree of 10,000 files, all duplicated, is scanned, saved
 and validated in a few seconds.
+
+The PowerShell module's per-file loops (grouping names, listing folders, hashing,
+reading the report, checking copies) run as compiled .NET code, which the module
+builds from `src/DuplicateFinder.cs` when it is imported (about half a second, once
+per PowerShell session); no separate download or install is involved.
 
 GPU/CUDA acceleration would not help: MD5 cannot be split across GPU cores
 within a single file, the bottleneck is reading the data, and copying it to
