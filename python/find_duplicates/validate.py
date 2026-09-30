@@ -10,7 +10,7 @@ import logging
 import os
 import stat
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional, Sequence, TypeVar
 
 from .folders import DuplicateFolderSet
@@ -28,6 +28,7 @@ UNAVAILABLE = "Unavailable"  # its drive or network share cannot be reached (kep
 
 Row = TypeVar("Row", DuplicateSet, DuplicateFolderSet)
 RootCache = Dict[str, bool]
+_EPOCH = datetime(1970, 1, 1)
 
 # Called with (file or folder name, rows checked so far, total rows).
 RowCallback = Callable[[str, int, int], None]
@@ -96,9 +97,17 @@ def _find_by_name_key(folder: str, file_name: str) -> Optional[str]:
 
 
 def check_copy(
-    folder: str, file_name: str, size_bytes: int, last_write_time: datetime, root_cache: Optional[RootCache] = None
+    folder: str,
+    file_name: str,
+    size_bytes: int,
+    last_write_time: datetime,
+    root_cache: Optional[RootCache] = None,
+    utc_offset: Optional[timedelta] = None,
 ) -> str:
     """Check one recorded file copy without reading its contents.
+
+    ``utc_offset`` is the report's offset for ``last_write_time``; without one (older
+    reports) the saved date is compared as local time on this computer.
 
     PRESENT when it is still there with the same size and saved date (to the second);
     UNAVAILABLE (kept) when its drive or share cannot be reached, or it cannot be checked,
@@ -117,16 +126,20 @@ def check_copy(
             # Not a plain file: a name Windows reserves for a device (NUL, CON ...). It cannot
             # be checked, so it is kept, never removed.
             return UNAVAILABLE
-        # Compare local wall-clock seconds, as PowerShell does; this is also correct in the
-        # repeated hour when daylight saving time ends (naive comparisons ignore "fold").
-        saved = local_time(info.st_mtime_ns // 1_000_000_000)
+        seconds = info.st_mtime_ns // 1_000_000_000
+        if utc_offset is None:
+            # Compare local wall-clock seconds, as PowerShell does; this is also correct in the
+            # repeated hour when daylight saving time ends (naive comparisons ignore "fold").
+            same_date = local_time(seconds) == last_write_time.replace(microsecond=0)
+        else:
+            # Compare instants: correct whatever this computer's time zone.
+            same_date = seconds == (last_write_time - utc_offset - _EPOCH) // timedelta(seconds=1)
     except FileNotFoundError:
         return MISSING  # deleted while being checked
     except (OSError, OverflowError, ValueError):
         return UNAVAILABLE
 
-    same = info.st_size == size_bytes and saved == last_write_time.replace(microsecond=0)
-    return PRESENT if same else CHANGED
+    return PRESENT if info.st_size == size_bytes and same_date else CHANGED
 
 
 def check_folder_copy(
@@ -222,7 +235,9 @@ def validate_report(path: str, dry_run: bool = False, on_row: Optional[RowCallba
 
     files = _check_rows(
         workbook.files,
-        lambda row, location: check_copy(location, row.file_name, row.size_bytes, row.last_write_time, root_cache),
+        lambda row, location: check_copy(
+            location, row.file_name, row.size_bytes, row.last_write_time, root_cache, row.utc_offset
+        ),
         lambda row: row.file_name,
         noun="",
         on_row=on_row,

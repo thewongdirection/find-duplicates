@@ -4,8 +4,8 @@ Mirrors Export-DuplicateReport, Import-DuplicateReport and Import-DuplicateFolde
 in src/DuplicateFinder.psm1 and writes the same workbook:
 
 * sheet "Duplicates": one row per duplicated file with the columns File Name, Last
-  Modified, Size (bytes), MD5, Copies, then "Location 1..N" holding the full folder
-  path of every copy;
+  Modified, UTC Offset, Size (bytes), MD5, Copies, then "Location 1..N" holding the
+  full folder path of every copy;
 * sheet "Duplicate Folders" (only when folder sets are given): one row per
   duplicated folder with the columns Folder Name, Files, Sub Folders, Size (bytes),
   Copies, then "Location 1..N" holding the full path of every copy.
@@ -27,6 +27,7 @@ from xml.sax.saxutils import escape
 
 from .folders import DuplicateFolderSet
 from .matcher import DuplicateSet
+from .scanner import local_utc_offset
 
 EXCEL_MAX_ROWS = 1_048_576
 EXCEL_MAX_COLUMNS = 16_384
@@ -34,10 +35,13 @@ EXCEL_MAX_CELL_TEXT = 32_767  # in UTF-16 code units, as Excel and .NET count th
 FIXED_COLUMNS = (
     ("File Name", 40),
     ("Last Modified", 20),
+    ("UTC Offset", 11),
     ("Size (bytes)", 14),
     ("MD5", 34),
     ("Copies", 8),
 )
+# Reports written before the UTC Offset column; still read, and validated by local time.
+LEGACY_FIXED_COLUMNS = tuple(column for column in FIXED_COLUMNS if column[0] != "UTC Offset")
 FOLDER_COLUMNS = (
     ("Folder Name", 40),
     ("Files", 10),
@@ -60,6 +64,8 @@ FILE_RULES = (
     "A file is listed when another file has ALL of: the same name (ignoring upper/lower case), the same saved date "
     "(last modified, to the whole second) and the same contents (MD5 hash).",
     "Each row is one duplicated file. Each Location column is the full path of a folder that holds a copy.",
+    "Last Modified is local time on the computer that ran the scan, and UTC Offset its difference from UTC then, "
+    "so the report can be checked in any time zone.",
     "Files of 0 bytes are included unless the scan used -IgnoreEmptyFiles (Python: --ignore-empty-files).",
 )
 FOLDER_RULES_TITLE = f"Sheet '{FOLDER_SHEET_NAME}': duplicate folders"
@@ -144,6 +150,28 @@ def excel_serial(value: datetime) -> float:
 def from_excel_serial(serial: float) -> datetime:
     """An Excel date serial number as a datetime, rounded to the millisecond like .NET DateTime.FromOADate."""
     return EXCEL_EPOCH + timedelta(milliseconds=int(serial * MS_PER_DAY + 0.5))
+
+
+def utc_offset_text(offset: timedelta) -> str:
+    """A UTC offset as text: +10:00, -04:30, or with seconds (+00:19:32) for historic local times."""
+    seconds = int(offset.total_seconds())
+    sign = "-" if seconds < 0 else "+"
+    hours, rest = divmod(abs(seconds), 3600)
+    minutes, seconds = divmod(rest, 60)
+    return f"{sign}{hours:02}:{minutes:02}" + (f":{seconds:02}" if seconds else "")
+
+
+_UTC_OFFSET = re.compile(r"([+-])(\d{2}):(\d{2})(?::(\d{2}))?")
+
+
+def parse_utc_offset(text: Optional[str], path: str) -> timedelta:
+    """The reverse of utc_offset_text, or a clear error naming the report."""
+    parts = _UTC_OFFSET.fullmatch(text or "")
+    if parts is None:
+        raise ValueError(f"'{path}' could not be read as a duplicates report: '{text or ''}' is not a UTC offset.")
+    sign, hours, minutes, seconds = parts.groups()
+    offset = timedelta(hours=int(hours), minutes=int(minutes), seconds=int(seconds or 0))
+    return -offset if sign == "-" else offset
 
 
 def _cell(reference: str, value: CellValue, style: int = 0) -> str:
@@ -315,6 +343,14 @@ def _package_parts(sheets: Sequence[Union[_Sheet, _RulesSheet]]) -> Dict[str, st
     }
 
 
+def _offset_of(duplicate: DuplicateSet) -> timedelta:
+    # Sets without an offset (read from a report made before the UTC Offset column, or built
+    # by hand) use this computer's offset at their saved date.
+    if duplicate.utc_offset is not None:
+        return duplicate.utc_offset
+    return local_utc_offset(duplicate.last_write_time)
+
+
 def export_duplicate_report(
     duplicates: Sequence[DuplicateSet], path: str, folders: Optional[Sequence[DuplicateFolderSet]] = None
 ) -> None:
@@ -328,7 +364,11 @@ def export_duplicate_report(
         _sheet(
             FILE_SHEET_NAME,
             FIXED_COLUMNS,
-            [[d.file_name, d.last_write_time, d.size_bytes, d.md5, d.count] + list(d.folders) for d in duplicates],
+            [
+                [d.file_name, d.last_write_time, utc_offset_text(_offset_of(d)), d.size_bytes, d.md5, d.count]
+                + list(d.folders)
+                for d in duplicates
+            ],
             "file",
         )
     ]
@@ -440,25 +480,35 @@ def _worksheet_rows(archive: zipfile.ZipFile, sheet_path: str, shared: List[str]
     return rows
 
 
-def _report_rows(rows: List[List[Optional[str]]], columns: Columns, error: str) -> List[Tuple[List[str], List[str]]]:
+def _is_header(row: List[Optional[str]], headers: Sequence[str]) -> bool:
+    return len(row) >= len(headers) and all((cell or "").casefold() == name.casefold() for cell, name in zip(row, headers))
+
+
+def _report_rows(
+    rows: List[List[Optional[str]]], columns: Columns, error: str, legacy_columns: Columns = ()
+) -> List[Tuple[List[str], List[str], bool]]:
     """Find a sheet's table header row (row 1; lower in reports that had the rules above
-    the table) and return
-    the data rows under it as (fixed values, folders) pairs."""
+    the table) and return the data rows under it as (fixed values, folders, legacy)
+    triples; legacy is true when the header was ``legacy_columns`` (a report made before
+    a column was added)."""
     expected = [header for header, _ in columns]
-
-    def is_header(row: List[Optional[str]]) -> bool:
-        return len(row) >= len(expected) and all(
-            (cell or "").casefold() == name.casefold() for cell, name in zip(row, expected)
-        )
-
-    header_at = next((index for index, row in enumerate(rows) if is_header(row)), None)
+    legacy = [header for header, _ in legacy_columns]
+    header_at, is_legacy = None, False
+    for index, row in enumerate(rows):
+        if _is_header(row, expected):
+            header_at = index
+        elif legacy and _is_header(row, legacy):
+            header_at, is_legacy = index, True
+        if header_at is not None:
+            break
     if header_at is None:
         raise ValueError(f"{error} '{', '.join(expected)}'.")
+    first_location = len(legacy if is_legacy else expected)
     result = []
     for row in rows[header_at + 1:]:
-        if len(row) < len(expected) or not row[0]:
+        if len(row) < first_location or not row[0]:
             continue
-        result.append((row, [folder for folder in row[len(expected):] if folder]))
+        result.append((row, [folder for folder in row[first_location:] if folder], is_legacy))
     return result
 
 
@@ -473,6 +523,20 @@ class DuplicateWorkbook:
 
     files: List[DuplicateSet]
     folders: Optional[List[DuplicateFolderSet]]
+
+
+def _file_row(row: List[str], folders: List[str], legacy: bool, path: str) -> DuplicateSet:
+    # Reports made before the UTC Offset column have no offset: they are checked by local time.
+    offset, at = (None, 2) if legacy else (parse_utc_offset(row[2], path), 3)
+    return DuplicateSet(
+        file_name=row[0],
+        last_write_time=from_excel_serial(float(row[1])),
+        size_bytes=_number(row[at]),
+        md5=row[at + 1],
+        count=len(folders),
+        folders=folders,
+        utc_offset=offset,
+    )
 
 
 def read_duplicate_workbook(path: str) -> DuplicateWorkbook:
@@ -490,16 +554,9 @@ def read_duplicate_workbook(path: str) -> DuplicateWorkbook:
             folder_rows = _worksheet_rows(archive, folder_sheet, shared) if folder_sheet else None
 
         files = [
-            DuplicateSet(
-                file_name=row[0],
-                last_write_time=from_excel_serial(float(row[1])),
-                size_bytes=_number(row[2]),
-                md5=row[3],
-                count=len(folders),
-                folders=folders,
-            )
-            for row, folders in _report_rows(
-                file_rows, FIXED_COLUMNS, f"'{path}' is not a duplicates report: it has no header row"
+            _file_row(row, folders, legacy, path)
+            for row, folders, legacy in _report_rows(
+                file_rows, FIXED_COLUMNS, f"'{path}' is not a duplicates report: it has no header row", LEGACY_FIXED_COLUMNS
             )
         ]
         duplicate_folders = None
@@ -513,7 +570,7 @@ def read_duplicate_workbook(path: str) -> DuplicateWorkbook:
                     count=len(folders),
                     folders=folders,
                 )
-                for row, folders in _report_rows(
+                for row, folders, _ in _report_rows(
                     folder_rows,
                     FOLDER_COLUMNS,
                     f"'{path}' is not a duplicates report: sheet '{FOLDER_SHEET_NAME}' has no header row",

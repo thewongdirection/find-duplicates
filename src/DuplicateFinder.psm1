@@ -27,10 +27,13 @@ $script:SpreadsheetMain    = 'http://schemas.openxmlformats.org/spreadsheetml/20
 $script:FixedColumns       = @(
     @{ Header = 'File Name';     Width = 40 }
     @{ Header = 'Last Modified'; Width = 20 }
+    @{ Header = 'UTC Offset';    Width = 11 }
     @{ Header = 'Size (bytes)';  Width = 14 }
     @{ Header = 'MD5';           Width = 34 }
     @{ Header = 'Copies';        Width = 8  }
 )
+# Reports written before the UTC Offset column; still read, and validated by local time.
+$script:LegacyFixedColumns = @($script:FixedColumns | Where-Object { $_.Header -ne 'UTC Offset' })
 $script:LocationColumnWidth = 60
 $script:FolderColumns      = @(
     @{ Header = 'Folder Name';  Width = 40 }
@@ -53,6 +56,7 @@ $script:FileRulesTitle = "Sheet '$script:FileSheetName': duplicate files"
 $script:FileRules = @(
     'A file is listed when another file has ALL of: the same name (ignoring upper/lower case), the same saved date (last modified, to the whole second) and the same contents (MD5 hash).'
     'Each row is one duplicated file. Each Location column is the full path of a folder that holds a copy.'
+    'Last Modified is local time on the computer that ran the scan, and UTC Offset its difference from UTC then, so the report can be checked in any time zone.'
     'Files of 0 bytes are included unless the scan used -IgnoreEmptyFiles (Python: --ignore-empty-files).'
 )
 $script:FolderRulesTitle = "Sheet '$script:FolderSheetName': duplicate folders"
@@ -262,6 +266,36 @@ function Get-InnermostMessage {
     $Exception.Message
 }
 
+function ConvertTo-UtcOffsetText {
+    # A UTC offset as text: +10:00, -04:30, or with seconds (+00:19:32) for historic local times.
+    param([Parameter(Mandatory)] [TimeSpan] $Offset)
+    $sign = if ($Offset -lt [TimeSpan]::Zero) { '-' } else { '+' }
+    $size = $Offset.Duration()
+    $text = $sign + ([int] [Math]::Floor($size.TotalHours)).ToString('00') + ':' + $size.Minutes.ToString('00')
+    if ($size.Seconds) { $text += ':' + $size.Seconds.ToString('00') }
+    $text
+}
+
+function ConvertFrom-UtcOffsetText {
+    # The reverse of ConvertTo-UtcOffsetText, or a clear error naming the report.
+    param([AllowNull()] [AllowEmptyString()] [string] $Text, [Parameter(Mandatory)] [string] $Path)
+    $parts = [regex]::Match([string] $Text, '^([+-])(\d{2}):(\d{2})(?::(\d{2}))?$')
+    if (-not $parts.Success) { throw "'$Path' could not be read as a duplicates report: '$Text' is not a UTC offset." }
+    $seconds = [int] $parts.Groups[2].Value * 3600 + [int] $parts.Groups[3].Value * 60
+    if ($parts.Groups[4].Success) { $seconds += [int] $parts.Groups[4].Value }
+    if ($parts.Groups[1].Value -eq '-') { $seconds = - $seconds }
+    [TimeSpan]::FromSeconds($seconds)
+}
+
+function Get-DuplicateSetUtcOffset {
+    # A duplicate set's UTC offset; for sets without one (read from a report made before the
+    # UTC Offset column, or built by hand), this computer's offset at its saved date.
+    param([Parameter(Mandatory)] [object] $Set)
+    $offset = $Set.PSObject.Properties['UtcOffset']
+    if ($offset -and $null -ne $offset.Value) { return [TimeSpan] $offset.Value }
+    [System.TimeZoneInfo]::Local.GetUtcOffset([datetime]::SpecifyKind($Set.LastWriteTime, [System.DateTimeKind]::Unspecified))
+}
+
 function Get-FileMd5 {
     # MD5 of one file's contents as upper-case hex (the Get-FileHash format).
     param([Parameter(Mandatory)] [string] $Path)
@@ -399,8 +433,9 @@ function Find-DuplicateFile {
     .SYNOPSIS
         Finds sets of files whose name, saved date and MD5 hash all match.
     .OUTPUTS
-        One object per duplicate set: FileName, LastWriteTime, SizeBytes, MD5,
-        Count and Folders (full folder path of every copy, sorted).
+        One object per duplicate set: FileName, LastWriteTime (local), UtcOffset (local
+        time minus UTC at that date), SizeBytes, MD5, Count and Folders (full folder path
+        of every copy, sorted).
     #>
     [CmdletBinding()]
     param(
@@ -481,6 +516,7 @@ function Find-DuplicateFile {
             $results.Add([pscustomobject] @{
                 FileName      = $first.Name
                 LastWriteTime = $first.LastWriteTime
+                UtcOffset     = $first.LastWriteTime - $first.LastWriteTimeUtc
                 SizeBytes     = $first.Length
                 MD5           = $md5ByPath[$first.FullName]
                 Count         = $set.Count
@@ -977,8 +1013,8 @@ function Export-DuplicateReport {
         Saves duplicate sets to an .xlsx workbook. Needs neither Excel nor extra modules.
     .DESCRIPTION
         Sheet "Duplicates": one row per duplicated file. Columns: File Name, Last Modified,
-        Size (bytes), MD5, Copies, then "Location 1..N" holding the full folder path of
-        every copy.
+        UTC Offset, Size (bytes), MD5, Copies, then "Location 1..N" holding the full folder
+        path of every copy.
         Sheet "Duplicate Folders" (only when -FolderSet is given): one row per duplicated
         folder. Columns: Folder Name, Files, Sub Folders, Size (bytes), Copies, then
         "Location 1..N" holding the full path of every copy.
@@ -1001,7 +1037,8 @@ function Export-DuplicateReport {
     $Path = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($Path)
 
     $fileRows = @(foreach ($set in $DuplicateSet) {
-            , (@($set.FileName, $set.LastWriteTime, [long] $set.SizeBytes, $set.MD5, [int] $set.Count) + @($set.Folders))
+            $offset = ConvertTo-UtcOffsetText (Get-DuplicateSetUtcOffset $set)
+            , (@($set.FileName, $set.LastWriteTime, $offset, [long] $set.SizeBytes, $set.MD5, [int] $set.Count) + @($set.Folders))
         })
     $sheets = [System.Collections.Generic.List[object]]::new()
     $sheets.Add((ConvertTo-WorksheetData -Name $script:FileSheetName -Column $script:FixedColumns -Row $fileRows -Noun 'file'))
@@ -1245,34 +1282,46 @@ function Get-WorksheetRow {
     }
 }
 
+function Test-ReportHeader {
+    # True when a row starts with the given column headers (ignoring case).
+    param([Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Values, [Parameter(Mandatory)] [string[]] $Header)
+    if ($Values.Count -lt $Header.Count) { return $false }
+    for ($c = 0; $c -lt $Header.Count; $c++) {
+        if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals([string] $Values[$c], $Header[$c])) { return $false }
+    }
+    $true
+}
+
 function Select-ReportRow {
-    # Finds a sheet's table header row (below the rules; row 1 in older reports) and returns
-    # the data rows under it as (fixed values, folders) pairs.
+    # Finds a sheet's table header row (row 1; lower in reports that had the rules above the
+    # table) and returns the data rows under it: fixed values, folders, and whether the
+    # header was $LegacyColumn's (a report made before a column was added).
     param(
         [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Row,
         [Parameter(Mandatory)] [object[]] $Column,
+        [object[]] $LegacyColumn = @(),
         [Parameter(Mandatory)] [string] $ErrorMessage
     )
 
-    $expected = @($Column | ForEach-Object { $_.Header })
+    $expected = [string[]] @($Column | ForEach-Object { $_.Header })
+    $legacy = [string[]] @($LegacyColumn | ForEach-Object { $_.Header })
     $headerAt = -1
+    $isLegacy = $false
     for ($r = 0; $headerAt -lt 0 -and $r -lt $Row.Count; $r++) {
-        $headerOk = $Row[$r].Count -ge $expected.Count
-        for ($c = 0; $headerOk -and $c -lt $expected.Count; $c++) {
-            $headerOk = [System.StringComparer]::OrdinalIgnoreCase.Equals([string] $Row[$r][$c], $expected[$c])
-        }
-        if ($headerOk) { $headerAt = $r }
+        if (Test-ReportHeader -Values $Row[$r] -Header $expected) { $headerAt = $r }
+        elseif ($legacy.Count -and (Test-ReportHeader -Values $Row[$r] -Header $legacy)) { $headerAt = $r; $isLegacy = $true }
     }
     if ($headerAt -lt 0) { throw "$ErrorMessage '$($expected -join ', ')'." }
 
     $firstLocation = $expected.Count
+    if ($isLegacy) { $firstLocation = $legacy.Count }
     for ($r = $headerAt + 1; $r -lt $Row.Count; $r++) {
         $values = $Row[$r]
         if ($values.Count -lt $firstLocation -or -not $values[0]) { continue }
         # (Not "$x = if ...": that would unroll an empty or one-item array.)
         $folders = [System.Collections.Generic.List[string]]::new()
         for ($c = $firstLocation; $c -lt $values.Count; $c++) { if ($values[$c]) { $folders.Add($values[$c]) } }
-        [pscustomobject] @{ Values = $values; Folders = $folders.ToArray() }
+        [pscustomobject] @{ Values = $values; Folders = $folders.ToArray(); Legacy = $isLegacy }
     }
 }
 
@@ -1312,13 +1361,18 @@ function Read-DuplicateWorkbook {
     finally { $stream.Dispose() }
 
     # Numbers go through [double] then [long]/[int], which rounds half to even like Python's round().
-    $files = @(foreach ($row in (Select-ReportRow -Row $fileRows -Column $script:FixedColumns `
+    $files = @(foreach ($row in (Select-ReportRow -Row $fileRows -Column $script:FixedColumns -LegacyColumn $script:LegacyFixedColumns `
                     -ErrorMessage "'$Path' is not a duplicates report: it has no header row")) {
+            # Reports made before the UTC Offset column have no offset: they are checked by local time.
+            $offset = $null
+            $at = 2
+            if (-not $row.Legacy) { $offset = ConvertFrom-UtcOffsetText $row.Values[2] -Path $Path; $at = 3 }
             [pscustomobject] @{
                 FileName      = $row.Values[0]
                 LastWriteTime = [datetime]::FromOADate((ConvertFrom-CellNumber $row.Values[1] -Path $Path))
-                SizeBytes     = [long] (ConvertFrom-CellNumber $row.Values[2] -Path $Path)
-                MD5           = $row.Values[3]
+                UtcOffset     = $offset
+                SizeBytes     = [long] (ConvertFrom-CellNumber $row.Values[$at] -Path $Path)
+                MD5           = $row.Values[$at + 1]
                 Count         = $row.Folders.Count
                 Folders       = $row.Folders
             }
@@ -1416,6 +1470,9 @@ function Test-DuplicateCopy {
         [Parameter(Mandatory)] [string] $FileName,
         [Parameter(Mandatory)] [long] $SizeBytes,
         [Parameter(Mandatory)] [datetime] $LastWriteTime,
+        # The report's UTC offset for $LastWriteTime; without one (older reports) the saved
+        # date is compared as local time on this computer.
+        [AllowNull()] [object] $UtcOffset,
         [System.Collections.Generic.Dictionary[string, bool]] $RootCache
     )
 
@@ -1426,6 +1483,7 @@ function Test-DuplicateCopy {
         if (-not $file) { return 'Missing' }
         $size    = $file.Length
         $written = $file.LastWriteTime
+        if ($null -ne $UtcOffset) { $written = $file.LastWriteTimeUtc }
     }
     catch [System.IO.FileNotFoundException] { return 'Missing' }  # deleted while being checked
     catch [System.UnauthorizedAccessException], [System.IO.IOException], [System.Security.SecurityException] {
@@ -1435,10 +1493,11 @@ function Test-DuplicateCopy {
     # Something that cannot be checked is kept, never removed.
     if ($size -isnot [long] -or $written -isnot [datetime]) { return 'Unavailable' }
 
-    # Whole seconds, in exact integer arithmetic (as when scanning).
+    # Whole seconds, in exact integer arithmetic (as when scanning); in UTC when the offset is known.
     $ticksPerSecond = [System.TimeSpan]::TicksPerSecond
     $ticks = $written.Ticks
     $savedTicks = $LastWriteTime.Ticks
+    if ($null -ne $UtcOffset) { $savedTicks -= ([TimeSpan] $UtcOffset).Ticks }
     if ($size -ne $SizeBytes -or
         ($ticks - ($ticks % $ticksPerSecond)) -ne ($savedTicks - ($savedTicks % $ticksPerSecond))) { return 'Changed' }
     'Present'
@@ -1558,7 +1617,8 @@ function Update-DuplicateReport {
 
     $files = Invoke-CopyCheck -Set $workbook.Files -NameProperty FileName -Noun '' -TestCopy {
         param($row, $location)
-        Test-DuplicateCopy -Folder $location -FileName $row.FileName -SizeBytes $row.SizeBytes -LastWriteTime $row.LastWriteTime -RootCache $rootCache
+        Test-DuplicateCopy -Folder $location -FileName $row.FileName -SizeBytes $row.SizeBytes -LastWriteTime $row.LastWriteTime `
+            -UtcOffset $row.UtcOffset -RootCache $rootCache
     }
 
     $folders = $null

@@ -463,6 +463,7 @@ Describe 'Export-DuplicateReport' {
         $script:Sets = @(
             [pscustomobject] @{
                 FileName = 'a & b <1>.txt'; LastWriteTime = [datetime]::new(2024, 1, 2, 3, 4, 5)
+                UtcOffset = [TimeSpan]::FromMinutes(330)
                 SizeBytes = 1234; MD5 = 'AAAA'; Count = 3
                 Folders = [string[]] @('C:\one', 'C:\two & more', 'D:\three')
             }
@@ -480,13 +481,15 @@ Describe 'Export-DuplicateReport' {
 
         $rows = @(Read-Worksheet $out)
         $rows.Count | Should -Be 3
-        $rows[0] | Should -Be @('File Name', 'Last Modified', 'Size (bytes)', 'MD5', 'Copies', 'Location 1', 'Location 2', 'Location 3')
+        $rows[0] | Should -Be @('File Name', 'Last Modified', 'UTC Offset', 'Size (bytes)', 'MD5', 'Copies', 'Location 1', 'Location 2', 'Location 3')
         $rows[1][0] | Should -BeExactly 'a & b <1>.txt'
-        $rows[1][2] | Should -Be '1234'
-        $rows[1][3] | Should -Be 'AAAA'
-        $rows[1][4] | Should -Be '3'
-        $rows[1][5..7] | Should -Be @('C:\one', 'C:\two & more', 'D:\three')
-        $rows[2][5..6] | Should -Be @('C:\x', "C:\bad$([char] 0xFFFD)name")
+        $rows[1][2] | Should -Be '+05:30'
+        $rows[1][3] | Should -Be '1234'
+        $rows[1][4] | Should -Be 'AAAA'
+        $rows[1][5] | Should -Be '3'
+        $rows[1][6..8] | Should -Be @('C:\one', 'C:\two & more', 'D:\three')
+        $rows[2][2] | Should -Match '^[+-]\d{2}:\d{2}' -Because "a set without an offset gets this computer's"
+        $rows[2][6..7] | Should -Be @('C:\x', "C:\bad$([char] 0xFFFD)name")
     }
 
     It 'stores the saved date as a real Excel date' {
@@ -539,7 +542,7 @@ Describe 'Export-DuplicateReport' {
         }
         finally { $zip.Dispose() }
         $sheetXml | Should -Match '<pane ySplit="1" topLeftCell="A2"'
-        $sheetXml | Should -Match '<autoFilter ref="A1:H3"'
+        $sheetXml | Should -Match '<autoFilter ref="A1:I3"'
     }
 
     It 'writes a header-only workbook when there are no duplicates' {
@@ -576,11 +579,11 @@ Describe 'Import-DuplicateReport' {
     BeforeAll {
         $script:RoundTrip = @(
             [pscustomobject] @{
-                FileName = 'a & b.txt'; LastWriteTime = [datetime]::new(2024, 1, 2, 3, 4, 5, 678)
+                FileName = 'a & b.txt'; LastWriteTime = [datetime]::new(2024, 1, 2, 3, 4, 5, 678); UtcOffset = [TimeSpan]::FromHours(10)
                 SizeBytes = 1234; MD5 = 'AAAA'; Count = 3; Folders = [string[]] @('C:\one', 'C:\two', 'D:\three')
             }
             [pscustomobject] @{
-                FileName = 'z.txt'; LastWriteTime = [datetime]::new(2023, 6, 7, 8, 9, 10)
+                FileName = 'z.txt'; LastWriteTime = [datetime]::new(2023, 6, 7, 8, 9, 10); UtcOffset = [TimeSpan]::new(-4, -30, 0)
                 SizeBytes = 5; MD5 = 'BBBB'; Count = 2; Folders = [string[]] @('C:\x', 'C:\y')
             }
         )
@@ -622,6 +625,41 @@ Describe 'Import-DuplicateReport' {
         }
     }
 
+    It 'validates a report made before the UTC Offset column, and adds the column when it rewrites it' {
+        $root = Add-TestRoot
+        $files = @(foreach ($folder in 'a', 'b', 'c') { Add-TestFile $root "$folder/x.txt" })
+        $path = Join-Path $root 'old.xlsx'
+        $header = [object[]] @('File Name', 'Last Modified', 'Size (bytes)', 'MD5', 'Copies', 'Location 1', 'Location 2', 'Location 3')
+        $row = [object[]] (@('x.txt', $files[0].LastWriteTime.ToOADate(), [double] $files[0].Length, 'ABC', [double] 3) + @($files.DirectoryName))
+        Write-ExcelSavedWorkbook -Path $path -Rows ([object[][]] @($header, $row))
+        Remove-Item -LiteralPath $files[2].FullName
+
+        $result = Update-DuplicateReport -Path $path
+
+        $result.CopiesRemoved | Should -Be 1 -Because 'the other two copies are found by local time'
+        (Read-Worksheet $path)[0][2] | Should -Be 'UTC Offset'
+        (Import-DuplicateReport -Path $path).UtcOffset | Should -Be ($files[0].LastWriteTime - $files[0].LastWriteTimeUtc)
+    }
+
+    It 'writes the UTC offset <Text> and reads it back' -ForEach @(
+        @{ Seconds = 19800; Text = '+05:30' }
+        @{ Seconds = -16200; Text = '-04:30' }
+        @{ Seconds = 0; Text = '+00:00' }
+        @{ Seconds = 50400; Text = '+14:00' }
+        @{ Seconds = 1172; Text = '+00:19:32' }   # local mean time, as some zones used before 1900
+    ) {
+        InModuleScope DuplicateFinder -Parameters $_ {
+            ConvertTo-UtcOffsetText ([TimeSpan]::FromSeconds($Seconds)) | Should -BeExactly $Text
+            ConvertFrom-UtcOffsetText $Text -Path 'report.xlsx' | Should -Be ([TimeSpan]::FromSeconds($Seconds))
+        }
+    }
+
+    It 'rejects a UTC offset it cannot read' {
+        InModuleScope DuplicateFinder {
+            { ConvertFrom-UtcOffsetText '10:00' -Path 'report.xlsx' } | Should -Throw "*'10:00' is not a UTC offset*"
+        }
+    }
+
     It 'reads back what Export-DuplicateReport wrote' {
         $path = Join-Path (Add-TestRoot) 'report.xlsx'
         Export-DuplicateReport -DuplicateSet $script:RoundTrip -Path $path
@@ -630,7 +668,7 @@ Describe 'Import-DuplicateReport' {
 
         $read.Count | Should -Be 2
         for ($i = 0; $i -lt 2; $i++) {
-            foreach ($property in 'FileName', 'LastWriteTime', 'SizeBytes', 'MD5', 'Count') {
+            foreach ($property in 'FileName', 'LastWriteTime', 'UtcOffset', 'SizeBytes', 'MD5', 'Count') {
                 $read[$i].$property | Should -Be $script:RoundTrip[$i].$property -Because $property
             }
             $read[$i].Folders | Should -Be $script:RoundTrip[$i].Folders
@@ -732,6 +770,26 @@ Describe 'Update-DuplicateReport' {
             $sets = @(Find-DuplicateFile -File @(Get-FileInventory -Path $Root))
             Export-DuplicateReport -DuplicateSet $sets -Path $path
             $path
+        }
+    }
+
+    It 'keeps every copy when validating in another time zone than the scan' {
+        if ($script:OnWindows) { Set-ItResult -Skipped -Because 'the TZ variable sets the time zone only on Linux and macOS'; return }
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b') { $null = Add-TestFile $root "$folder/x.txt" }
+        $previous = $env:TZ
+        try {
+            $env:TZ = 'Asia/Kolkata'
+            [System.TimeZoneInfo]::ClearCachedData()
+            $report = Export-ScannedReport $root
+            $env:TZ = 'America/New_York'
+            [System.TimeZoneInfo]::ClearCachedData()
+
+            (Update-DuplicateReport -Path $report -WhatIf).CopiesRemoved | Should -Be 0
+        }
+        finally {
+            $env:TZ = $previous
+            [System.TimeZoneInfo]::ClearCachedData()
         }
     }
 
@@ -1299,7 +1357,7 @@ Describe 'Find-Duplicates.ps1' {
         $rows[1][0] | Should -Be 'invoice.pdf'
         $expected = 'data/2023', 'data/backup', 'data/old/copy' |
             ForEach-Object { [System.IO.Path]::GetFullPath((Join-Path $script:Root $_)) }
-        $rows[1][5..7] | Should -Be $expected -Because 'the full folder path of every copy is recorded'
+        $rows[1][6..8] | Should -Be $expected -Because 'the full folder path of every copy is recorded'
     }
 
     It 'uses the given output file name and adds .xlsx when missing' {
@@ -1701,22 +1759,22 @@ Describe 'Edge cases' {
 
     It 'writes a file with as many copies as Excel has location columns' {
         $set = [pscustomobject] @{
-            FileName = 'x.txt'; LastWriteTime = $script:Saved; SizeBytes = 1; MD5 = 'A'; Count = 16379
-            Folders = [string[]] @(1..16379 | ForEach-Object { "/copy$_" })
+            FileName = 'x.txt'; LastWriteTime = $script:Saved; SizeBytes = 1; MD5 = 'A'; Count = 16378
+            Folders = [string[]] @(1..16378 | ForEach-Object { "/copy$_" })
         }
         $report = Join-Path (Add-TestRoot) 'wide.xlsx'
         Export-DuplicateReport -DuplicateSet @($set) -Path $report
-        (Import-DuplicateReport -Path $report).Count | Should -Be 16379
+        (Import-DuplicateReport -Path $report).Count | Should -Be 16378
     }
 
     It 'refuses a file with more copies than Excel has location columns' {
         $set = [pscustomobject] @{
-            FileName = 'x.txt'; LastWriteTime = $script:Saved; SizeBytes = 1; MD5 = 'A'; Count = 16380
-            Folders = [string[]] @(1..16380 | ForEach-Object { "/copy$_" })
+            FileName = 'x.txt'; LastWriteTime = $script:Saved; SizeBytes = 1; MD5 = 'A'; Count = 16379
+            Folders = [string[]] @(1..16379 | ForEach-Object { "/copy$_" })
         }
         $report = Join-Path (Add-TestRoot) 'too-wide.xlsx'
         { Export-DuplicateReport -DuplicateSet @($set) -Path $report } |
-            Should -Throw 'A file has 16380 copies; Excel supports at most 16379 location columns.'
+            Should -Throw 'A file has 16379 copies; Excel supports at most 16378 location columns.'
         Test-Path -LiteralPath $report | Should -BeFalse
     }
 
@@ -1739,7 +1797,7 @@ Describe 'Edge cases' {
         }
         $report = Join-Path (Add-TestRoot) 'long-cell.xlsx'
         { Export-DuplicateReport -DuplicateSet @($set) -Path $report } |
-            Should -Throw 'Cell F2 would hold 32768 characters; Excel allows at most 32767.'
+            Should -Throw 'Cell G2 would hold 32768 characters; Excel allows at most 32767.'
         Test-Path -LiteralPath $report | Should -BeFalse
     }
 

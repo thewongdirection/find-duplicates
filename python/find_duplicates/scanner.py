@@ -92,6 +92,7 @@ def full_path(path: str) -> str:
 
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_EPOCH_NAIVE = datetime(1970, 1, 1)
 
 
 def local_time(seconds: float) -> datetime:
@@ -108,6 +109,27 @@ def local_time(seconds: float) -> datetime:
         probe = utc.replace(year=1972)
         offset = datetime.fromtimestamp(probe.timestamp()) - probe.replace(tzinfo=None)
         return (utc + offset).replace(tzinfo=None)
+
+
+def utc_offset(seconds: int) -> timedelta:
+    """Local time minus UTC at a moment given in whole seconds since 1970-01-01 UTC, like
+    .NET's LastWriteTime - LastWriteTimeUtc."""
+    return local_time(seconds) - (_EPOCH_NAIVE + timedelta(seconds=seconds))
+
+
+def local_utc_offset(local: datetime) -> timedelta:
+    """This computer's UTC offset at a naive local date and time, like .NET's
+    TimeZoneInfo.Local.GetUtcOffset: the standard offset when the time happens twice or
+    not at all (daylight saving changes). Dates Python cannot convert here (before 1970 on
+    Windows) use the same date in 1972, as local_time does."""
+
+    def offset(value: datetime) -> timedelta:
+        return min(value.replace(fold=0).astimezone().utcoffset(), value.replace(fold=1).astimezone().utcoffset())
+
+    try:
+        return offset(local)
+    except (OSError, OverflowError, ValueError):
+        return offset(local.replace(year=1972))
 
 
 def _same_path_key(path: str) -> str:

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+import time
 import zipfile
 from datetime import datetime, timezone
-from typing import List
+from typing import Iterator, List
 from xml.etree import ElementTree
 
 SAVED = datetime(2024, 5, 17, 10, 30, 0, tzinfo=timezone.utc)
@@ -21,6 +23,22 @@ def add_file(root: str, relative: str, content: str = "same content", saved: dat
     ns = int(saved.timestamp()) * 1_000_000_000 + saved.microsecond * 1000
     os.utime(path, ns=(ns, ns))
     return path
+
+
+@contextlib.contextmanager
+def time_zone(name: str) -> Iterator[None]:
+    """Run with the TZ variable set (Linux and macOS only)."""
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            del os.environ["TZ"]
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
 
 
 TABLE_HEADERS = ("File Name", "Folder Name")

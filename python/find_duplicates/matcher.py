@@ -19,11 +19,11 @@ import logging
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Dict, Hashable, Iterable, List, Optional, Sequence, TypeVar
 
 from .names import name_key, path_sort_key, sort_key
-from .scanner import FileRecord, is_cloud_only, local_time
+from .scanner import FileRecord, is_cloud_only, local_time, utc_offset
 
 log = logging.getLogger("find_duplicates")
 
@@ -48,6 +48,9 @@ class DuplicateSet:
     md5: str
     count: int
     folders: List[str]
+    # Local time minus UTC at last_write_time; None for rows read from a report made before
+    # the UTC Offset column (those are checked by local time).
+    utc_offset: Optional[timedelta] = None
 
 
 def md5_file(path: str) -> str:
@@ -196,6 +199,7 @@ def find_duplicate_files(
                 DuplicateSet(
                     file_name=first.name,
                     last_write_time=local_time(first.mtime_ns / NS_PER_SECOND),
+                    utc_offset=utc_offset(first.mtime_ns // NS_PER_SECOND),
                     size_bytes=first.size,
                     md5=md5,
                     count=len(same),

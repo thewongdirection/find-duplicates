@@ -201,8 +201,10 @@ downloaded from the cloud); a file edited without changing its size or saved
 date is not detected. Run a full scan for that, and to find new duplicates.
 File names containing control characters (possible on Linux) are stored with
 a replacement character, so validation cannot find those copies and removes them.
-Validate on a computer set to the same time zone as the scan, since saved
-dates are stored as local time.
+Saved dates are compared as moments in time (using the report's *UTC Offset*
+column), so a report can be validated on a computer in another time zone.
+Reports made before that column existed are compared by local time: validate
+those in the time zone of the scan. Rewriting such a report adds the column.
 
 ```powershell
 # Check .\duplicates.xlsx
@@ -231,14 +233,17 @@ The workbook has these sheets:
 
 On the *Duplicates* sheet: one row per duplicated file, one column per copy:
 
-| File Name  | Last Modified       | Size (bytes) | MD5     | Copies | Location 1     | Location 2        | Location 3 |
-|------------|---------------------|--------------|---------|--------|----------------|-------------------|------------|
-| report.doc | 2024-05-17 10:30:00 | 48128        | 9A0F... | 3      | D:\Docs\2024   | D:\Backup\Docs    | E:\Old     |
+| File Name  | Last Modified       | UTC Offset | Size (bytes) | MD5     | Copies | Location 1     | Location 2        | Location 3 |
+|------------|---------------------|------------|--------------|---------|--------|----------------|-------------------|------------|
+| report.doc | 2024-05-17 10:30:00 | +10:00     | 48128        | 9A0F... | 3      | D:\Docs\2024   | D:\Backup\Docs    | E:\Old     |
 
 - Each `Location` column holds the full folder path of one copy; there are as
   many columns as the file with the most copies needs.
 - The header row is frozen and has filters; *Last Modified* is a real Excel
   date; *Size* and *Copies* are numbers.
+- *Last Modified* is local time on the computer that ran the scan, and *UTC
+  Offset* its difference from UTC at that date (daylight saving included), so
+  the moment each file was saved is known in any time zone.
 - Rows are sorted by file name, then saved date, then MD5; locations are sorted
   by path. Where copies' names differ only in case, the row shows the name of
   the copy in the alphabetically first folder.
@@ -275,13 +280,13 @@ Each of these is covered by an automated test on Windows, Linux and macOS
 | Saved dates before 1970 or after 2038 | Fully supported. |
 | Copies on FAT/exFAT drives (USB sticks, memory cards) | These store saved times in 2-second steps, so a copy of a file saved at 10:30:01 shows 10:30:02 there. Such copies are **not** matched: the saved date must agree to the second. |
 | Daylight saving time | Makes no difference: dates are compared as instants. |
-| Changing the computer's time zone between the scan and `-Validate` | The report stores local times, so every copy would look changed and be removed. Validate in the time zone the scan used (a preview with `-WhatIf` shows this). |
+| Changing the computer's time zone between the scan and `-Validate` | Makes no difference: the *UTC Offset* column lets validation compare instants. (Reports made before that column are compared by local time; validate those in the time zone of the scan.) |
 | A folder that is deleted, or cannot be read, during the scan | Reported as a warning and skipped; the scan carries on. |
 | A file that cannot be read (permissions, locked by another program) | Reported as a warning and left out; its other copies are still matched. |
 | The scanned folder is itself a symbolic link | Scanned through the link; locations show the link's path. |
 | Two files in one folder whose names differ only in case (Linux, or case-sensitive folders on Windows) | Reported as duplicates; the row lists that folder twice. |
 | Names Windows reserves or trims (`NUL`, `PRN.txt`, names ending in a dot or space) | Ordinary names on Linux and macOS. On Windows such files can only be made by special tools; the scan never fails on them, but may skip them with a warning, and `-Validate` keeps such copies rather than guess. |
-| Excel limits | A file with more than 16,379 copies, more than 1,048,575 duplicated files, or a cell longer than 32,767 characters stops the tool with an error, rather than writing a report Excel would reject or cut short. |
+| Excel limits | A file with more than 16,378 copies, more than 1,048,575 duplicated files, or a cell longer than 32,767 characters stops the tool with an error, rather than writing a report Excel would reject or cut short. |
 | Reports opened and saved in Excel or LibreOffice | Still read and validated (shared strings and re-numbered sheet parts are handled). |
 
 Some situations need real equipment and are checked by hand before a release:

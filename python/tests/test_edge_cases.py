@@ -13,7 +13,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,7 +29,7 @@ from find_duplicates.validate import validate_report  # noqa: E402
 from find_duplicates.xlsx import (  # noqa: E402
     export_duplicate_report, read_duplicate_folder_report, read_duplicate_report,
 )
-from tests.helpers import SAVED, add_file  # noqa: E402
+from tests.helpers import SAVED, add_file, time_zone  # noqa: E402
 
 ON_WINDOWS = sys.platform == "win32"
 LIBREOFFICE_REQUIRED = bool(os.environ.get("FIND_DUPLICATES_REQUIRE_LIBREOFFICE"))
@@ -68,22 +67,6 @@ def long_paths_enabled() -> bool:
             return winreg.QueryValueEx(key, "LongPathsEnabled")[0] == 1
     except OSError:
         return False
-
-
-@contextlib.contextmanager
-def time_zone(name: str) -> Iterator[None]:
-    """Run with the TZ variable set (Linux and macOS only)."""
-    previous = os.environ.get("TZ")
-    os.environ["TZ"] = name
-    time.tzset()
-    try:
-        yield
-    finally:
-        if previous is None:
-            del os.environ["TZ"]
-        else:
-            os.environ["TZ"] = previous
-        time.tzset()
 
 
 @contextlib.contextmanager
@@ -350,13 +333,13 @@ class EdgeCaseTests(unittest.TestCase):
 
     def test_writes_a_file_with_as_many_copies_as_excel_has_location_columns(self):
         report = os.path.join(self.new_root(), "wide.xlsx")
-        export_duplicate_report([self.wide_set(16379)], report)
-        self.assertEqual(read_duplicate_report(report)[0].count, 16379)
+        export_duplicate_report([self.wide_set(16378)], report)
+        self.assertEqual(read_duplicate_report(report)[0].count, 16378)
 
     def test_refuses_a_file_with_more_copies_than_excel_has_location_columns(self):
         report = os.path.join(self.new_root(), "too-wide.xlsx")
-        with self.assertRaisesRegex(ValueError, "^A file has 16380 copies; Excel supports at most 16379 location columns.$"):
-            export_duplicate_report([self.wide_set(16380)], report)
+        with self.assertRaisesRegex(ValueError, "^A file has 16379 copies; Excel supports at most 16378 location columns.$"):
+            export_duplicate_report([self.wide_set(16379)], report)
         self.assertFalse(os.path.exists(report))
 
     def test_refuses_more_duplicated_files_than_excel_has_rows(self):
@@ -368,7 +351,7 @@ class EdgeCaseTests(unittest.TestCase):
 
     def test_refuses_text_longer_than_an_excel_cell_can_hold(self):
         report = os.path.join(self.new_root(), "long-cell.xlsx")
-        with self.assertRaisesRegex(ValueError, "^Cell F2 would hold 32768 characters; Excel allows at most 32767.$"):
+        with self.assertRaisesRegex(ValueError, "^Cell G2 would hold 32768 characters; Excel allows at most 32767.$"):
             export_duplicate_report([self.wide_set(2, "/" + "x" * 32767)], report)
         self.assertFalse(os.path.exists(report))
 

@@ -8,7 +8,6 @@ import os
 import stat
 import sys
 import tempfile
-import time
 import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -20,12 +19,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from find_duplicates import cli, matcher, scanner, validate  # noqa: E402
 from find_duplicates.matcher import DuplicateSet, find_duplicate_files, md5_file  # noqa: E402
-from find_duplicates.scanner import FileRecord, iter_files  # noqa: E402
+from find_duplicates.scanner import FileRecord, iter_files, local_time, utc_offset  # noqa: E402
 from find_duplicates.validate import validate_report  # noqa: E402
 from find_duplicates.xlsx import (  # noqa: E402
-    column_name, excel_serial, export_duplicate_report, from_excel_serial, read_duplicate_report,
+    column_name, excel_serial, export_duplicate_report, from_excel_serial, parse_utc_offset, read_duplicate_report,
+    utc_offset_text,
 )
-from tests.helpers import SAVED, add_file, read_worksheet, sheet_names  # noqa: E402
+from tests.helpers import SAVED, add_file, read_worksheet, sheet_names, time_zone  # noqa: E402
 
 
 class TempDirTestCase(unittest.TestCase):
@@ -292,7 +292,7 @@ class FindDuplicateFilesTests(TempDirTestCase):
 class ExportDuplicateReportTests(TempDirTestCase):
     SETS = [
         DuplicateSet("a & b <1>.txt", datetime(2024, 1, 2, 3, 4, 5), 1234, "AAAA", 3,
-                     ["C:\\one", "C:\\two & more", "D:\\three"]),
+                     ["C:\\one", "C:\\two & more", "D:\\three"], utc_offset=timedelta(minutes=330)),
         DuplicateSet("z.txt", datetime(2023, 6, 7, 8, 9, 10), 5, "BBBB", 2,
                      ["C:\\x", "C:\\bad" + chr(1) + "name"]),
     ]
@@ -305,12 +305,13 @@ class ExportDuplicateReportTests(TempDirTestCase):
     def test_one_row_per_file_with_a_column_per_location(self):
         rows = read_worksheet(self.export())
         self.assertEqual(len(rows), 3)
-        self.assertEqual(rows[0], ["File Name", "Last Modified", "Size (bytes)", "MD5", "Copies",
+        self.assertEqual(rows[0], ["File Name", "Last Modified", "UTC Offset", "Size (bytes)", "MD5", "Copies",
                                    "Location 1", "Location 2", "Location 3"])
         self.assertEqual(rows[1][0], "a & b <1>.txt")
-        self.assertEqual(rows[1][2:5], ["1234", "AAAA", "3"])
-        self.assertEqual(rows[1][5:8], ["C:\\one", "C:\\two & more", "D:\\three"])
-        self.assertEqual(rows[2][5:7], ["C:\\x", "C:\\bad" + chr(0xFFFD) + "name"])
+        self.assertEqual(rows[1][2:6], ["+05:30", "1234", "AAAA", "3"])
+        self.assertEqual(rows[1][6:9], ["C:\\one", "C:\\two & more", "D:\\three"])
+        self.assertRegex(rows[2][2], r"^[+-]\d{2}:\d{2}", "a set without an offset gets this computer's")
+        self.assertEqual(rows[2][6:8], ["C:\\x", "C:\\bad" + chr(0xFFFD) + "name"])
 
     def test_stores_the_saved_date_as_a_real_excel_date(self):
         serial = float(read_worksheet(self.export())[1][1])
@@ -346,7 +347,7 @@ class ExportDuplicateReportTests(TempDirTestCase):
         with zipfile.ZipFile(path) as archive:
             sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
         self.assertIn('<pane ySplit="1" topLeftCell="A2"', sheet)
-        self.assertIn('<autoFilter ref="A1:H3"', sheet)
+        self.assertIn('<autoFilter ref="A1:I3"', sheet)
 
     def test_reads_a_report_that_had_the_rules_above_the_table(self):
         path = os.path.join(self.root, "older.xlsx")
@@ -454,9 +455,38 @@ def write_excel_saved_workbook(path, rows):
 class ReadDuplicateReportTests(TempDirTestCase):
     ROUND_TRIP = [
         DuplicateSet("a & b.txt", datetime(2024, 1, 2, 3, 4, 5, 678_000), 1234, "AAAA", 3,
-                     ["C:\\one", "C:\\two", "D:\\three"]),
-        DuplicateSet("z.txt", datetime(2023, 6, 7, 8, 9, 10), 5, "BBBB", 2, ["C:\\x", "C:\\y"]),
+                     ["C:\\one", "C:\\two", "D:\\three"], utc_offset=timedelta(hours=10)),
+        DuplicateSet("z.txt", datetime(2023, 6, 7, 8, 9, 10), 5, "BBBB", 2, ["C:\\x", "C:\\y"],
+                     utc_offset=-timedelta(hours=4, minutes=30)),
     ]
+
+    def test_validates_a_report_made_before_the_utc_offset_column_and_adds_the_column_when_it_rewrites_it(self):
+        paths = [add_file(self.root, f"{folder}/x.txt") for folder in ("a", "b", "c")]
+        path = os.path.join(self.root, "old.xlsx")
+        info = os.stat(paths[0])
+        serial = excel_serial(local_time(info.st_mtime_ns / 1e9))
+        write_excel_saved_workbook(path, [
+            ["File Name", "Last Modified", "Size (bytes)", "MD5", "Copies", "Location 1", "Location 2", "Location 3"],
+            ["x.txt", serial, float(info.st_size), "ABC", 3.0] + [os.path.dirname(p) for p in paths],
+        ])
+        os.remove(paths[2])
+
+        result = validate_report(path)
+
+        self.assertEqual(result.copies_removed, 1, "the other two copies are found by local time")
+        self.assertEqual(read_worksheet(path)[0][2], "UTC Offset")
+        self.assertEqual(read_duplicate_report(path)[0].utc_offset, utc_offset(info.st_mtime_ns // 1_000_000_000))
+
+    def test_writes_the_utc_offset_and_reads_it_back(self):
+        for seconds, text in ((19800, "+05:30"), (-16200, "-04:30"), (0, "+00:00"), (50400, "+14:00"),
+                              (1172, "+00:19:32")):  # the last: local mean time, as some zones used before 1900
+            with self.subTest(text=text):
+                self.assertEqual(utc_offset_text(timedelta(seconds=seconds)), text)
+                self.assertEqual(parse_utc_offset(text, "report.xlsx"), timedelta(seconds=seconds))
+
+    def test_rejects_a_utc_offset_it_cannot_read(self):
+        with self.assertRaisesRegex(ValueError, "'10:00' is not a UTC offset"):
+            parse_utc_offset("10:00", "report.xlsx")
 
     def test_reads_back_what_export_wrote(self):
         path = os.path.join(self.root, "report.xlsx")
@@ -551,6 +581,14 @@ class ValidateReportTests(TempDirTestCase):
             add_file(root, rel, content)
         return root
 
+    @unittest.skipIf(sys.platform == "win32", "the TZ variable sets the time zone only on Linux and macOS")
+    def test_keeps_every_copy_when_validating_in_another_time_zone_than_the_scan(self):
+        root = self.tree("a/x.txt", "b/x.txt")
+        with time_zone("Asia/Kolkata"):
+            report = self.scanned_report(root)
+        with time_zone("America/New_York"):
+            self.assertEqual(validate_report(report, dry_run=True).copies_removed, 0)
+
     def test_leaves_the_report_untouched_when_every_copy_exists(self):
         root = self.tree("a/x.txt", "b/x.txt")
         report = self.scanned_report(root)
@@ -616,22 +654,13 @@ class ValidateReportTests(TempDirTestCase):
 
     @unittest.skipIf(sys.platform == "win32", "time.tzset is not available on Windows")
     def test_keeps_a_copy_saved_in_the_repeated_hour_when_daylight_saving_ends(self):
-        previous = os.environ.get("TZ")
-        os.environ["TZ"] = "America/New_York"
-        time.tzset()
-        try:
+        with time_zone("America/New_York"):
             # 06:30 UTC on 3 Nov 2024 is 01:30 local, in the hour that happens twice.
             saved = datetime(2024, 11, 3, 6, 30, tzinfo=timezone.utc)
             path = add_file(self.root, "dst/x.txt", saved=saved)
             recorded = datetime.fromtimestamp(saved.timestamp())
             state = validate.check_copy(os.path.dirname(path), "x.txt", os.path.getsize(path), recorded)
             self.assertEqual(state, validate.PRESENT)
-        finally:
-            if previous is None:
-                del os.environ["TZ"]
-            else:
-                os.environ["TZ"] = previous
-            time.tzset()
 
     def test_keeps_a_copy_whose_size_and_saved_date_cannot_be_read(self):
         # As for a file named NUL on Windows, which the system treats as a device.
@@ -694,8 +723,8 @@ class CliTests(TempDirTestCase):
         rows = read_worksheet(report)
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[1][0], "invoice.pdf")
-        self.assertEqual(rows[1][4], "3")
-        self.assertEqual(rows[1][5:8], [os.path.join(self.data, p) for p in ("2023", "backup", "old/copy".replace("/", os.sep))])
+        self.assertEqual(rows[1][5], "3")
+        self.assertEqual(rows[1][6:9], [os.path.join(self.data, p) for p in ("2023", "backup", "old/copy".replace("/", os.sep))])
         self.assertIn("Found 1 duplicated files (3 copies in total).", out)
 
     def test_uses_the_given_output_name_and_adds_xlsx(self):
