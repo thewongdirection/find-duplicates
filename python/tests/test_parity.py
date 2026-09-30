@@ -24,8 +24,7 @@ from xml.etree import ElementTree
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from find_duplicates import cli  # noqa: E402
-from find_duplicates.xlsx import FILE_RULES  # noqa: E402
-from tests.helpers import SAVED, add_file, read_worksheet  # noqa: E402
+from tests.helpers import SAVED, add_file, read_worksheet, sheet_names  # noqa: E402
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PS_SCRIPT = os.path.join(REPO_ROOT, "Find-Duplicates.ps1")
@@ -73,6 +72,7 @@ if os.name != "nt":  # characters Windows does not allow in file names
 # Removed before validating: one copy of a three-copy set, one of a two-copy set,
 # and a file inside one copy of the duplicate "Holiday" folder.
 REMOVED_BEFORE_VALIDATE = ["b/report.doc", "b/photo.jpg", "y/Holiday/p1.jpg"]
+FILE_SHEET = "xl/worksheets/sheet1.xml"
 FOLDER_SHEET = "xl/worksheets/sheet2.xml"
 
 
@@ -104,14 +104,20 @@ class ParityTests(unittest.TestCase):
             self.assertEqual(cli.main(list(args)), 0)
 
     def assert_same_report(self, ps_report, py_report):
-        self.assertEqual(read_worksheet(py_report, FOLDER_SHEET, include_rules=True),
-                         read_worksheet(ps_report, FOLDER_SHEET, include_rules=True))
-        ps_rows = read_worksheet(ps_report, include_rules=True)
-        py_rows = read_worksheet(py_report, include_rules=True)
+        self.assertEqual(sheet_names(py_report), sheet_names(ps_report))
+        # Every sheet except the file sheet (compared below, with a date tolerance) must be
+        # identical: the folder sheet and the Rules sheet with its wording.
+        for part in _worksheet_parts(ps_report):
+            if part != FILE_SHEET:
+                with self.subTest(part=part):
+                    self.assertEqual(read_worksheet(py_report, part, all_rows=True),
+                                     read_worksheet(ps_report, part, all_rows=True))
+        ps_rows = read_worksheet(ps_report)
+        py_rows = read_worksheet(py_report)
         self.assertEqual(len(py_rows), len(ps_rows))
         for number, (ps_row, py_row) in enumerate(zip(ps_rows, py_rows), start=1):
             with self.subTest(row=number):
-                if number > len(FILE_RULES) + 1:  # data rows, below the rules and the header
+                if number > 1:  # data rows, below the header
                     # Both are the same instant; allow float formatting differences.
                     self.assertTrue(math.isclose(float(ps_row[DATE_COLUMN]), float(py_row[DATE_COLUMN]), abs_tol=1e-8))
                     ps_row, py_row = _without(ps_row, DATE_COLUMN), _without(py_row, DATE_COLUMN)
@@ -146,6 +152,11 @@ class ParityTests(unittest.TestCase):
         self.assert_same_report(self.report("ps.xlsx"), self.report("py.xlsx"))
         names = [row[0] for row in read_worksheet(self.report("py.xlsx"))[1:]]
         self.assertNotIn("Photo.JPG", names, "a row left with one copy is removed")
+
+
+def _worksheet_parts(path):
+    with zipfile.ZipFile(path) as archive:
+        return sorted(name for name in archive.namelist() if name.startswith("xl/worksheets/"))
 
 
 def _without(row, index):

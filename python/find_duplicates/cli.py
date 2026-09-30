@@ -28,8 +28,8 @@ file name (case-insensitive), saved date (last modified time, to the whole
 second) and MD5 hash of the contents. MD5 is only calculated for files whose
 name and saved date already match another file (and whose size matches too),
 so most files are never read. Files of 0 bytes are included unless
---ignore-empty-files is used. Each sheet of the report starts with the
-matching rules, then the table.
+--ignore-empty-files is used. A "Rules" sheet in the report states the
+matching rules in plain words.
 
 DUPLICATE FOLDERS (--folders): also finds folders with the same name and
 exactly the same contents: the same tree of file and sub folder names, where

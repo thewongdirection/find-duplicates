@@ -39,16 +39,22 @@ $script:FolderColumns      = @(
 )
 $script:FileSheetName   = 'Duplicates'
 $script:FolderSheetName = 'Duplicate Folders'
+$script:RulesSheetName  = 'Rules'
+$script:RulesColumnWidth = 150
 
-# The matching rules, written above each table. Shared word for word with the Python port.
+# The matching rules, written on the Rules sheet. Shared word for word with the Python port.
+$script:RulesIntro = @(
+    'Matching rules'
+    'These rules decide what counts as a match on the other sheets of this workbook.'
+)
+$script:FileRulesTitle = "Sheet '$script:FileSheetName': duplicate files"
 $script:FileRules = @(
-    'Duplicate files'
     'A file is listed when another file has ALL of: the same name (ignoring upper/lower case), the same saved date (last modified, to the whole second) and the same contents (MD5 hash).'
     'Each row is one duplicated file. Each Location column is the full path of a folder that holds a copy.'
     'Files of 0 bytes are included unless the scan used -IgnoreEmptyFiles (Python: --ignore-empty-files).'
 )
+$script:FolderRulesTitle = "Sheet '$script:FolderSheetName': duplicate folders"
 $script:FolderRules = @(
-    'Duplicate folders'
     'A folder is listed when another folder has ALL of: the same name (ignoring upper/lower case), the same tree of files and sub folders (empty sub folders included), and every file matching the file at the same place in the other folder (same name, saved date and MD5).'
     'Only the top-most duplicates are listed: a sub folder is listed on its own only when one of its copies is outside a duplicate folder. Folders that contain no files are not listed.'
     'Each row is one duplicated folder. Each Location column is the full path of one copy.'
@@ -60,9 +66,24 @@ $script:CloudOnlyAttributes = 0x1000 -bor 0x40000 -bor 0x400000  # Offline | Rec
 
 # Orderings shared with the Python port (python/find_duplicates) so both tools
 # report the same "first" copy and sort rows and locations identically on every OS.
+# Case-insensitive order compares upper-cased text by UTF-16 code units; unlike
+# StringComparer.OrdinalIgnoreCase, that is the same on .NET Framework (Windows
+# PowerShell 5.1) and on .NET (PowerShell 7) for characters beyond U+FFFF.
+function Compare-IgnoringCase {
+    param([AllowEmptyString()] [string] $X, [AllowEmptyString()] [string] $Y)
+    [string]::CompareOrdinal($X.ToUpperInvariant(), $Y.ToUpperInvariant())
+}
+
+$script:ByPathIgnoringCase = [System.Comparison[string]] {
+    param($x, $y)
+    $order = Compare-IgnoringCase $x $y
+    if ($order -eq 0) { $order = [string]::CompareOrdinal($x, $y) }  # a fixed order for names differing only in case
+    $order
+}
+
 $script:ByDuplicateSet = [System.Comparison[object]] {
     param($x, $y)
-    $order = [System.StringComparer]::OrdinalIgnoreCase.Compare($x.FileName, $y.FileName)
+    $order = Compare-IgnoringCase $x.FileName $y.FileName
     if ($order -eq 0) { $order = $x.LastWriteTime.CompareTo($y.LastWriteTime) }
     if ($order -eq 0) { $order = [string]::CompareOrdinal($x.MD5, $y.MD5) }
     $order
@@ -218,7 +239,7 @@ function ConvertTo-NameKey {
     #>
     param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Name)
     try { if (-not $Name.IsNormalized()) { $Name = $Name.Normalize() } }
-    catch [System.ArgumentException] { }
+    catch [System.ArgumentException] { Write-Debug "Cannot normalise '$Name'; comparing it as it is." }
     $Name.ToUpperInvariant()
 }
 
@@ -374,7 +395,8 @@ function Find-DuplicateFile {
         # Inline rather than ConvertTo-NameKey: this loop runs once per file. The dictionary
         # in Group-ByKey ignores case; only Unicode normalisation is needed here.
         $name = $f.Name
-        try { if (-not $name.IsNormalized()) { $name = $name.Normalize() } } catch [System.ArgumentException] { }
+        try { if (-not $name.IsNormalized()) { $name = $name.Normalize() } }
+        catch [System.ArgumentException] { Write-Debug "Cannot normalise '$name'; comparing it as it is." }
         $keys.Add([string] ($ticks - ($ticks % $ticksPerSecond)) + '|' + $name)
     }
     $nameDateGroups = @(Group-ByKey -InputItems $File -Key $keys.ToArray())
@@ -431,11 +453,11 @@ function Find-DuplicateFile {
 }
 
 function Get-SortedFolder {
-    # Folder paths in case-insensitive ordinal order.
+    # Folder paths in case-insensitive order (see Compare-IgnoringCase).
     param([Parameter(Mandatory)] [string[]] $Path)
-    $sorted = [string[]] $Path.Clone()
-    [System.Array]::Sort($sorted, [System.StringComparer]::OrdinalIgnoreCase)
-    , $sorted
+    $sorted = [System.Collections.Generic.List[string]]::new($Path)
+    $sorted.Sort($script:ByPathIgnoringCase)
+    , $sorted.ToArray()
 }
 
 #endregion
@@ -445,9 +467,9 @@ function Get-SortedFolder {
 # Same ordering as the Python port: folder name (ordinal, ignoring case), size, first location.
 $script:ByFolderSet = [System.Comparison[object]] {
     param($x, $y)
-    $order = [System.StringComparer]::OrdinalIgnoreCase.Compare($x.FolderName, $y.FolderName)
+    $order = Compare-IgnoringCase $x.FolderName $y.FolderName
     if ($order -eq 0) { $order = $x.SizeBytes.CompareTo($y.SizeBytes) }
-    if ($order -eq 0) { $order = [System.StringComparer]::OrdinalIgnoreCase.Compare($x.Folders[0], $y.Folders[0]) }
+    if ($order -eq 0) { $order = $script:ByPathIgnoringCase.Invoke($x.Folders[0], $y.Folders[0]) }
     $order
 }
 
@@ -766,14 +788,13 @@ function ConvertTo-WorksheetData {
     # Lays out one sheet: fixed columns, then as many "Location N" columns as the longest row needs.
     param(
         [Parameter(Mandatory)] [string] $Name,
-        [Parameter(Mandatory)] [string[]] $Rule,
         [Parameter(Mandatory)] [object[]] $Column,
         [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Row,
         [Parameter(Mandatory)] [string] $Noun
     )
 
-    # The rules fill the first rows, then one blank row, then the table's header row.
-    $headerRow = $Rule.Count + 2
+    # The table's header row (the rules are on their own sheet).
+    $headerRow = 1
 
     $maxCopies = 1
     foreach ($values in $Row) { $maxCopies = [Math]::Max($maxCopies, $values.Count - $Column.Count) }
@@ -787,8 +808,8 @@ function ConvertTo-WorksheetData {
     }
 
     [pscustomobject] @{
+        Kind       = 'Table'
         Name       = $Name
-        Rules      = $Rule
         HeaderRow  = $headerRow
         Headers    = [string[]] (@($Column | ForEach-Object { $_.Header }) + @(1..$maxCopies | ForEach-Object { "Location $_" }))
         Widths     = [int[]] (@($Column | ForEach-Object { $_.Width }) + @(1..$maxCopies | ForEach-Object { $script:LocationColumnWidth }))
@@ -810,7 +831,7 @@ function Write-WorksheetXml {
 
     $Writer.WriteStartElement('worksheet', $ns)
 
-    # Frozen rules and header row.
+    # Frozen header row.
     $Writer.WriteStartElement('sheetViews', $ns)
     $Writer.WriteStartElement('sheetView', $ns)
     $Writer.WriteAttributeString('workbookViewId', '0')
@@ -836,15 +857,6 @@ function Write-WorksheetXml {
     $Writer.WriteEndElement()
 
     $Writer.WriteStartElement('sheetData', $ns)
-
-    # The matching rules: a bold title, then one sentence per row.
-    for ($r = 0; $r -lt $Sheet.Rules.Count; $r++) {
-        $Writer.WriteStartElement('row', $ns)
-        $Writer.WriteAttributeString('r', [string] ($r + 1))
-        $style = if ($r -eq 0) { $styleBold } else { 0 }
-        Write-Cell -Writer $Writer -Reference "A$($r + 1)" -Value $Sheet.Rules[$r] -Style $style
-        $Writer.WriteEndElement()
-    }
 
     # Header row.
     $Writer.WriteStartElement('row', $ns)
@@ -876,6 +888,54 @@ function Write-WorksheetXml {
     $Writer.WriteEndElement()  # worksheet
 }
 
+function Get-RulesSheetData {
+    # The Rules sheet: a title, a section per data sheet, and blank rows ($null) between.
+    param([switch] $IncludeFolders)
+
+    $lines = [System.Collections.Generic.List[object]]::new()
+    $lines.Add([pscustomobject] @{ Text = $script:RulesIntro[0]; Bold = $true })
+    foreach ($text in $script:RulesIntro[1..($script:RulesIntro.Count - 1)]) { $lines.Add([pscustomobject] @{ Text = $text; Bold = $false }) }
+    $sections = @(@{ Title = $script:FileRulesTitle; Rules = $script:FileRules })
+    if ($IncludeFolders) { $sections += @{ Title = $script:FolderRulesTitle; Rules = $script:FolderRules } }
+    foreach ($section in $sections) {
+        $lines.Add($null)
+        $lines.Add([pscustomobject] @{ Text = $section.Title; Bold = $true })
+        foreach ($text in $section.Rules) { $lines.Add([pscustomobject] @{ Text = $text; Bold = $false }) }
+    }
+    [pscustomobject] @{ Kind = 'Rules'; Name = $script:RulesSheetName; Lines = $lines.ToArray() }
+}
+
+function Write-RulesSheetXml {
+    param(
+        [Parameter(Mandatory)] [System.Xml.XmlWriter] $Writer,
+        [Parameter(Mandatory)] [object] $Sheet
+    )
+
+    $ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    $Writer.WriteStartElement('worksheet', $ns)
+    $Writer.WriteStartElement('cols', $ns)
+    $Writer.WriteStartElement('col', $ns)
+    $Writer.WriteAttributeString('min', '1')
+    $Writer.WriteAttributeString('max', '1')
+    $Writer.WriteAttributeString('width', [string] $script:RulesColumnWidth)
+    $Writer.WriteAttributeString('customWidth', '1')
+    $Writer.WriteEndElement()
+    $Writer.WriteEndElement()
+
+    $Writer.WriteStartElement('sheetData', $ns)
+    for ($r = 0; $r -lt $Sheet.Lines.Count; $r++) {
+        $line = $Sheet.Lines[$r]
+        if ($null -eq $line) { continue }  # a blank row
+        $Writer.WriteStartElement('row', $ns)
+        $Writer.WriteAttributeString('r', [string] ($r + 1))
+        $style = if ($line.Bold) { 1 } else { 0 }
+        Write-Cell -Writer $Writer -Reference "A$($r + 1)" -Value $line.Text -Style $style
+        $Writer.WriteEndElement()
+    }
+    $Writer.WriteEndElement()  # sheetData
+    $Writer.WriteEndElement()  # worksheet
+}
+
 function Export-DuplicateReport {
     <#
     .SYNOPSIS
@@ -887,6 +947,7 @@ function Export-DuplicateReport {
         Sheet "Duplicate Folders" (only when -FolderSet is given): one row per duplicated
         folder. Columns: Folder Name, Files, Sub Folders, Size (bytes), Copies, then
         "Location 1..N" holding the full path of every copy.
+        Sheet "Rules": the matching rules behind the other sheets, in plain words.
     #>
     [CmdletBinding()]
     param(
@@ -908,14 +969,15 @@ function Export-DuplicateReport {
             , (@($set.FileName, $set.LastWriteTime, [long] $set.SizeBytes, $set.MD5, [int] $set.Count) + @($set.Folders))
         })
     $sheets = [System.Collections.Generic.List[object]]::new()
-    $sheets.Add((ConvertTo-WorksheetData -Name $script:FileSheetName -Rule $script:FileRules -Column $script:FixedColumns -Row $fileRows -Noun 'file'))
+    $sheets.Add((ConvertTo-WorksheetData -Name $script:FileSheetName -Column $script:FixedColumns -Row $fileRows -Noun 'file'))
 
     if ($PSBoundParameters.ContainsKey('FolderSet') -and $null -ne $FolderSet) {
         $folderRows = @(foreach ($set in $FolderSet) {
                 , (@($set.FolderName, [int] $set.FileCount, [int] $set.FolderCount, [long] $set.SizeBytes, [int] $set.Count) + @($set.Folders))
             })
-        $sheets.Add((ConvertTo-WorksheetData -Name $script:FolderSheetName -Rule $script:FolderRules -Column $script:FolderColumns -Row $folderRows -Noun 'folder'))
+        $sheets.Add((ConvertTo-WorksheetData -Name $script:FolderSheetName -Column $script:FolderColumns -Row $folderRows -Noun 'folder'))
     }
+    $sheets.Add((Get-RulesSheetData -IncludeFolders:($sheets.Count -gt 1)))
 
     $sheetEntries = ''; $overrides = ''; $sheetRels = ''; $filters = ''
     for ($i = 1; $i -le $sheets.Count; $i++) {
@@ -923,7 +985,9 @@ function Export-DuplicateReport {
         $sheetEntries += "<sheet name=`"$($sheet.Name)`" sheetId=`"$i`" r:id=`"rId$i`"/>"
         $overrides += "<Override PartName=`"/xl/worksheets/sheet$i.xml`" ContentType=`"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml`"/>"
         $sheetRels += "<Relationship Id=`"rId$i`" Type=`"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet`" Target=`"worksheets/sheet$i.xml`"/>"
-        $filters += "<definedName name=`"_xlnm._FilterDatabase`" localSheetId=`"$($i - 1)`" hidden=`"1`">'$($sheet.Name)'!`$A`$$($sheet.HeaderRow):`$$($sheet.LastColumn)`$$($sheet.LastRow)</definedName>"
+        if ($sheet.Kind -eq 'Table') {
+            $filters += "<definedName name=`"_xlnm._FilterDatabase`" localSheetId=`"$($i - 1)`" hidden=`"1`">'$($sheet.Name)'!`$A`$$($sheet.HeaderRow):`$$($sheet.LastColumn)`$$($sheet.LastRow)</definedName>"
+        }
     }
     $stylesId = "rId$($sheets.Count + 1)"
 
@@ -978,7 +1042,8 @@ function Export-DuplicateReport {
                     $sheet = $sheets[$i - 1]
                     Write-ZipXmlEntry -Archive $zip -EntryName "xl/worksheets/sheet$i.xml" -Body {
                         param($w)
-                        Write-WorksheetXml -Writer $w -Sheet $sheet
+                        if ($sheet.Kind -eq 'Rules') { Write-RulesSheetXml -Writer $w -Sheet $sheet }
+                        else { Write-WorksheetXml -Writer $w -Sheet $sheet }
                     }
                 }
             }

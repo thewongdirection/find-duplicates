@@ -46,17 +46,23 @@ FOLDER_COLUMNS = (
 )
 FILE_SHEET_NAME = "Duplicates"
 FOLDER_SHEET_NAME = "Duplicate Folders"
+RULES_SHEET_NAME = "Rules"
+RULES_COLUMN_WIDTH = 150
 
-# The matching rules, written above each table. Shared word for word with PowerShell.
+# The matching rules, written on the Rules sheet. Shared word for word with PowerShell.
+RULES_INTRO = (
+    "Matching rules",
+    "These rules decide what counts as a match on the other sheets of this workbook.",
+)
+FILE_RULES_TITLE = f"Sheet '{FILE_SHEET_NAME}': duplicate files"
 FILE_RULES = (
-    "Duplicate files",
     "A file is listed when another file has ALL of: the same name (ignoring upper/lower case), the same saved date "
     "(last modified, to the whole second) and the same contents (MD5 hash).",
     "Each row is one duplicated file. Each Location column is the full path of a folder that holds a copy.",
     "Files of 0 bytes are included unless the scan used -IgnoreEmptyFiles (Python: --ignore-empty-files).",
 )
+FOLDER_RULES_TITLE = f"Sheet '{FOLDER_SHEET_NAME}': duplicate folders"
 FOLDER_RULES = (
-    "Duplicate folders",
     "A folder is listed when another folder has ALL of: the same name (ignoring upper/lower case), the same tree of "
     "files and sub folders (empty sub folders included), and every file matching the file at the same place in the "
     "other folder (same name, saved date and MD5).",
@@ -167,7 +173,6 @@ def _row(number: int, values: Sequence[CellValue], bold: bool = False) -> str:
 @dataclass
 class _Sheet:
     name: str
-    rules: Sequence[str]
     header_row: int
     headers: List[str]
     widths: List[int]
@@ -176,10 +181,41 @@ class _Sheet:
     last_row: int
 
 
-def _sheet(name: str, rules: Sequence[str], columns: Columns, rows: List[List[CellValue]], noun: str) -> _Sheet:
-    """Lay out one sheet: the rules, a blank row, then the table with fixed columns and as
-    many "Location N" columns as the longest row needs."""
-    header_row = len(rules) + 2
+@dataclass
+class _RulesSheet:
+    name: str
+    lines: List[Optional[Tuple[str, bool]]]  # (text, bold), or None for a blank row
+
+
+def _rules_sheet(include_folders: bool) -> _RulesSheet:
+    """The Rules sheet: a title, a section per data sheet, and blank rows between."""
+    lines: List[Optional[Tuple[str, bool]]] = [(RULES_INTRO[0], True)] + [(text, False) for text in RULES_INTRO[1:]]
+    sections = [(FILE_RULES_TITLE, FILE_RULES)]
+    if include_folders:
+        sections.append((FOLDER_RULES_TITLE, FOLDER_RULES))
+    for title, rules in sections:
+        lines += [None, (title, True)] + [(text, False) for text in rules]
+    return _RulesSheet(RULES_SHEET_NAME, lines)
+
+
+def _rules_worksheet(sheet: _RulesSheet) -> str:
+    rows = [
+        _row(number, [line[0]], bold=line[1])
+        for number, line in enumerate(sheet.lines, start=1)
+        if line is not None
+    ]
+    return (
+        f'{XML_DECLARATION}<worksheet xmlns="{MAIN_NS}">'
+        f'<cols><col min="1" max="1" width="{RULES_COLUMN_WIDTH}" customWidth="1"/></cols>'
+        f'<sheetData>{"".join(rows)}</sheetData>'
+        "</worksheet>"
+    )
+
+
+def _sheet(name: str, columns: Columns, rows: List[List[CellValue]], noun: str) -> _Sheet:
+    """Lay out one table sheet: fixed columns, then as many "Location N" columns as the
+    longest row needs."""
+    header_row = 1  # the rules are on their own sheet
     max_copies = max([1] + [len(row) - len(columns) for row in rows])
     column_count = len(columns) + max_copies
     if column_count > EXCEL_MAX_COLUMNS:
@@ -193,7 +229,6 @@ def _sheet(name: str, rules: Sequence[str], columns: Columns, rows: List[List[Ce
         )
     return _Sheet(
         name=name,
-        rules=rules,
         header_row=header_row,
         headers=[header for header, _ in columns] + [f"Location {n}" for n in range(1, max_copies + 1)],
         widths=[width for _, width in columns] + [LOCATION_COLUMN_WIDTH] * max_copies,
@@ -207,10 +242,8 @@ def _worksheet(sheet: _Sheet) -> str:
     cols = "".join(
         f'<col min="{i}" max="{i}" width="{w}" customWidth="1"/>' for i, w in enumerate(sheet.widths, start=1)
     )
-    # The matching rules (a bold title, then one sentence per row), the header row, then
-    # one row per duplicated item with one column per copy.
-    rows = [_row(number, [rule], bold=number == 1) for number, rule in enumerate(sheet.rules, start=1)]
-    rows.append(_row(sheet.header_row, sheet.headers, bold=True))
+    # The header row, then one row per duplicated item with one column per copy.
+    rows = [_row(sheet.header_row, sheet.headers, bold=True)]
     rows += [_row(number, values) for number, values in enumerate(sheet.rows, start=sheet.header_row + 1)]
     return (
         f'{XML_DECLARATION}<worksheet xmlns="{MAIN_NS}">'
@@ -224,7 +257,7 @@ def _worksheet(sheet: _Sheet) -> str:
     )
 
 
-def _package_parts(sheets: Sequence[_Sheet]) -> Dict[str, str]:
+def _package_parts(sheets: Sequence[Union[_Sheet, _RulesSheet]]) -> Dict[str, str]:
     """Every part of the package except the worksheets, as XML text."""
     numbered = list(enumerate(sheets, start=1))
     content_types = (
@@ -250,6 +283,7 @@ def _package_parts(sheets: Sequence[_Sheet]) -> Dict[str, str]:
             f'<definedName name="_xlnm._FilterDatabase" localSheetId="{i - 1}" hidden="1">'
             f"'{s.name}'!$A${s.header_row}:${s.last_column}${s.last_row}</definedName>"
             for i, s in numbered
+            if isinstance(s, _Sheet)
         )
         + "</definedNames></workbook>"
     )
@@ -278,13 +312,13 @@ def export_duplicate_report(
 ) -> None:
     """Save duplicate sets to an .xlsx workbook at ``path``.
 
-    With ``folders`` (even an empty list) the "Duplicate Folders" sheet is added.
+    With ``folders`` (even an empty list) the "Duplicate Folders" sheet is added. A
+    "Rules" sheet always follows, stating the matching rules behind the other sheets.
     """
     path = os.path.abspath(path)
-    sheets = [
+    sheets: List[Union[_Sheet, _RulesSheet]] = [
         _sheet(
             FILE_SHEET_NAME,
-            FILE_RULES,
             FIXED_COLUMNS,
             [[d.file_name, d.last_write_time, d.size_bytes, d.md5, d.count] + list(d.folders) for d in duplicates],
             "file",
@@ -294,12 +328,12 @@ def export_duplicate_report(
         sheets.append(
             _sheet(
                 FOLDER_SHEET_NAME,
-                FOLDER_RULES,
                 FOLDER_COLUMNS,
                 [[f.folder_name, f.file_count, f.folder_count, f.size_bytes, f.count] + list(f.folders) for f in folders],
                 "folder",
             )
         )
+    sheets.append(_rules_sheet(include_folders=folders is not None))
 
     # Build next to the target, then swap in, so a failure never leaves a half-written report.
     temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
@@ -308,7 +342,8 @@ def export_duplicate_report(
             for name, xml in _package_parts(sheets).items():
                 archive.writestr(name, XML_DECLARATION + xml)
             for number, sheet in enumerate(sheets, start=1):
-                archive.writestr(f"xl/worksheets/sheet{number}.xml", _worksheet(sheet))
+                xml = _rules_worksheet(sheet) if isinstance(sheet, _RulesSheet) else _worksheet(sheet)
+                archive.writestr(f"xl/worksheets/sheet{number}.xml", xml)
         os.replace(temp_path, path)
     finally:
         if os.path.exists(temp_path):
@@ -388,7 +423,8 @@ def _worksheet_rows(archive: zipfile.ZipFile, sheet_path: str, shared: List[str]
 
 
 def _report_rows(rows: List[List[Optional[str]]], columns: Columns, error: str) -> List[Tuple[List[str], List[str]]]:
-    """Find a sheet's table header row (below the rules; row 1 in older reports) and return
+    """Find a sheet's table header row (row 1; lower in reports that had the rules above
+    the table) and return
     the data rows under it as (fixed values, folders) pairs."""
     expected = [header for header, _ in columns]
 

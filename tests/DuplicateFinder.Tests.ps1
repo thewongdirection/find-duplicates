@@ -33,10 +33,22 @@ BeforeAll {
         (New-Item -ItemType Directory -Path $root).FullName
     }
 
+    function Get-SheetName {
+        # The workbook's sheet names, in order.
+        param([string] $Path)
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        try {
+            $reader = [System.IO.StreamReader]::new($zip.GetEntry('xl/workbook.xml').Open())
+            try { [xml] $xml = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        }
+        finally { $zip.Dispose() }
+        @($xml.workbook.sheets.sheet | ForEach-Object { $_.name })
+    }
+
     function Read-Worksheet {
         # Returns a worksheet as a list of rows, each row a list of cell texts: from the
-        # table's header row down, or with -IncludeRules every row including the rules above.
-        param([string] $Path, [string] $Part = 'xl/worksheets/sheet1.xml', [switch] $IncludeRules)
+        # table's header row down, or with -AllRows every row (for the Rules sheet).
+        param([string] $Path, [string] $Part = 'xl/worksheets/sheet1.xml', [switch] $AllRows)
         $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
         try {
             $reader = [System.IO.StreamReader]::new($zip.GetEntry($Part).Open())
@@ -46,7 +58,7 @@ BeforeAll {
 
         $ns = [System.Xml.XmlNamespaceManager]::new($xml.NameTable)
         $ns.AddNamespace('s', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main')
-        $inTable = [bool] $IncludeRules
+        $inTable = [bool] $AllRows
         foreach ($row in $xml.SelectNodes('//s:sheetData/s:row', $ns)) {
             $cells = @(foreach ($cell in $row.SelectNodes('s:c', $ns)) {
                     $text = $cell.SelectSingleNode('s:is/s:t', $ns)
@@ -492,7 +504,7 @@ Describe 'Export-DuplicateReport' {
         $zip = [System.IO.Compression.ZipFile]::OpenRead($out)
         try {
             $expected = '[Content_Types].xml', '_rels/.rels', 'xl/_rels/workbook.xml.rels',
-                'xl/styles.xml', 'xl/workbook.xml', 'xl/worksheets/sheet1.xml'
+                'xl/styles.xml', 'xl/workbook.xml', 'xl/worksheets/sheet1.xml', 'xl/worksheets/sheet2.xml'
             ($zip.Entries.FullName | Sort-Object) | Should -Be ($expected | Sort-Object)
             foreach ($entry in $zip.Entries) {
                 $reader = [System.IO.StreamReader]::new($entry.Open())
@@ -503,23 +515,31 @@ Describe 'Export-DuplicateReport' {
         finally { $zip.Dispose() }
     }
 
-    It 'writes the matching rules above the table' {
+    It 'writes the matching rules on a Rules sheet' {
         $out = Join-Path (Add-TestRoot) 'report.xlsx'
         Export-DuplicateReport -DuplicateSet $script:Sets -Path $out
 
-        $all = @(Read-Worksheet $out -IncludeRules)
-        $all[0][0] | Should -Be 'Duplicate files'
-        $all[1][0] | Should -BeLike 'A file is listed when another file has ALL of*MD5*'
-        $all[4][0] | Should -Be 'File Name' -Because 'rules, then one blank row (not written), then the table'
+        Get-SheetName $out | Should -Be @('Duplicates', 'Rules')
+        $rules = @(Read-Worksheet $out -Part 'xl/worksheets/sheet2.xml' -AllRows | ForEach-Object { $_[0] })
+        $rules[0] | Should -Be 'Matching rules'
+        $rules | Should -Contain "Sheet 'Duplicates': duplicate files"
+        @($rules | Where-Object { $_ -like 'A file is listed when another file has ALL of*' }).Count | Should -Be 1
+        $rules | Should -Not -Contain "Sheet 'Duplicate Folders': duplicate folders" -Because 'no folder sheet, no folder rules'
+    }
 
+    It 'starts the table on row 1' {
+        $out = Join-Path (Add-TestRoot) 'report.xlsx'
+        Export-DuplicateReport -DuplicateSet $script:Sets -Path $out
+
+        (Read-Worksheet $out -AllRows)[0][0] | Should -Be 'File Name'
         $zip = [System.IO.Compression.ZipFile]::OpenRead($out)
         try {
             $reader = [System.IO.StreamReader]::new($zip.GetEntry('xl/worksheets/sheet1.xml').Open())
             try { $sheetXml = $reader.ReadToEnd() } finally { $reader.Dispose() }
         }
         finally { $zip.Dispose() }
-        $sheetXml | Should -Match '<pane ySplit="6" topLeftCell="A7"'
-        $sheetXml | Should -Match '<autoFilter ref="A6:H8"'
+        $sheetXml | Should -Match '<pane ySplit="1" topLeftCell="A2"'
+        $sheetXml | Should -Match '<autoFilter ref="A1:H3"'
     }
 
     It 'writes a header-only workbook when there are no duplicates' {
@@ -631,6 +651,18 @@ Describe 'Import-DuplicateReport' {
         $read[0].LastWriteTime | Should -Be ([datetime]::new(2024, 1, 1, 12, 0, 0))
         $read[0].SizeBytes | Should -Be 10
         $read[0].Folders | Should -Be @('C:\a', 'C:\b')
+    }
+
+    It 'reads a report that had the rules above the table' {
+        $path = Join-Path (Add-TestRoot) 'older.xlsx'
+        Write-ExcelSavedWorkbook -Path $path -Rows @(
+            , @('Duplicate files')
+            , @('Some rule.')
+            , @($null)
+            , @('File Name', 'Last Modified', 'Size (bytes)', 'MD5', 'Copies', 'Location 1', 'Location 2')
+            , @('x.txt', 45292.5, 10, 'CCCC', 2, 'C:\a', 'C:\b')
+        )
+        @(Import-DuplicateReport -Path $path).FileName | Should -Be @('x.txt')
     }
 
     It 'rejects a workbook that is not a duplicates report' {
@@ -1057,6 +1089,17 @@ Describe 'Unicode names' {
         (Update-DuplicateReport -Path $report).CopiesRemoved | Should -Be 0
     }
 
+    It 'orders names the same way on Windows PowerShell 5.1 and PowerShell 7' {
+        # In UTF-16 order an emoji comes before U+FF21 (full-width A); in code-point order
+        # it comes after. OrdinalIgnoreCase differs between .NET versions here.
+        $emoji = [char]::ConvertFromUtf32(0x1F600)
+        $fullWidthA = [string] [char] 0xFF21
+        InModuleScope DuplicateFinder -Parameters @{ Emoji = $emoji; FullWidthA = $fullWidthA } {
+            Get-SortedFolder -Path @("/x/$FullWidthA", "/x/$Emoji") | Should -Be @("/x/$Emoji", "/x/$FullWidthA")
+            Get-SortedFolder -Path @('/x/photos', '/x/Photos') | Should -Be @('/x/Photos', '/x/photos') -Because 'names differing only in case keep a fixed order'
+        }
+    }
+
     It 'finds duplicate folders with Unicode names' {
         $root = Add-TestRoot
         foreach ($parent in 'one', 'two') {
@@ -1105,6 +1148,9 @@ Describe 'Duplicate folders in the report' {
             $read[0].$property | Should -Be $script:FolderSets[0].$property -Because $property
         }
         $read[0].Folders | Should -Be $script:FolderSets[0].Folders
+        Get-SheetName $path | Should -Be @('Duplicates', 'Duplicate Folders', 'Rules')
+        $rules = @(Read-Worksheet $path -Part 'xl/worksheets/sheet3.xml' -AllRows | ForEach-Object { $_[0] })
+        $rules | Should -Contain "Sheet 'Duplicate Folders': duplicate folders"
     }
 
     It 'writes no folder sheet unless folder sets are given' {
@@ -1112,16 +1158,14 @@ Describe 'Duplicate folders in the report' {
         Export-DuplicateReport -DuplicateSet @() -Path $path
 
         @(Import-DuplicateFolderReport -Path $path).Count | Should -Be 0
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($path)
-        try { $zip.Entries.FullName | Should -Not -Contain 'xl/worksheets/sheet2.xml' } finally { $zip.Dispose() }
+        Get-SheetName $path | Should -Not -Contain 'Duplicate Folders'
     }
 
     It 'writes an empty folder sheet when no duplicate folders were found' {
         $path = Join-Path (Add-TestRoot) 'report.xlsx'
         Export-DuplicateReport -DuplicateSet @() -FolderSet @() -Path $path
 
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($path)
-        try { $zip.Entries.FullName | Should -Contain 'xl/worksheets/sheet2.xml' } finally { $zip.Dispose() }
+        Get-SheetName $path | Should -Contain 'Duplicate Folders'
         @(Import-DuplicateFolderReport -Path $path).Count | Should -Be 0
     }
 }
@@ -1184,8 +1228,7 @@ Describe 'Validating duplicate folders' {
 
         $result.FolderRowsRemoved | Should -Be 1
         $result.DuplicateFolderSet.Count | Should -Be 0
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($report)
-        try { $zip.Entries.FullName | Should -Contain 'xl/worksheets/sheet2.xml' } finally { $zip.Dispose() }
+        Get-SheetName $report | Should -Contain 'Duplicate Folders'
     }
 
     It 'keeps folder copies that cannot be reached' {
@@ -1212,8 +1255,7 @@ Describe 'Validating duplicate folders' {
         $result.Saved | Should -BeTrue
         $result.DuplicateFolderSet | Should -BeNullOrEmpty
         @(Import-DuplicateFolderReport -Path $report).Count | Should -Be 0
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($report)
-        try { $zip.Entries.FullName | Should -Not -Contain 'xl/worksheets/sheet2.xml' } finally { $zip.Dispose() }
+        Get-SheetName $report | Should -Be @('Duplicates', 'Rules')
     }
 }
 
@@ -1267,7 +1309,7 @@ Describe 'Find-Duplicates.ps1' {
         $result[0].Folders | ForEach-Object { $_ | Should -Not -BeLike '*~*' }
     }
 
-    It 'scans a network share given as a UNC path' {
+    It 'scans and validates a network share given as a UNC path' {
         if (-not $script:OnWindows) { Set-ItResult -Skipped -Because 'UNC paths are Windows-only'; return }
         $root = Add-TestRoot
         $null = Add-TestFile $root 'a/x.txt'
@@ -1282,6 +1324,11 @@ Describe 'Find-Duplicates.ps1' {
         $result.Count | Should -Be 1
         $result[0].Folders | Should -Be @("$unc\a", "$unc\b")
         $out | Should -Exist
+
+        # Validation over the network path too.
+        Remove-Item -LiteralPath (Join-Path $root 'a/x.txt')
+        $null = & $script:ScriptPath -Validate $out 6>$null
+        @(Import-DuplicateReport -Path $out).Count | Should -Be 0
     }
 
     It 'hashes several files at a time with -ThrottleLimit' {

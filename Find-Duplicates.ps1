@@ -15,7 +15,7 @@
     another file (and whose size matches too), so most files are never read.
     Files of 0 bytes are included unless -IgnoreEmptyFiles is used.
 
-    Each sheet of the report starts with the matching rules, then the table.
+    A "Rules" sheet in the report states the matching rules in plain words.
     The report has one row per duplicated file with the columns
     File Name | Last Modified | Size (bytes) | MD5 | Copies | Location 1 | Location 2 | ...
     where each "Location" column holds the full folder path of one copy.

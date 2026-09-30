@@ -24,12 +24,20 @@ def add_file(root: str, relative: str, content: str = "same content", saved: dat
 
 
 TABLE_HEADERS = ("File Name", "Folder Name")
+MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
 
-def read_worksheet(path: str, part: str = "xl/worksheets/sheet1.xml", include_rules: bool = False) -> List[List[str]]:
-    """A worksheet written by this tool as a list of rows, each row a list of cell texts:
-    from the table's header row down, or with ``include_rules`` every row including the
-    rules above it."""
+def sheet_names(path: str) -> List[str]:
+    """The workbook's sheet names, in order."""
+    with zipfile.ZipFile(path) as archive:
+        root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+    return [sheet.get("name") for sheet in root.findall(f"{{{MAIN}}}sheets/{{{MAIN}}}sheet")]
+
+
+def read_worksheet(path: str, part: str = "xl/worksheets/sheet1.xml", all_rows: bool = False) -> List[List[str]]:
+    """A worksheet as a list of rows, each row a list of cell texts: from the table's
+    header row down, or with ``all_rows`` every row (for the Rules sheet, or reports
+    that had text above the table)."""
     with zipfile.ZipFile(path) as archive:
         root = ElementTree.fromstring(archive.read(part))
     rows = []
@@ -39,7 +47,7 @@ def read_worksheet(path: str, part: str = "xl/worksheets/sheet1.xml", include_ru
             text = cell.find("s:is/s:t", NS)
             cells.append((text.text or "") if text is not None else cell.find("s:v", NS).text)
         rows.append(cells)
-    if include_rules:
+    if all_rows:
         return rows
     start = next(i for i, row in enumerate(rows) if row and row[0] in TABLE_HEADERS)
     return rows[start:]

@@ -25,7 +25,7 @@ from find_duplicates.validate import validate_report  # noqa: E402
 from find_duplicates.xlsx import (  # noqa: E402
     column_name, excel_serial, export_duplicate_report, from_excel_serial, read_duplicate_report,
 )
-from tests.helpers import SAVED, add_file, read_worksheet  # noqa: E402
+from tests.helpers import SAVED, add_file, read_worksheet, sheet_names  # noqa: E402
 
 
 class TempDirTestCase(unittest.TestCase):
@@ -320,7 +320,7 @@ class ExportDuplicateReportTests(TempDirTestCase):
         with zipfile.ZipFile(self.export()) as archive:
             self.assertEqual(sorted(archive.namelist()), sorted([
                 "[Content_Types].xml", "_rels/.rels", "xl/_rels/workbook.xml.rels",
-                "xl/styles.xml", "xl/workbook.xml", "xl/worksheets/sheet1.xml"]))
+                "xl/styles.xml", "xl/workbook.xml", "xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml"]))
             for name in archive.namelist():
                 with self.subTest(part=name):
                     ElementTree.fromstring(archive.read(name))
@@ -331,16 +331,31 @@ class ExportDuplicateReportTests(TempDirTestCase):
         rows = read_worksheet(self.export(sets=[bad]))
         self.assertEqual(rows[1][0], "f" + chr(0xFFFD) + ".txt")
 
-    def test_writes_the_matching_rules_above_the_table(self):
+    def test_writes_the_matching_rules_on_a_rules_sheet(self):
         path = self.export()
-        rows = read_worksheet(path, include_rules=True)
-        self.assertEqual(rows[0][0], "Duplicate files")
-        self.assertRegex(rows[1][0], "^A file is listed when another file has ALL of.*MD5")
-        self.assertEqual(rows[4][0], "File Name", "rules, then one blank row (not written), then the table")
+        self.assertEqual(sheet_names(path), ["Duplicates", "Rules"])
+        rules = [row[0] for row in read_worksheet(path, "xl/worksheets/sheet2.xml", all_rows=True)]
+        self.assertEqual(rules[0], "Matching rules")
+        self.assertIn("Sheet 'Duplicates': duplicate files", rules)
+        self.assertTrue(any(line.startswith("A file is listed when another file has ALL of") for line in rules))
+        self.assertNotIn("Sheet 'Duplicate Folders': duplicate folders", rules, "no folder sheet, no folder rules")
+
+    def test_starts_the_table_on_row_1(self):
+        path = self.export()
+        self.assertEqual(read_worksheet(path, all_rows=True)[0][0], "File Name")
         with zipfile.ZipFile(path) as archive:
             sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
-        self.assertIn('<pane ySplit="6" topLeftCell="A7"', sheet)
-        self.assertIn('<autoFilter ref="A6:H8"', sheet)
+        self.assertIn('<pane ySplit="1" topLeftCell="A2"', sheet)
+        self.assertIn('<autoFilter ref="A1:H3"', sheet)
+
+    def test_reads_a_report_that_had_the_rules_above_the_table(self):
+        path = os.path.join(self.root, "older.xlsx")
+        write_excel_saved_workbook(path, [
+            ["Duplicate files"], ["Some rule."], [],
+            ["File Name", "Last Modified", "Size (bytes)", "MD5", "Copies", "Location 1", "Location 2"],
+            ["x.txt", 45292.5, 10, "CCCC", 2, "C:\\a", "C:\\b"],
+        ])
+        self.assertEqual([d.file_name for d in read_duplicate_report(path)], ["x.txt"])
 
     def test_header_only_workbook_when_no_duplicates(self):
         rows = read_worksheet(self.export("empty.xlsx", sets=[]))
@@ -696,6 +711,25 @@ class CliTests(TempDirTestCase):
         self.run_cli(root, report)
         self.assertEqual(len(read_duplicate_report(report)), 1)
         self.run_cli(root, report, "--ignore-empty-files")
+        self.assertEqual(read_duplicate_report(report), [])
+
+    @unittest.skipUnless(sys.platform == "win32", "UNC paths are Windows-only")
+    def test_scans_and_validates_a_network_share_given_as_a_unc_path(self):
+        root = self.new_dir("unc")
+        add_file(root, "a/x.txt")
+        add_file(root, "b/x.txt")
+        # Reach the local test folder through the administrative share, e.g. \\localhost\C$\...
+        unc = "\\\\localhost\\" + root[0] + "$" + root[2:]
+        if not os.path.isdir(unc):
+            self.skipTest("the administrative share is not available")
+        report = os.path.join(self.new_dir("work"), "unc.xlsx")
+
+        self.assertEqual(self.run_cli(unc, report)[0], 0)
+        (row,) = read_duplicate_report(report)
+        self.assertEqual(row.folders, [os.path.join(unc, "a"), os.path.join(unc, "b")])
+
+        os.remove(os.path.join(root, "a", "x.txt"))
+        self.assertEqual(self.run_cli("--validate", report)[0], 0)
         self.assertEqual(read_duplicate_report(report), [])
 
     def test_saves_no_report_with_dry_run(self):

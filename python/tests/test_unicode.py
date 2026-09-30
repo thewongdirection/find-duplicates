@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from find_duplicates import scanner  # noqa: E402
 from find_duplicates.folders import find_duplicate_folders  # noqa: E402
 from find_duplicates.matcher import find_duplicate_files  # noqa: E402
-from find_duplicates.names import name_key, sort_key  # noqa: E402
+from find_duplicates.names import name_key, path_sort_key, sort_key  # noqa: E402
 from find_duplicates.scanner import iter_files  # noqa: E402
 from find_duplicates.validate import validate_report  # noqa: E402
 from find_duplicates.xlsx import (  # noqa: E402
@@ -147,6 +147,9 @@ class NameKeyTests(unittest.TestCase):
         emoji, full_width_a = NAMES["Emoji"], chr(0xFF21)
         self.assertEqual(sorted([full_width_a, emoji], key=sort_key), [emoji, full_width_a])
         self.assertEqual(sorted([full_width_a, emoji], key=lambda t: sort_key(t, True)), [emoji, full_width_a])
+
+    def test_orders_paths_differing_only_in_case_in_a_fixed_order(self):
+        self.assertEqual(sorted(["/x/photos", "/x/Photos"], key=path_sort_key), ["/x/Photos", "/x/photos"])
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, Hashable, Iterable, List, Optional, Sequence, TypeVar
 
-from .names import name_key, sort_key
+from .names import name_key, path_sort_key, sort_key
 from .scanner import FileRecord, is_cloud_only
 
 log = logging.getLogger("find_duplicates")
@@ -199,7 +199,7 @@ def find_duplicate_files(
                     size_bytes=first.size,
                     md5=md5,
                     count=len(same),
-                    folders=sorted((record.folder for record, _ in same), key=lambda p: sort_key(p, True)),
+                    folders=sorted((record.folder for record, _ in same), key=path_sort_key),
                 )
             )
 

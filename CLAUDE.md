@@ -45,10 +45,14 @@ locations are sorted ordinal-ignore-case, rows by file name
 millisecond when written and rounded to it when read, as .NET does.
 
 Names are matched in NFC form, ignoring case (`ConvertTo-NameKey` / `name_key`),
-and ordered by UTF-16 code units (`sort_key`), which is how .NET's ordinal
-comparers order characters beyond U+FFFF. The rules text written above each
-table (`$script:FileRules` / `FILE_RULES`, `$script:FolderRules` / `FOLDER_RULES`)
-must be identical in both languages; the parity test compares it.
+and ordered by UTF-16 code units: `String.CompareOrdinal` on upper-cased text
+(`Compare-IgnoringCase`, `$script:ByPathIgnoringCase` / `sort_key`,
+`path_sort_key`). Never order with `StringComparer.OrdinalIgnoreCase`: .NET
+Framework (Windows PowerShell 5.1) and .NET (PowerShell 7) order characters
+beyond U+FFFF differently with it. The text of the Rules sheet
+(`$script:RulesIntro` / `RULES_INTRO`, `$script:FileRules` / `FILE_RULES`,
+`$script:FolderRules` / `FOLDER_RULES` and their titles) must be identical in both
+languages; the parity test compares every sheet.
 
 PowerShell source files must stay ASCII: Windows PowerShell 5.1 reads BOM-less
 files in the ANSI code page. Build non-ASCII test data from code points.

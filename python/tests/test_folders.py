@@ -23,7 +23,7 @@ from find_duplicates.validate import validate_report  # noqa: E402
 from find_duplicates.xlsx import (  # noqa: E402
     export_duplicate_report, read_duplicate_folder_report, read_duplicate_report,
 )
-from tests.helpers import SAVED, add_file  # noqa: E402
+from tests.helpers import SAVED, add_file, read_worksheet, sheet_names  # noqa: E402
 
 
 def folder_scan(root):
@@ -170,14 +170,14 @@ class FindDuplicateFoldersTests(TempRootTestCase):
 class DuplicateFoldersInTheReportTests(TempRootTestCase):
     SETS = [DuplicateFolderSet("Photos", 12, 3, 123456, 2, ["C:\\one\\Photos", "D:\\two\\Photos"])]
 
-    def sheet_parts(self, path):
-        with zipfile.ZipFile(path) as archive:
-            return archive.namelist()
-
     def test_writes_and_reads_back_a_duplicate_folders_sheet(self):
         path = self.path("report.xlsx")
         export_duplicate_report([], path, self.SETS)
         self.assertEqual(read_duplicate_folder_report(path), self.SETS)
+        self.assertEqual(sheet_names(path), ["Duplicates", "Duplicate Folders", "Rules"])
+        rules = [row[0] for row in read_worksheet(path, "xl/worksheets/sheet3.xml", all_rows=True)]
+        self.assertIn("Sheet 'Duplicate Folders': duplicate folders", rules)
+        self.assertTrue(any(line.startswith("A folder is listed when another folder has ALL of") for line in rules))
 
     def test_finds_the_folder_sheet_whatever_the_case_of_its_name(self):
         path = self.path("report.xlsx")
@@ -194,12 +194,12 @@ class DuplicateFoldersInTheReportTests(TempRootTestCase):
         path = self.path("report.xlsx")
         export_duplicate_report([], path)
         self.assertEqual(read_duplicate_folder_report(path), [])
-        self.assertNotIn("xl/worksheets/sheet2.xml", self.sheet_parts(path))
+        self.assertNotIn("Duplicate Folders", sheet_names(path))
 
     def test_writes_an_empty_folder_sheet_when_no_duplicate_folders_were_found(self):
         path = self.path("report.xlsx")
         export_duplicate_report([], path, [])
-        self.assertIn("xl/worksheets/sheet2.xml", self.sheet_parts(path))
+        self.assertIn("Duplicate Folders", sheet_names(path))
         self.assertEqual(read_duplicate_folder_report(path), [])
 
 
@@ -242,8 +242,7 @@ class ValidatingDuplicateFoldersTests(TempRootTestCase):
         result = validate_report(report)
         self.assertEqual(result.folder_rows_removed, 1)
         self.assertEqual(result.duplicate_folders, [])
-        with zipfile.ZipFile(report) as archive:
-            self.assertIn("xl/worksheets/sheet2.xml", archive.namelist())
+        self.assertIn("Duplicate Folders", sheet_names(report))
 
     def test_keeps_folder_copies_that_cannot_be_reached(self):
         self.add_three_copies()
@@ -262,8 +261,7 @@ class ValidatingDuplicateFoldersTests(TempRootTestCase):
         result = validate_report(report)
         self.assertTrue(result.saved)
         self.assertIsNone(result.duplicate_folders)
-        with zipfile.ZipFile(report) as archive:
-            self.assertNotIn("xl/worksheets/sheet2.xml", archive.namelist())
+        self.assertEqual(sheet_names(report), ["Duplicates", "Rules"])
 
 
 class FolderCliTests(TempRootTestCase):

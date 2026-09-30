@@ -25,7 +25,14 @@ def name_key(text: str) -> str:
 
 
 def sort_key(text: str, ignore_case: bool = False) -> bytes:
-    """Orders strings exactly as .NET's ordinal comparers do (StringComparer.Ordinal,
-    or OrdinalIgnoreCase with ``ignore_case``): by UTF-16 code units, which differs
-    from Python's code-point order for characters beyond U+FFFF such as emoji."""
+    """Orders strings as the PowerShell tool does: by UTF-16 code units (.NET's
+    String.CompareOrdinal), upper-cased first with ``ignore_case`` (Compare-IgnoringCase).
+    UTF-16 order differs from Python's code-point order for characters beyond U+FFFF
+    such as emoji."""
     return (_upper(text) if ignore_case else text).encode("utf-16-be", "surrogatepass")
+
+
+def path_sort_key(path: str) -> tuple:
+    """Case-insensitive order for paths, with a fixed order for paths differing only in
+    case (as ByPathIgnoringCase in PowerShell)."""
+    return sort_key(path, ignore_case=True), sort_key(path)

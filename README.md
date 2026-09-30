@@ -30,7 +30,7 @@ The tool comes in two versions with the same features and the same output: a
 | Parallel hashing | `-ThrottleLimit N` hashes up to N files at the same time (1-64). |
 | Every copy recorded | One row per duplicated file, one column per copy, with the full folder path of each. |
 | Duplicate folders | `-IncludeFolders` also finds whole folders with the same name and identical contents (every file and sub folder), on a second sheet. |
-| Excel output without Excel | Writes a real `.xlsx`: each sheet starts with the matching rules in plain words, then a table with a frozen, filterable header and real dates. Excel does not need to be installed. |
+| Excel output without Excel | Writes a real `.xlsx`: data sheets with a frozen, filterable header and real dates, plus a *Rules* sheet stating in plain words what counts as a match. Excel does not need to be installed. |
 | Empty files optional | `-IgnoreEmptyFiles` leaves files of 0 bytes out of the file duplicates. |
 | Any language | File and folder names in any script (Chinese, Arabic, Cyrillic, emoji ...) are matched and stored correctly; a name typed on a Mac matches the same name saved on Windows. |
 | Validate without rescanning | `-Validate` re-checks every copy listed in an existing report (files with a quick lookup, folders by re-listing them, never reading contents) and removes those that are gone or changed. |
@@ -221,11 +221,15 @@ formatting is dropped when it is rewritten.
 
 ## The report
 
-Each sheet starts with the rules used to decide on matches, written out in
-plain words (rows 1-4), then a blank row, then the table. The rules and the
-table's header row stay visible while you scroll.
+The workbook has these sheets:
 
-Below the rules: one row per duplicated file, one column per copy:
+| Sheet | Contents |
+|---|---|
+| **Duplicates** | One row per duplicated file (below). |
+| **Duplicate Folders** | Only with `-IncludeFolders`: one row per duplicated folder (see [Duplicate folders](#duplicate-folders)). |
+| **Rules** | The matching rules behind the other sheets, in plain words, so anyone reviewing the data can check what a match means. Rewritten with the data, so it always matches the sheets present. |
+
+On the *Duplicates* sheet: one row per duplicated file, one column per copy:
 
 | File Name  | Last Modified       | Size (bytes) | MD5     | Copies | Location 1     | Location 2        | Location 3 |
 |------------|---------------------|--------------|---------|--------|----------------|-------------------|------------|
