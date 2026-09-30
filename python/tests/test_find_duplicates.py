@@ -8,9 +8,10 @@ import os
 import stat
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 from xml.etree import ElementTree
@@ -30,7 +31,8 @@ from tests.helpers import SAVED, add_file, read_worksheet  # noqa: E402
 class TempDirTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._temp = tempfile.TemporaryDirectory()
-        self.root = self._temp.name
+        # Long form: the Windows temp folder is often a short (8.3) path, which the tool expands.
+        self.root = scanner.full_path(self._temp.name)
 
     def tearDown(self) -> None:
         self._temp.cleanup()
@@ -65,6 +67,13 @@ class IterFilesTests(TempDirTestCase):
         add_file(self.root, "one/b.txt")
         add_file(self.root, "one/two/three/c.txt")
         self.assertEqual(sorted(r.name for r in iter_files(self.root)), ["a.txt", "b.txt", "c.txt"])
+
+    def test_leaves_out_excluded_files_given_in_another_form(self):
+        keep = add_file(self.root, "keep.txt")
+        skip = add_file(self.root, "sub/duplicates.xlsx")
+        other_form = os.path.join(self.root, "sub", "..", "sub", "duplicates.xlsx")
+        self.assertEqual([r.path for r in iter_files(self.root, exclude=[other_form])], [keep])
+        self.assertTrue(os.path.exists(skip))
 
     def test_leaves_out_excluded_files(self):
         keep = add_file(self.root, "keep.txt")
@@ -224,7 +233,7 @@ class FindDuplicateFilesTests(TempDirTestCase):
         }
         for label, files in cases.items():
             with self.subTest(label), tempfile.TemporaryDirectory() as root:
-                self.root = root
+                root = self.root = scanner.full_path(root)
                 paths = [add_file(root, p, c, s) for p, c, s in files]
                 with mock.patch.object(matcher, "md5_file", return_value="ABC") as md5:
                     find_duplicate_files(self.records(*paths))
@@ -382,6 +391,8 @@ def write_excel_saved_workbook(path, rows):
         cells = []
         for c, value in enumerate(row, start=1):
             ref = f"{column_name(c)}{r}"
+            if value is None:
+                continue  # Excel leaves blank cells out
             if isinstance(value, str):
                 strings.append(value)
                 cells.append(f'<c r="{ref}" t="s"><v>{len(strings) - 1}</v></c>')
@@ -439,9 +450,47 @@ class ReadDuplicateReportTests(TempDirTestCase):
         with self.assertRaisesRegex(ValueError, "is not an Excel workbook"):
             read_duplicate_report(path)
 
+    def test_rejects_a_header_row_with_a_blank_cell(self):
+        path = os.path.join(self.root, "gap.xlsx")
+        write_excel_saved_workbook(path, [["File Name", None, "Size (bytes)", "MD5", "Copies"]])
+        with self.assertRaisesRegex(ValueError, "is not a duplicates report"):
+            read_duplicate_report(path)
+
+    def test_rejects_a_report_containing_a_dtd(self):
+        path = os.path.join(self.root, "dtd.xlsx")
+        export_duplicate_report(self.ROUND_TRIP, path)
+        add_doctype_to_workbook_part(path)
+        with self.assertRaisesRegex(ValueError, "DTD"):
+            read_duplicate_report(path)
+
+    def test_reports_a_damaged_workbook_as_an_error(self):
+        path = os.path.join(self.root, "damaged.xlsx")
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("xl/workbook.xml", "<workbook")  # truncated XML
+            archive.writestr("xl/_rels/workbook.xml.rels", "<Relationships/>")
+        with self.assertRaisesRegex(ValueError, "could not be read"):
+            read_duplicate_report(path)
+
+    def test_reads_a_report_that_another_program_has_open(self):
+        path = os.path.join(self.root, "open.xlsx")
+        export_duplicate_report(self.ROUND_TRIP, path)
+        with open(path, "r+b"):  # like Excel holding the file
+            self.assertEqual(len(read_duplicate_report(path)), 2)
+
     def test_reports_a_missing_report(self):
         with self.assertRaisesRegex(FileNotFoundError, "was not found"):
             read_duplicate_report(os.path.join(self.root, "missing.xlsx"))
+
+
+def add_doctype_to_workbook_part(path):
+    """Rewrite the workbook part with a DTD, as a malicious file might."""
+    with zipfile.ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts["xl/workbook.xml"] = parts["xl/workbook.xml"].replace(
+        b"<workbook", b'<!DOCTYPE workbook [<!ENTITY x "x">]><workbook', 1)
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, data in parts.items():
+            archive.writestr(name, data)
 
 
 class ValidateReportTests(TempDirTestCase):
@@ -519,6 +568,33 @@ class ValidateReportTests(TempDirTestCase):
             self.skipTest("no free drive letter")
         state = validate.check_copy(f"{free}:\\photos", "x.txt", 1, datetime.now())
         self.assertEqual(state, validate.UNAVAILABLE)
+
+    @unittest.skipIf(sys.platform == "win32", "time.tzset is not available on Windows")
+    def test_keeps_a_copy_saved_in_the_repeated_hour_when_daylight_saving_ends(self):
+        previous = os.environ.get("TZ")
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        try:
+            # 06:30 UTC on 3 Nov 2024 is 01:30 local, in the hour that happens twice.
+            saved = datetime(2024, 11, 3, 6, 30, tzinfo=timezone.utc)
+            path = add_file(self.root, "dst/x.txt", saved=saved)
+            recorded = datetime.fromtimestamp(saved.timestamp())
+            state = validate.check_copy(os.path.dirname(path), "x.txt", os.path.getsize(path), recorded)
+            self.assertEqual(state, validate.PRESENT)
+        finally:
+            if previous is None:
+                del os.environ["TZ"]
+            else:
+                os.environ["TZ"] = previous
+            time.tzset()
+
+    def test_checks_each_drive_or_share_only_once(self):
+        root_cache = {}
+        with mock.patch.object(validate, "_path_root", return_value="Z:\\"), \
+                mock.patch.object(validate.os.path, "isdir", return_value=False) as isdir:
+            states = {validate.check_copy(f"Z:\\{n}", "x.txt", 1, datetime.now(), root_cache) for n in range(5)}
+        self.assertEqual(states, {validate.UNAVAILABLE})
+        self.assertEqual(isdir.call_count, 1)
 
     def test_changes_nothing_with_dry_run(self):
         root = self.tree("a/x.txt", "b/x.txt", "c/x.txt")
@@ -607,6 +683,24 @@ class CliTests(TempDirTestCase):
         os.remove(os.path.join(self.data, "backup", "invoice.pdf"))
         self.run_cli("--validate", report)
         self.assertEqual(read_duplicate_report(report + ".xlsx"), [])
+
+    def test_prints_every_folder_with_verbose(self):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            cli.main([self.data, os.path.join(self.new_dir("work"), "v.xlsx"), "--verbose"])
+        self.assertIn(f"Scanning {os.path.join(self.data, 'backup')}", err.getvalue())
+
+    def test_reports_a_damaged_report_without_a_traceback(self):
+        path = os.path.join(self.new_dir("work"), "damaged.xlsx")
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("xl/workbook.xml", "<workbook")
+            archive.writestr("xl/_rels/workbook.xml.rels", "<Relationships/>")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = cli.main(["--validate", path])
+        self.assertEqual(code, 1)
+        self.assertIn("error:", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
 
     def test_rejects_scan_options_with_validate(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):

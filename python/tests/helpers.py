@@ -23,10 +23,10 @@ def add_file(root: str, relative: str, content: str = "same content", saved: dat
     return path
 
 
-def read_worksheet(path: str) -> List[List[str]]:
-    """The worksheet as a list of rows, each row a list of cell texts."""
+def read_worksheet(path: str, part: str = "xl/worksheets/sheet1.xml") -> List[List[str]]:
+    """A worksheet written by this tool as a list of rows, each row a list of cell texts."""
     with zipfile.ZipFile(path) as archive:
-        root = ElementTree.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+        root = ElementTree.fromstring(archive.read(part))
     rows = []
     for row in root.findall("s:sheetData/s:row", NS):
         cells = []

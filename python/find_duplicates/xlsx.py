@@ -1,9 +1,16 @@
 """Excel (.xlsx) report writer and reader. Needs neither Excel nor third-party packages.
 
-Mirrors Export-DuplicateReport and Import-DuplicateReport in src/DuplicateFinder.psm1
-and writes the same workbook: one row per duplicated file with the columns File
-Name, Last Modified, Size (bytes), MD5, Copies, then "Location 1..N" holding the
-full folder path of every copy. The header row is frozen and filtered.
+Mirrors Export-DuplicateReport, Import-DuplicateReport and Import-DuplicateFolderReport
+in src/DuplicateFinder.psm1 and writes the same workbook:
+
+* sheet "Duplicates": one row per duplicated file with the columns File Name, Last
+  Modified, Size (bytes), MD5, Copies, then "Location 1..N" holding the full folder
+  path of every copy;
+* sheet "Duplicate Folders" (only when folder sets are given): one row per
+  duplicated folder with the columns Folder Name, Files, Sub Folders, Size (bytes),
+  Copies, then "Location 1..N" holding the full path of every copy.
+
+Header rows are frozen and filtered.
 """
 
 from __future__ import annotations
@@ -13,10 +20,12 @@ import re
 import uuid
 import zipfile
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Sequence, Union
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
+from .folders import DuplicateFolderSet
 from .matcher import DuplicateSet
 
 EXCEL_MAX_ROWS = 1_048_576
@@ -28,6 +37,15 @@ FIXED_COLUMNS = (
     ("MD5", 34),
     ("Copies", 8),
 )
+FOLDER_COLUMNS = (
+    ("Folder Name", 40),
+    ("Files", 10),
+    ("Sub Folders", 12),
+    ("Size (bytes)", 16),
+    ("Copies", 8),
+)
+FILE_SHEET_NAME = "Duplicates"
+FOLDER_SHEET_NAME = "Duplicate Folders"
 LOCATION_COLUMN_WIDTH = 60
 STYLE_BOLD = 1
 STYLE_DATE = 2
@@ -49,24 +67,9 @@ _INVALID_XML_CHARS = re.compile(
 )
 REPLACEMENT_CHAR = chr(0xFFFD)
 
-CONTENT_TYPES = (
-    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-    '<Default Extension="xml" ContentType="application/xml"/>'
-    '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-    '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-    '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
-    "</Types>"
-)
 ROOT_RELS = (
     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
     '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
-    "</Relationships>"
-)
-WORKBOOK_RELS = (
-    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-    '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
     "</Relationships>"
 )
 # Style 0 = default, 1 = bold header, 2 = date/time.
@@ -86,6 +89,7 @@ STYLES = (
 )
 
 CellValue = Union[str, int, datetime]
+Columns = Sequence[Tuple[str, int]]
 
 
 def column_name(index: int) -> str:
@@ -142,21 +146,43 @@ def _row(number: int, values: Sequence[CellValue]) -> str:
     return f'<row r="{number}">{"".join(cells)}</row>'
 
 
-def _worksheet(duplicates: Sequence[DuplicateSet], location_columns: int, last_column: str) -> str:
-    last_row = len(duplicates) + 1
-    widths = [width for _, width in FIXED_COLUMNS] + [LOCATION_COLUMN_WIDTH] * location_columns
-    cols = "".join(
-        f'<col min="{i}" max="{i}" width="{w}" customWidth="1"/>' for i, w in enumerate(widths, start=1)
+@dataclass
+class _Sheet:
+    name: str
+    headers: List[str]
+    widths: List[int]
+    rows: List[List[CellValue]]
+    last_column: str
+    last_row: int
+
+
+def _sheet(name: str, columns: Columns, rows: List[List[CellValue]], noun: str) -> _Sheet:
+    """Lay out one sheet: fixed columns, then as many "Location N" columns as the longest row needs."""
+    max_copies = max([1] + [len(row) - len(columns) for row in rows])
+    column_count = len(columns) + max_copies
+    if column_count > EXCEL_MAX_COLUMNS:
+        raise ValueError(
+            f"A {noun} has {max_copies} copies; Excel supports at most "
+            f"{EXCEL_MAX_COLUMNS - len(columns)} location columns."
+        )
+    if len(rows) + 1 > EXCEL_MAX_ROWS:
+        raise ValueError(f"Found {len(rows)} duplicated {noun}s; Excel supports at most {EXCEL_MAX_ROWS - 1} rows.")
+    return _Sheet(
+        name=name,
+        headers=[header for header, _ in columns] + [f"Location {n}" for n in range(1, max_copies + 1)],
+        widths=[width for _, width in columns] + [LOCATION_COLUMN_WIDTH] * max_copies,
+        rows=rows,
+        last_column=column_name(column_count),
+        last_row=len(rows) + 1,
     )
-    headers: List[CellValue] = [header for header, _ in FIXED_COLUMNS]
-    headers += [f"Location {n}" for n in range(1, location_columns + 1)]
 
-    # One row per duplicated file; one column per folder holding a copy.
-    rows = [_row(1, headers)]
-    for number, dup in enumerate(duplicates, start=2):
-        values: List[CellValue] = [dup.file_name, dup.last_write_time, dup.size_bytes, dup.md5, dup.count]
-        rows.append(_row(number, values + list(dup.folders)))
 
+def _worksheet(sheet: _Sheet) -> str:
+    cols = "".join(
+        f'<col min="{i}" max="{i}" width="{w}" customWidth="1"/>' for i, w in enumerate(sheet.widths, start=1)
+    )
+    # One row per duplicated item; one column per copy.
+    rows = [_row(1, sheet.headers)] + [_row(number, values) for number, values in enumerate(sheet.rows, start=2)]
     return (
         f'{XML_DECLARATION}<worksheet xmlns="{MAIN_NS}">'
         '<sheetViews><sheetView workbookViewId="0">'
@@ -164,50 +190,94 @@ def _worksheet(duplicates: Sequence[DuplicateSet], location_columns: int, last_c
         "</sheetView></sheetViews>"
         f"<cols>{cols}</cols>"
         f'<sheetData>{"".join(rows)}</sheetData>'
-        f'<autoFilter ref="A1:{last_column}{last_row}"/>'
+        f'<autoFilter ref="A1:{sheet.last_column}{sheet.last_row}"/>'
         "</worksheet>"
     )
 
 
-def _workbook(last_column: str, last_row: int) -> str:
-    return (
+def _package_parts(sheets: Sequence[_Sheet]) -> Dict[str, str]:
+    """Every part of the package except the worksheets, as XML text."""
+    numbered = list(enumerate(sheets, start=1))
+    content_types = (
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        + "".join(
+            f'<Override PartName="/xl/worksheets/sheet{i}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            for i, _ in numbered
+        )
+        + '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        "</Types>"
+    )
+    workbook = (
         '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        '<sheets><sheet name="Duplicates" sheetId="1" r:id="rId1"/></sheets>'
-        '<definedNames><definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">'
-        f"Duplicates!$A$1:${last_column}${last_row}</definedName></definedNames>"
-        "</workbook>"
+        "<sheets>"
+        + "".join(f'<sheet name="{s.name}" sheetId="{i}" r:id="rId{i}"/>' for i, s in numbered)
+        + "</sheets><definedNames>"
+        + "".join(
+            f'<definedName name="_xlnm._FilterDatabase" localSheetId="{i - 1}" hidden="1">'
+            f"'{s.name}'!$A$1:${s.last_column}${s.last_row}</definedName>"
+            for i, s in numbered
+        )
+        + "</definedNames></workbook>"
     )
+    workbook_rels = (
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(
+            f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            f'Target="worksheets/sheet{i}.xml"/>'
+            for i, _ in numbered
+        )
+        + f'<Relationship Id="rId{len(sheets) + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
+        'Target="styles.xml"/>'
+        "</Relationships>"
+    )
+    return {
+        "[Content_Types].xml": content_types,
+        "_rels/.rels": ROOT_RELS,
+        "xl/workbook.xml": workbook,
+        "xl/_rels/workbook.xml.rels": workbook_rels,
+        "xl/styles.xml": STYLES,
+    }
 
 
-def export_duplicate_report(duplicates: Sequence[DuplicateSet], path: str) -> None:
-    """Save duplicate sets to an .xlsx workbook at ``path``."""
+def export_duplicate_report(
+    duplicates: Sequence[DuplicateSet], path: str, folders: Optional[Sequence[DuplicateFolderSet]] = None
+) -> None:
+    """Save duplicate sets to an .xlsx workbook at ``path``.
+
+    With ``folders`` (even an empty list) the "Duplicate Folders" sheet is added.
+    """
     path = os.path.abspath(path)
-    max_copies = max([1] + [len(dup.folders) for dup in duplicates])
-
-    column_count = len(FIXED_COLUMNS) + max_copies
-    if column_count > EXCEL_MAX_COLUMNS:
-        raise ValueError(
-            f"A file has {max_copies} copies; Excel supports at most "
-            f"{EXCEL_MAX_COLUMNS - len(FIXED_COLUMNS)} location columns."
+    sheets = [
+        _sheet(
+            FILE_SHEET_NAME,
+            FIXED_COLUMNS,
+            [[d.file_name, d.last_write_time, d.size_bytes, d.md5, d.count] + list(d.folders) for d in duplicates],
+            "file",
         )
-    if len(duplicates) + 1 > EXCEL_MAX_ROWS:
-        raise ValueError(
-            f"Found {len(duplicates)} duplicated files; Excel supports at most {EXCEL_MAX_ROWS - 1} rows."
+    ]
+    if folders is not None:
+        sheets.append(
+            _sheet(
+                FOLDER_SHEET_NAME,
+                FOLDER_COLUMNS,
+                [[f.folder_name, f.file_count, f.folder_count, f.size_bytes, f.count] + list(f.folders) for f in folders],
+                "folder",
+            )
         )
-    last_column = column_name(column_count)
-    last_row = len(duplicates) + 1
 
     # Build next to the target, then swap in, so a failure never leaves a half-written report.
     temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
     try:
         with zipfile.ZipFile(temp_path, "x", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("[Content_Types].xml", XML_DECLARATION + CONTENT_TYPES)
-            archive.writestr("_rels/.rels", XML_DECLARATION + ROOT_RELS)
-            archive.writestr("xl/workbook.xml", XML_DECLARATION + _workbook(last_column, last_row))
-            archive.writestr("xl/_rels/workbook.xml.rels", XML_DECLARATION + WORKBOOK_RELS)
-            archive.writestr("xl/styles.xml", XML_DECLARATION + STYLES)
-            archive.writestr("xl/worksheets/sheet1.xml", _worksheet(duplicates, max_copies, last_column))
+            for name, xml in _package_parts(sheets).items():
+                archive.writestr(name, XML_DECLARATION + xml)
+            for number, sheet in enumerate(sheets, start=1):
+                archive.writestr(f"xl/worksheets/sheet{number}.xml", _worksheet(sheet))
         os.replace(temp_path, path)
     finally:
         if os.path.exists(temp_path):
@@ -236,28 +306,34 @@ def _cell_text(node: ElementTree.Element) -> str:
 
 def _read_xml(archive: zipfile.ZipFile, name: str) -> Optional[ElementTree.Element]:
     try:
-        return ElementTree.fromstring(archive.read(name))
+        data = archive.read(name)
     except KeyError:
         return None
+    # Reports never contain DTDs, so refuse them (no entity expansion).
+    if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
+        raise ValueError(f"Part '{name}' contains a DTD, which reports never do.")
+    return ElementTree.fromstring(data)
 
 
-def _worksheet_rows(archive: zipfile.ZipFile) -> List[List[Optional[str]]]:
-    """The first worksheet as rows of cell text, one entry per column.
-
-    Handles workbooks written by this tool and the same workbook after Excel saved it.
-    """
+def _workbook_sheets(archive: zipfile.ZipFile) -> List[Tuple[str, str]]:
+    """The workbook's sheets in order, as (name, part path) pairs."""
     workbook = _read_xml(archive, "xl/workbook.xml")
     rels = _read_xml(archive, "xl/_rels/workbook.xml.rels")
     if workbook is None or rels is None:
         raise ValueError("The file is not an Excel workbook.")
+    targets = {r.get("Id"): r.get("Target") for r in rels.findall(f"{{{PACKAGE_RELS_NS}}}Relationship")}
+    sheets = []
+    for sheet in workbook.findall(f"{{{MAIN_NS}}}sheets/{{{MAIN_NS}}}sheet"):
+        target = targets[sheet.get(f"{{{OFFICE_RELS_NS}}}id")]
+        sheets.append((sheet.get("name"), target.lstrip("/") if target.startswith("/") else f"xl/{target}"))
+    return sheets
 
-    rel_id = workbook.find(f"{{{MAIN_NS}}}sheets/{{{MAIN_NS}}}sheet").get(f"{{{OFFICE_RELS_NS}}}id")
-    target = next(r.get("Target") for r in rels.findall(f"{{{PACKAGE_RELS_NS}}}Relationship") if r.get("Id") == rel_id)
-    sheet_path = target.lstrip("/") if target.startswith("/") else f"xl/{target}"
 
-    shared_xml = _read_xml(archive, "xl/sharedStrings.xml")
-    shared = [] if shared_xml is None else [_cell_text(si) for si in shared_xml.findall(f"{{{MAIN_NS}}}si")]
+def _worksheet_rows(archive: zipfile.ZipFile, sheet_path: str, shared: List[str]) -> List[List[Optional[str]]]:
+    """One worksheet as rows of cell text, one entry per column.
 
+    Handles workbooks written by this tool and the same workbook after Excel saved it.
+    """
     rows = []
     sheet = _read_xml(archive, sheet_path)
     for row in sheet.findall(f"{{{MAIN_NS}}}sheetData/{{{MAIN_NS}}}row"):
@@ -280,35 +356,92 @@ def _worksheet_rows(archive: zipfile.ZipFile) -> List[List[Optional[str]]]:
     return rows
 
 
-def read_duplicate_report(path: str) -> List[DuplicateSet]:
-    """Read a report written by export_duplicate_report back into duplicate sets."""
+def _report_rows(rows: List[List[Optional[str]]], columns: Columns, error: str) -> List[Tuple[List[str], List[str]]]:
+    """Check a sheet's header row and return its data rows as (fixed values, folders) pairs."""
+    expected = [header for header, _ in columns]
+    header = rows[0] if rows else []
+    if len(header) < len(expected) or any(
+        (cell or "").casefold() != name.casefold() for cell, name in zip(header, expected)
+    ):
+        raise ValueError(f"{error} '{', '.join(expected)}'.")
+    result = []
+    for row in rows[1:]:
+        if len(row) < len(expected) or not row[0]:
+            continue
+        result.append((row, [folder for folder in row[len(expected):] if folder]))
+    return result
+
+
+def _number(text: Optional[str]) -> int:
+    # Rounds half to even, like PowerShell's [long][double].
+    return int(round(float(text)))
+
+
+@dataclass
+class DuplicateWorkbook:
+    """Both sheets of a report; ``folders`` is None when the report has no folder sheet."""
+
+    files: List[DuplicateSet]
+    folders: Optional[List[DuplicateFolderSet]]
+
+
+def read_duplicate_workbook(path: str) -> DuplicateWorkbook:
+    """Read both sheets of a report written by export_duplicate_report."""
     path = os.path.abspath(path)
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Report '{path}' was not found.")
     try:
         with zipfile.ZipFile(path) as archive:
-            rows = _worksheet_rows(archive)
-    except zipfile.BadZipFile:
-        raise ValueError(f"'{path}' is not an Excel workbook.") from None
+            sheets = _workbook_sheets(archive)
+            shared_xml = _read_xml(archive, "xl/sharedStrings.xml")
+            shared = [] if shared_xml is None else [_cell_text(si) for si in shared_xml.findall(f"{{{MAIN_NS}}}si")]
+            file_rows = _worksheet_rows(archive, sheets[0][1], shared)
+            folder_sheet = next((p for name, p in sheets if name == FOLDER_SHEET_NAME), None)
+            folder_rows = _worksheet_rows(archive, folder_sheet, shared) if folder_sheet else None
 
-    expected = [header for header, _ in FIXED_COLUMNS]
-    if not rows or [(c or "").casefold() for c in rows[0][: len(expected)]] != [h.casefold() for h in expected]:
-        raise ValueError(f"'{path}' is not a duplicates report: its header row is not '{', '.join(expected)}'.")
-
-    first_location = len(expected)
-    duplicates = []
-    for row in rows[1:]:
-        if len(row) < first_location or not row[0]:
-            continue
-        folders = [folder for folder in row[first_location:] if folder]
-        duplicates.append(
+        files = [
             DuplicateSet(
                 file_name=row[0],
                 last_write_time=from_excel_serial(float(row[1])),
-                size_bytes=int(float(row[2])),
+                size_bytes=_number(row[2]),
                 md5=row[3],
                 count=len(folders),
                 folders=folders,
             )
-        )
-    return duplicates
+            for row, folders in _report_rows(
+                file_rows, FIXED_COLUMNS, f"'{path}' is not a duplicates report: its header row is not"
+            )
+        ]
+        duplicate_folders = None
+        if folder_rows is not None:
+            duplicate_folders = [
+                DuplicateFolderSet(
+                    folder_name=row[0],
+                    file_count=_number(row[1]),
+                    folder_count=_number(row[2]),
+                    size_bytes=_number(row[3]),
+                    count=len(folders),
+                    folders=folders,
+                )
+                for row, folders in _report_rows(
+                    folder_rows,
+                    FOLDER_COLUMNS,
+                    f"'{path}' is not a duplicates report: the header row of sheet '{FOLDER_SHEET_NAME}' is not",
+                )
+            ]
+    except zipfile.BadZipFile:
+        raise ValueError(f"'{path}' is not an Excel workbook.") from None
+    except (ElementTree.ParseError, KeyError, IndexError, AttributeError, TypeError) as exc:
+        # A damaged or foreign workbook: report it plainly instead of with a traceback.
+        raise ValueError(f"'{path}' could not be read as a duplicates report: {exc}") from None
+    return DuplicateWorkbook(files, duplicate_folders)
+
+
+def read_duplicate_report(path: str) -> List[DuplicateSet]:
+    """Read the duplicate files back from a report written by export_duplicate_report."""
+    return read_duplicate_workbook(path).files
+
+
+def read_duplicate_folder_report(path: str) -> List[DuplicateFolderSet]:
+    """Read the duplicate folders back from a report; empty when it has no folder sheet."""
+    return read_duplicate_workbook(path).folders or []

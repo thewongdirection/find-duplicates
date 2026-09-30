@@ -531,6 +531,7 @@ Describe 'Import-DuplicateReport' {
                 $cells = for ($c = 0; $c -lt $Rows[$r].Count; $c++) {
                     $ref = "$(ConvertTo-ColumnName ($c + 1))$($r + 1)"
                     $value = $Rows[$r][$c]
+                    if ($null -eq $value) { continue }  # Excel leaves blank cells out
                     if ($value -is [string]) {
                         $strings.Add($value)
                         "<c r=`"$ref`" t=`"s`"><v>$($strings.Count - 1)</v></c>"
@@ -599,6 +600,38 @@ Describe 'Import-DuplicateReport' {
         $path = Join-Path (Add-TestRoot) 'notes.xlsx'
         Set-Content -LiteralPath $path -Value 'not a zip'
         { Import-DuplicateReport -Path $path } | Should -Throw '*is not an Excel workbook*'
+    }
+
+    It 'rejects a header row with a blank cell' {
+        $path = Join-Path (Add-TestRoot) 'gap.xlsx'
+        Write-ExcelSavedWorkbook -Path $path -Rows @(, @('File Name', $null, 'Size (bytes)', 'MD5', 'Copies'))
+        { Import-DuplicateReport -Path $path } | Should -Throw '*is not a duplicates report*'
+    }
+
+    It 'rejects a report containing a DTD' {
+        $path = Join-Path (Add-TestRoot) 'dtd.xlsx'
+        Export-DuplicateReport -DuplicateSet $script:RoundTrip -Path $path
+        $zip = [System.IO.Compression.ZipFile]::Open($path, [System.IO.Compression.ZipArchiveMode]::Update)
+        try {
+            $entry = $zip.GetEntry('xl/workbook.xml')
+            $reader = [System.IO.StreamReader]::new($entry.Open())
+            try { $xml = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            $entry.Delete()
+            $writer = [System.IO.StreamWriter]::new($zip.CreateEntry('xl/workbook.xml').Open())
+            try { $writer.Write($xml.Replace('<workbook', '<!DOCTYPE workbook [<!ENTITY x "x">]><workbook')) } finally { $writer.Dispose() }
+        }
+        finally { $zip.Dispose() }
+
+        { Import-DuplicateReport -Path $path } | Should -Throw '*DTD*'
+    }
+
+    It 'reads a report that another program has open' {
+        $path = Join-Path (Add-TestRoot) 'open.xlsx'
+        Export-DuplicateReport -DuplicateSet $script:RoundTrip -Path $path
+        # Like Excel: open for writing, letting others read.
+        $lock = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+        try { @(Import-DuplicateReport -Path $path).Count | Should -Be 2 }
+        finally { $lock.Dispose() }
     }
 
     It 'reports a missing report' {
@@ -713,6 +746,15 @@ Describe 'Update-DuplicateReport' {
         }
     }
 
+    It 'checks each drive or share only once' {
+        InModuleScope DuplicateFinder -Parameters @{ Folder = (Add-TestRoot) } {
+            $cache = [System.Collections.Generic.Dictionary[string, bool]]::new()
+            Test-PathRootReachable -Folder (Join-Path $Folder 'a') -Cache $cache | Should -BeTrue
+            Test-PathRootReachable -Folder (Join-Path $Folder 'b') -Cache $cache | Should -BeTrue
+            $cache.Count | Should -Be 1
+        }
+    }
+
     It 'changes nothing with -WhatIf' {
         $root = Add-TestRoot
         foreach ($folder in 'a', 'b', 'c') { $null = Add-TestFile $root "$folder/x.txt" }
@@ -723,7 +765,293 @@ Describe 'Update-DuplicateReport' {
 
         $result.CopiesRemoved | Should -Be 1
         $result.Saved | Should -BeFalse
-        (Import-DuplicateReport -Path $report).Count | Should -Be 3
+        $rows = @(Import-DuplicateReport -Path $report)
+        $rows.Count | Should -Be 1
+        $rows[0].Count | Should -Be 3 -Because 'the removed copy is still listed'
+    }
+}
+
+Describe 'Find-DuplicateFolder' {
+    BeforeAll {
+        function Get-FolderScan {
+            # Files and folder records for a tree, as the script collects them.
+            param([string] $Root)
+            $info = [System.Collections.Generic.List[object]]::new()
+            $files = @(Get-FileInventory -Path $Root -FolderInfo $info)
+            [pscustomobject] @{ Files = $files; Folders = $info.ToArray() }
+        }
+
+        function Add-PhotoFolder {
+            # A small tree: two files, one in a sub folder, and an empty sub folder.
+            param([string] $Root, [string] $Folder, [string] $Content = 'photo')
+            $null = Add-TestFile $Root "$Folder/a.jpg" -Content "a $Content"
+            $null = Add-TestFile $Root "$Folder/sub/b.jpg" -Content "b $Content"
+            $null = New-Item -ItemType Directory -Force -Path (Join-Path $Root "$Folder/empty")
+        }
+
+        function Find-InTree {
+            param([string] $Root, [hashtable] $Options = @{})
+            $scan = Get-FolderScan $Root
+            @(Find-DuplicateFolder -File $scan.Files -Folder $scan.Folders @Options)
+        }
+    }
+
+    It 'finds folders with the same name and the same contents' {
+        $root = Add-TestRoot
+        Add-PhotoFolder $root 'one/Photos'
+        Add-PhotoFolder $root 'two/Photos'
+
+        $result = Find-InTree $root
+
+        $result.Count | Should -Be 1
+        $result[0].FolderName | Should -Be 'Photos'
+        $result[0].FileCount | Should -Be 2
+        $result[0].FolderCount | Should -Be 2
+        $result[0].SizeBytes | Should -Be ('a photo'.Length + 'b photo'.Length)
+        $result[0].Count | Should -Be 2
+        $result[0].Folders | Should -Be @((Join-Path $root 'one/Photos'), (Join-Path $root 'two/Photos') | ForEach-Object { [System.IO.Path]::GetFullPath($_) })
+    }
+
+    It 'matches folder names that differ only by case' {
+        $root = Add-TestRoot
+        Add-PhotoFolder $root 'one/Photos'
+        Add-PhotoFolder $root 'two/photos'
+        (Find-InTree $root).Count | Should -Be 1
+    }
+
+    It 'ignores folders whose <Case>, but still finds their identical sub folders' -ForEach @(
+        @{ Case = 'names differ'; Second = 'two/Pictures'; Change = {} }
+        @{ Case = 'file contents differ at the same size and date'; Second = 'two/Photos'; Change = {
+                param($r) $null = Add-TestFile $r 'two/Photos/a.jpg' -Content 'a PHOTO' } }
+        @{ Case = 'file saved dates differ'; Second = 'two/Photos'; Change = {
+                param($r) $null = Add-TestFile $r 'two/Photos/a.jpg' -Content 'a photo' -SavedUtc $script:Saved.AddMinutes(1) } }
+        @{ Case = 'files differ (an extra file)'; Second = 'two/Photos'; Change = {
+                param($r) $null = Add-TestFile $r 'two/Photos/extra.txt' } }
+        @{ Case = 'sub folders differ (an extra empty folder)'; Second = 'two/Photos'; Change = {
+                param($r) $null = New-Item -ItemType Directory -Path (Join-Path $r 'two/Photos/more') } }
+        @{ Case = 'file names differ'; Second = 'two/Photos'; Change = {
+                param($r) Rename-Item -LiteralPath (Join-Path $r 'two/Photos/a.jpg') -NewName 'c.jpg' } }
+    ) {
+        $root = Add-TestRoot
+        Add-PhotoFolder $root 'one/Photos'
+        Add-PhotoFolder $root $Second
+        & $Change $root
+
+        # The Photos folders differ, but their untouched "sub" folders are still duplicates.
+        (Find-InTree $root).FolderName | Should -Be @('sub')
+    }
+
+    It 'reports only the top-most duplicate folders' {
+        $root = Add-TestRoot
+        Add-PhotoFolder $root 'one/Photos/2024'
+        Add-PhotoFolder $root 'two/Photos/2024'
+
+        $result = Find-InTree $root
+
+        $result.Count | Should -Be 1
+        $result[0].FolderName | Should -Be 'Photos'
+    }
+
+    It 'keeps a nested set that also has a copy somewhere else' {
+        $root = Add-TestRoot
+        Add-PhotoFolder $root 'one/Photos/2024'
+        Add-PhotoFolder $root 'two/Photos/2024'
+        Add-PhotoFolder $root 'three/2024'
+
+        $result = Find-InTree $root
+
+        $result.FolderName | Should -Be @('2024', 'Photos')
+        $result[0].Count | Should -Be 3
+    }
+
+    It 'does not report folders that contain no files' {
+        $root = Add-TestRoot
+        foreach ($folder in 'one/Empty/inner', 'two/Empty/inner') { $null = New-Item -ItemType Directory -Force -Path (Join-Path $root $folder) }
+        (Find-InTree $root).Count | Should -Be 0
+    }
+
+    It 'does not report a folder that has an unreadable sub folder' {
+        $root = Add-TestRoot
+        Add-PhotoFolder $root 'one/Photos'
+        Add-PhotoFolder $root 'two/Photos'
+        $scan = Get-FolderScan $root
+        ($scan.Folders | Where-Object { $_.Path -eq [System.IO.Path]::GetFullPath((Join-Path $root 'two/Photos/sub')) }).Readable = $false
+
+        @(Find-DuplicateFolder -File $scan.Files -Folder $scan.Folders).Count | Should -Be 0
+    }
+
+    It 'does not read files again that the file scan already hashed' {
+        $root = Add-TestRoot
+        Add-PhotoFolder $root 'one/Photos'
+        Add-PhotoFolder $root 'two/Photos'
+        $scan = Get-FolderScan $root
+        $cache = [System.Collections.Generic.Dictionary[string, string]]::new()
+        $null = Find-DuplicateFile -File $scan.Files -Md5Cache $cache
+        Mock -ModuleName DuplicateFinder Get-FileMd5 { throw 'should not be called' }
+
+        $result = @(Find-DuplicateFolder -File $scan.Files -Folder $scan.Folders -Md5Cache $cache)
+
+        Should -Invoke -ModuleName DuplicateFinder Get-FileMd5 -Times 0 -Exactly
+        $result.Count | Should -Be 1
+    }
+
+    It 'does not report folders holding online-only files with -SkipCloudOnly' {
+        $root = Add-TestRoot
+        Add-PhotoFolder $root 'one/Photos'
+        Add-PhotoFolder $root 'two/Photos'
+        Add-PhotoFolder $root 'cloud/Photos'
+        Mock -ModuleName DuplicateFinder Test-CloudOnlyFile { "$($File.FullName)" -like '*cloud*' }
+
+        $result = Find-InTree $root @{ SkipCloudOnly = $true; WarningVariable = 'warnings'; WarningAction = 'SilentlyContinue' }
+
+        $result.Count | Should -Be 1
+        $result[0].Folders | Should -Not -BeLike '*cloud*'
+        "$($warnings[0])" | Should -BeLike '2 online-only*folders*'
+    }
+
+    It 'finds the same folders hashing several files at a time' {
+        $root = Add-TestRoot
+        Add-PhotoFolder $root 'one/Photos'
+        Add-PhotoFolder $root 'two/Photos'
+        Add-PhotoFolder $root 'one/Other' -Content 'other'
+        Add-PhotoFolder $root 'two/Other' -Content 'other'
+
+        $result = Find-InTree $root @{ ThrottleLimit = 4 }
+
+        $result.FolderName | Should -Be @('Other', 'Photos')
+    }
+}
+
+Describe 'Duplicate folders in the report' {
+    BeforeAll {
+        $script:FolderSets = @(
+            [pscustomobject] @{
+                FolderName = 'Photos'; FileCount = 12; FolderCount = 3; SizeBytes = 123456; Count = 2
+                Folders = [string[]] @('C:\one\Photos', 'D:\two\Photos')
+            }
+        )
+    }
+
+    It 'writes and reads back a Duplicate Folders sheet' {
+        $path = Join-Path (Add-TestRoot) 'report.xlsx'
+        Export-DuplicateReport -DuplicateSet @() -FolderSet $script:FolderSets -Path $path
+
+        $read = @(Import-DuplicateFolderReport -Path $path)
+
+        $read.Count | Should -Be 1
+        foreach ($property in 'FolderName', 'FileCount', 'FolderCount', 'SizeBytes', 'Count') {
+            $read[0].$property | Should -Be $script:FolderSets[0].$property -Because $property
+        }
+        $read[0].Folders | Should -Be $script:FolderSets[0].Folders
+    }
+
+    It 'writes no folder sheet unless folder sets are given' {
+        $path = Join-Path (Add-TestRoot) 'report.xlsx'
+        Export-DuplicateReport -DuplicateSet @() -Path $path
+
+        @(Import-DuplicateFolderReport -Path $path).Count | Should -Be 0
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($path)
+        try { $zip.Entries.FullName | Should -Not -Contain 'xl/worksheets/sheet2.xml' } finally { $zip.Dispose() }
+    }
+
+    It 'writes an empty folder sheet when no duplicate folders were found' {
+        $path = Join-Path (Add-TestRoot) 'report.xlsx'
+        Export-DuplicateReport -DuplicateSet @() -FolderSet @() -Path $path
+
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($path)
+        try { $zip.Entries.FullName | Should -Contain 'xl/worksheets/sheet2.xml' } finally { $zip.Dispose() }
+        @(Import-DuplicateFolderReport -Path $path).Count | Should -Be 0
+    }
+}
+
+Describe 'Validating duplicate folders' {
+    BeforeAll {
+        function Export-FolderReport {
+            # Scans $Root (files and folders) into a report next to it and returns its path.
+            param([string] $Root)
+            $info = [System.Collections.Generic.List[object]]::new()
+            $files = @(Get-FileInventory -Path $Root -FolderInfo $info)
+            $path = "$Root.xlsx"
+            Export-DuplicateReport -Path $path -DuplicateSet @(Find-DuplicateFile -File $files) `
+                -FolderSet @(Find-DuplicateFolder -File $files -Folder $info.ToArray())
+            $path
+        }
+
+        function Add-ThreeCopies {
+            param([string] $Root)
+            foreach ($folder in 'one', 'two', 'three') {
+                $null = Add-TestFile $Root "$folder/Photos/a.jpg" -Content 'a'
+                $null = Add-TestFile $Root "$folder/Photos/sub/b.jpg" -Content 'b'
+            }
+        }
+    }
+
+    It 'removes a folder copy that no longer exists' {
+        $root = Add-TestRoot
+        Add-ThreeCopies $root
+        $report = Export-FolderReport $root
+        Remove-Item -LiteralPath (Join-Path $root 'two/Photos') -Recurse
+
+        $result = Update-DuplicateReport -Path $report
+
+        $result.FolderCopiesRemoved | Should -Be 1
+        $read = @(Import-DuplicateFolderReport -Path $report)
+        $read[0].Count | Should -Be 2
+        $read[0].Folders | Should -Be @((Join-Path $root 'one/Photos'), (Join-Path $root 'three/Photos') | ForEach-Object { [System.IO.Path]::GetFullPath($_) })
+    }
+
+    It 'removes a folder copy whose contents changed' {
+        $root = Add-TestRoot
+        Add-ThreeCopies $root
+        $report = Export-FolderReport $root
+        $null = Add-TestFile $root 'three/Photos/sub/new.jpg'
+
+        $result = Update-DuplicateReport -Path $report
+
+        $result.FolderCopiesRemoved | Should -Be 1
+        $result.FolderRowsRemaining | Should -Be 1
+    }
+
+    It 'keeps an empty folder sheet when every folder row is removed' {
+        $root = Add-TestRoot
+        Add-ThreeCopies $root
+        $report = Export-FolderReport $root
+        foreach ($folder in 'one', 'two') { Remove-Item -LiteralPath (Join-Path $root "$folder/Photos") -Recurse }
+
+        $result = Update-DuplicateReport -Path $report
+
+        $result.FolderRowsRemoved | Should -Be 1
+        $result.DuplicateFolderSet.Count | Should -Be 0
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($report)
+        try { $zip.Entries.FullName | Should -Contain 'xl/worksheets/sheet2.xml' } finally { $zip.Dispose() }
+    }
+
+    It 'keeps folder copies that cannot be reached' {
+        $root = Add-TestRoot
+        Add-ThreeCopies $root
+        $report = Export-FolderReport $root
+        Mock -ModuleName DuplicateFinder Test-DuplicateFolderCopy { 'Unavailable' }
+
+        $result = Update-DuplicateReport -Path $report -WarningAction SilentlyContinue
+
+        $result.FolderCopiesUnavailable | Should -Be 3
+        $result.FolderRowsRemaining | Should -Be 1
+    }
+
+    It 'leaves reports without a folder sheet without one' {
+        $root = Add-TestRoot
+        Add-ThreeCopies $root
+        $report = "$root.xlsx"
+        Export-DuplicateReport -DuplicateSet @(Find-DuplicateFile -File @(Get-FileInventory -Path $root)) -Path $report
+        Remove-Item -LiteralPath (Join-Path $root 'one/Photos/a.jpg')
+
+        $result = Update-DuplicateReport -Path $report
+
+        $result.Saved | Should -BeTrue
+        $result.DuplicateFolderSet | Should -BeNullOrEmpty
+        @(Import-DuplicateFolderReport -Path $report).Count | Should -Be 0
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($report)
+        try { $zip.Entries.FullName | Should -Not -Contain 'xl/worksheets/sheet2.xml' } finally { $zip.Dispose() }
     }
 }
 
@@ -802,6 +1130,14 @@ Describe 'Find-Duplicates.ps1' {
         $result[0].Count | Should -Be 3
     }
 
+    It 'prints every folder with -Verbose' {
+        $out = Join-Path (Add-TestRoot) 'verbose.xlsx'
+        $verbose = & $script:ScriptPath -Path (Join-Path $script:Root 'data') -OutputFile $out -Verbose 4>&1 6>$null |
+            Where-Object { $_ -is [System.Management.Automation.VerboseRecord] }
+
+        $verbose.Message | Should -Contain "Scanning $(Join-Path $script:Root 'data/backup' | ForEach-Object { [System.IO.Path]::GetFullPath($_) })"
+    }
+
     It 'saves no report with -WhatIf' {
         $out = Join-Path (Add-TestRoot) 'whatif.xlsx'
         $result = @(& $script:ScriptPath -Path $script:Root -OutputFile $out -WhatIf -PassThru 6>$null)
@@ -824,7 +1160,9 @@ Describe 'Find-Duplicates.ps1' {
 
         $remaining.Count | Should -Be 1
         $remaining[0].Folders | Should -Be @((Join-Path $root 'a'), (Join-Path $root 'c'))
-        (Import-DuplicateReport -Path (Join-Path $workDir 'duplicates.xlsx')).Count | Should -Be 2
+        $rows = @(Import-DuplicateReport -Path (Join-Path $workDir 'duplicates.xlsx'))
+        $rows.Count | Should -Be 1
+        $rows[0].Count | Should -Be 2
     }
 
     It 'takes the report to validate as its first argument' {
@@ -838,6 +1176,33 @@ Describe 'Find-Duplicates.ps1' {
 
         $remaining.Count | Should -Be 0
         @(Import-DuplicateReport -Path "$report.xlsx").Count | Should -Be 0
+    }
+
+    It 'adds duplicate folders to the report with -IncludeFolders' {
+        $root = Add-TestRoot
+        foreach ($folder in 'one', 'two') {
+            $null = Add-TestFile $root "$folder/Photos/a.jpg" -Content 'a'
+            $null = Add-TestFile $root "$folder/Photos/b.jpg" -Content 'b'
+        }
+        $out = Join-Path (Add-TestRoot) 'folders.xlsx'
+
+        $result = @(& $script:ScriptPath -Path $root -OutputFile $out -IncludeFolders -PassThru 6>$null)
+
+        @($result | Where-Object { $_.PSObject.Properties['FolderName'] }).Count | Should -Be 1
+        @($result | Where-Object { $_.PSObject.Properties['FileName'] }).Count | Should -Be 2
+        @(Import-DuplicateFolderReport -Path $out)[0].FolderName | Should -Be 'Photos'
+    }
+
+    It 're-checks duplicate folders with -Validate' {
+        $root = Add-TestRoot
+        foreach ($folder in 'one', 'two', 'three') { $null = Add-TestFile $root "$folder/Photos/a.jpg" -Content 'a' }
+        $out = Join-Path (Add-TestRoot) 'folders.xlsx'
+        $null = & $script:ScriptPath -Path $root -OutputFile $out -IncludeFolders 6>$null
+        Remove-Item -LiteralPath (Join-Path $root 'one/Photos') -Recurse
+
+        $null = & $script:ScriptPath -Validate $out 6>$null
+
+        @(Import-DuplicateFolderReport -Path $out)[0].Count | Should -Be 2
     }
 
     It 'does not scan its own report when it is saved inside the scanned folder' {

@@ -11,7 +11,7 @@ import os
 import stat
 import sys
 from dataclasses import dataclass
-from typing import Callable, Iterable, Iterator, Optional
+from typing import Callable, Iterable, Iterator, List, Optional
 
 log = logging.getLogger("find_duplicates")
 
@@ -40,6 +40,14 @@ class FileRecord:
     size: int
     mtime_ns: int
     attributes: int = 0  # Windows file attributes; 0 elsewhere
+
+
+@dataclass(frozen=True)
+class FolderRecord:
+    """A folder the scan listed, and whether its contents could be read."""
+
+    path: str
+    readable: bool
 
 
 def is_folder_link(entry: os.DirEntry) -> bool:
@@ -88,6 +96,7 @@ def iter_files(
     root: str,
     exclude: Iterable[str] = (),
     on_folder: Optional[FolderCallback] = None,
+    folders: Optional[List[FolderRecord]] = None,
 ) -> Iterator[FileRecord]:
     """Yield every file below ``root``, recursing into sub folders.
 
@@ -95,12 +104,15 @@ def iter_files(
     that cannot be read (permissions, dropped network connection) are logged as
     warnings and skipped. Symbolic links and junctions are not followed, which
     prevents infinite loops; cloud-synced folders are. Listing folders never
-    downloads cloud files.
+    downloads cloud files. When ``folders`` is given, it receives a record for
+    every folder listed (needed to compare folder trees, including empty and
+    unreadable folders).
     """
     if not os.path.isdir(root):
         raise NotADirectoryError(f"'{root}' is not a folder.")
 
-    excluded = {_same_path_key(p) for p in exclude}
+    # Normalised like the scanned paths (long names), or a short-form path would never match.
+    excluded = {_same_path_key(full_path(p)) for p in exclude}
     pending = [full_path(root)]
     folder_count = 0
     file_count = 0
@@ -119,7 +131,11 @@ def iter_files(
                 entries = sorted(it, key=lambda e: e.name)
         except OSError as exc:
             log.warning("Skipping '%s': %s", folder, exc.strerror or exc)
+            if folders is not None:
+                folders.append(FolderRecord(folder, readable=False))
             continue
+        if folders is not None:
+            folders.append(FolderRecord(folder, readable=True))
 
         sub_folders = []
         for entry in entries:

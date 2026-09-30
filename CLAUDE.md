@@ -10,8 +10,9 @@ that must behave identically:
 | Folder scanning     | `Get-FileInventory`, `Test-FolderLink`, `Test-CloudOnlyFile`, `Get-SortedByName` | `python/find_duplicates/scanner.py` |
 | Duplicate matching  | `Find-DuplicateFile`, `Get-FileMd5`, `Get-FileMd5Map`, `Get-SortedFolder` | `python/find_duplicates/matcher.py` |
 | Excel output/input  | `Export-DuplicateReport`, `Import-DuplicateReport` and helpers | `python/find_duplicates/xlsx.py` |
-| Validation          | `Update-DuplicateReport`, `Test-DuplicateCopy` | `python/find_duplicates/validate.py` |
-| Tests               | `tests/DuplicateFinder.Tests.ps1`    | `python/tests/test_find_duplicates.py` |
+| Duplicate folders   | `Find-DuplicateFolder`, `Get-FolderTree`, `Get-FolderSignature` | `python/find_duplicates/folders.py` |
+| Validation          | `Update-DuplicateReport`, `Invoke-CopyCheck`, `Test-DuplicateCopy`, `Test-DuplicateFolderCopy`, `Test-PathRootReachable` | `python/find_duplicates/validate.py` |
+| Tests               | `tests/DuplicateFinder.Tests.ps1`    | `python/tests/test_find_duplicates.py`, `python/tests/test_folders.py` |
 | Cross-language test | —                                    | `python/tests/test_parity.py`          |
 
 All PowerShell functions live in `src/DuplicateFinder.psm1`.
@@ -31,6 +32,7 @@ Every new feature, behaviour change or bug fix is done in this order:
 
 Command-line options map one to one: `-Path` ↔ `path`,
 `-OutputFile` ↔ `output` / `-o`, `-ThrottleLimit` ↔ `-j` / `--throttle-limit`,
+`-IncludeFolders` ↔ `--folders`,
 `-SkipCloudOnly` ↔ `--skip-cloud-only`, `-Validate` ↔ `--validate`,
 `-WhatIf` ↔ `--dry-run`, `-Verbose` ↔ `--verbose`. `-PassThru` corresponds to
 calling `find_duplicate_files()` / `validate_report()` from Python. Console
@@ -40,6 +42,12 @@ Keep orderings identical: folders and files are visited in ordinal name order,
 locations are sorted ordinal-ignore-case, rows by file name
 (ordinal-ignore-case), saved date, then MD5. Excel dates are truncated to the
 millisecond when written and rounded to it when read, as .NET does.
+
+PowerShell pitfalls this code base has hit: never assign a collection with
+`$x = if (...) { ... }` (an empty or one-item array is unrolled); return
+enumerable objects (XmlDocument, namespace managers, lists) with `, $x`;
+pass `-WhatIf`/`-Verbose` explicitly into module functions; keep
+`Array.Sort` calls on their non-generic overloads for Windows PowerShell 5.1.
 
 ## Constraints
 

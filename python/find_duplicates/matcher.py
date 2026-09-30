@@ -68,15 +68,28 @@ def _hash_or_none(path: str) -> Optional[str]:
 
 
 def md5_map(
-    paths: Sequence[str], throttle_limit: int = 1, on_hash: Optional[HashCallback] = None
+    paths: Sequence[str],
+    throttle_limit: int = 1,
+    on_hash: Optional[HashCallback] = None,
+    cache: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
     """Hash files, up to ``throttle_limit`` at a time, returning full path -> MD5.
 
     Files that cannot be read are logged as warnings and left out of the map.
+    With ``cache``, files already in it are not read again and new hashes are
+    added to it.
     """
     if not MIN_THROTTLE_LIMIT <= throttle_limit <= MAX_THROTTLE_LIMIT:
         raise ValueError(f"throttle_limit must be {MIN_THROTTLE_LIMIT}-{MAX_THROTTLE_LIMIT}, not {throttle_limit}.")
 
+    if cache is not None:
+        hashed = _md5_map(paths=[p for p in paths if p not in cache], throttle_limit=throttle_limit, on_hash=on_hash)
+        cache.update(hashed)
+        return {p: cache[p] for p in paths if p in cache}
+    return _md5_map(paths, throttle_limit, on_hash)
+
+
+def _md5_map(paths: Sequence[str], throttle_limit: int, on_hash: Optional[HashCallback]) -> Dict[str, str]:
     result: Dict[str, str] = {}
 
     def record(done: int, path: str, md5: Optional[str]) -> None:
@@ -115,7 +128,7 @@ def _saved_date_key(record: FileRecord) -> int:
     return record.mtime_ns // NS_PER_SECOND
 
 
-def _groups_of_many(items: Iterable[T], key: Callable[[T], Hashable]) -> List[List[T]]:
+def groups_of_many(items: Iterable[T], key: Callable[[T], Hashable]) -> List[List[T]]:
     """Group items by key, keeping only the groups that hold more than one item."""
     groups: Dict[Hashable, List[T]] = defaultdict(list)
     for item in items:
@@ -128,19 +141,21 @@ def find_duplicate_files(
     skip_cloud_only: bool = False,
     on_hash: Optional[HashCallback] = None,
     throttle_limit: int = 1,
+    md5_cache: Optional[Dict[str, str]] = None,
 ) -> List[DuplicateSet]:
     """Find sets of files whose name, saved date and MD5 hash all match.
 
     With ``skip_cloud_only`` online-only cloud files are never hashed (hashing
     would download them); duplicates among such files are then not reported.
     ``throttle_limit`` is how many files to hash at the same time (1-64).
+    ``md5_cache`` is shared with find_duplicate_folders so no file is read twice.
     """
     # Stage 1: name + saved date.
-    name_date_groups = _groups_of_many(files, lambda f: (ordinal_ignore_case(f.name), _saved_date_key(f)))
+    name_date_groups = groups_of_many(files, lambda f: (ordinal_ignore_case(f.name), _saved_date_key(f)))
 
     # Stage 2: size. A cheap check that avoids hashing files that cannot match.
     candidate_groups = [
-        group for nd in name_date_groups for group in _groups_of_many(nd, lambda f: f.size)
+        group for nd in name_date_groups for group in groups_of_many(nd, lambda f: f.size)
     ]
 
     if skip_cloud_only:
@@ -164,12 +179,12 @@ def find_duplicate_files(
             )
 
     # Stage 3: MD5, only for files that already match on name, date and size.
-    md5_by_path = md5_map([r.path for group in candidate_groups for r in group], throttle_limit, on_hash)
+    md5_by_path = md5_map([r.path for group in candidate_groups for r in group], throttle_limit, on_hash, md5_cache)
 
     results: List[DuplicateSet] = []
     for group in candidate_groups:
         hashed_files = [(r, md5_by_path[r.path]) for r in group if r.path in md5_by_path]
-        for same in _groups_of_many(hashed_files, lambda pair: pair[1]):
+        for same in groups_of_many(hashed_files, lambda pair: pair[1]):
             first, md5 = same[0]
             results.append(
                 DuplicateSet(
