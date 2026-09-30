@@ -123,11 +123,11 @@ $script:WorkerLoop = {
     }
 }
 
-function Start-WorkerPool {
+function Open-WorkerPool {
     <#
         Starts $ThrottleLimit worker runspaces, each with this module loaded, that run $Work
         (a script block taking one item) on every item added to the pool's Queue. Take the
-        results with Receive-WorkerResult; always finish with Stop-WorkerPool.
+        results with Receive-WorkerResult; always finish with Close-WorkerPool.
     #>
     param(
         [Parameter(Mandatory)] [scriptblock] $Work,
@@ -169,7 +169,7 @@ function Receive-WorkerResult {
     $result
 }
 
-function Stop-WorkerPool {
+function Close-WorkerPool {
     # Drops any items still queued (after an error or Ctrl+C), lets each worker finish its
     # current item, and frees the runspaces.
     param([Parameter(Mandatory)] [object] $Pool)
@@ -329,7 +329,7 @@ function Get-TreeListing {
     $lastShownMs = - $script:ProgressIntervalMs
     $pool = $null
     try {
-        $pool = Start-WorkerPool -Work { param($Folder) Get-FolderListing -Path $Folder } -ThrottleLimit $ThrottleLimit
+        $pool = Open-WorkerPool -Work { param($Folder) Get-FolderListing -Path $Folder } -ThrottleLimit $ThrottleLimit
         $pool.Queue.Add($Path)
         $outstanding = 1
         while ($outstanding -gt 0) {
@@ -352,7 +352,7 @@ function Get-TreeListing {
         }
     }
     finally {
-        if ($null -ne $pool) { Stop-WorkerPool -Pool $pool }
+        if ($null -ne $pool) { Close-WorkerPool -Pool $pool }
     }
     , $listings
 }
@@ -509,7 +509,7 @@ function Get-FileMd5Map {
     else {
         $pool = $null
         try {
-            $pool = Start-WorkerPool -Work { param($File) & $script:ComputeMd5 $File } -ThrottleLimit ([Math]::Min($ThrottleLimit, $Path.Count))
+            $pool = Open-WorkerPool -Work { param($File) & $script:ComputeMd5 $File } -ThrottleLimit ([Math]::Min($ThrottleLimit, $Path.Count))
             foreach ($p in $Path) { $pool.Queue.Add($p) }
             $result = $null
             while ($done -lt $Path.Count) {
@@ -527,7 +527,7 @@ function Get-FileMd5Map {
             }
         }
         finally {
-            if ($null -ne $pool) { Stop-WorkerPool -Pool $pool }
+            if ($null -ne $pool) { Close-WorkerPool -Pool $pool }
         }
     }
 
@@ -1450,8 +1450,8 @@ function Get-WorksheetRow {
 
 function Test-ReportHeader {
     # True when a row starts with the given column headers (ignoring case).
-    param([Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Values, [Parameter(Mandatory)] [string[]] $Header)
-    if ($Values.Count -lt $Header.Count) { return $false }
+    param([object[]] $Values, [string[]] $Header)
+    if ($null -eq $Values -or $Values.Count -lt $Header.Count) { return $false }
     for ($c = 0; $c -lt $Header.Count; $c++) {
         if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals([string] $Values[$c], $Header[$c])) { return $false }
     }
@@ -1756,7 +1756,7 @@ function Invoke-WorkItem {
     else {
         $pool = $null
         try {
-            $pool = Start-WorkerPool -Work $Work -ThrottleLimit ([Math]::Min($ThrottleLimit, $Item.Count))
+            $pool = Open-WorkerPool -Work $Work -ThrottleLimit ([Math]::Min($ThrottleLimit, $Item.Count))
             foreach ($one in $Item) { $pool.Queue.Add($one) }
             for ($done = 1; $done -le $Item.Count; $done++) {
                 $result = Receive-WorkerResult -Pool $pool
@@ -1770,7 +1770,7 @@ function Invoke-WorkItem {
             }
         }
         finally {
-            if ($null -ne $pool) { Stop-WorkerPool -Pool $pool }
+            if ($null -ne $pool) { Close-WorkerPool -Pool $pool }
         }
     }
     Write-Progress -Id 3 -Activity $Activity -Completed

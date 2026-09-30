@@ -69,8 +69,8 @@ may pick the generic overload and sort a copy of the items); remember that
 .NET property whose getter throws into `$null` (so read file details that may fail
 with getter methods, e.g. `$file.get_Length()`, inside `try`).
 
-Parallel work in PowerShell goes through `Start-WorkerPool` / `Receive-WorkerResult` /
-`Stop-WorkerPool` (runspaces that load this module); in Python through
+Parallel work in PowerShell goes through `Open-WorkerPool` / `Receive-WorkerResult` /
+`Close-WorkerPool` (runspaces that load this module); in Python through
 `ThreadPoolExecutor`, but only for work on network drives and for hashing files of
 1 MB or more (`scanner.on_network_drive`, `matcher.PARALLEL_HASH_MIN_BYTES`): for small
 local operations the GIL makes threads many times slower. `-ThrottleLimit` / `-j` sets

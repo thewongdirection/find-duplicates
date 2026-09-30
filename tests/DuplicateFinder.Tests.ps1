@@ -1029,7 +1029,7 @@ Describe 'Update-DuplicateReport' {
 
 Describe 'Get-PreviousMd5' {
     BeforeAll {
-        function New-ScannedTree {
+        function Add-ScannedTree {
             # Two duplicated files, each in two folders, and a report of them.
             $root = Add-TestRoot
             foreach ($path in 'a/x.txt', 'b/x.txt') { $null = Add-TestFile $root $path -Content 'x' }
@@ -1041,7 +1041,7 @@ Describe 'Get-PreviousMd5' {
     }
 
     It 'takes the MD5 hashes of unchanged files from the previous report' {
-        $tree = New-ScannedTree
+        $tree = Add-ScannedTree
         [System.IO.File]::WriteAllText((Join-Path $tree.Root 'c/y.txt'), 'z')  # same size, new contents, saved now
 
         $previous = Get-PreviousMd5 -Path $tree.Report -File @(Get-FileInventory -Path $tree.Root)
@@ -1051,7 +1051,7 @@ Describe 'Get-PreviousMd5' {
     }
 
     It 'does not read files again whose MD5 the previous report holds' {
-        $tree = New-ScannedTree
+        $tree = Add-ScannedTree
         $files = @(Get-FileInventory -Path $tree.Root)
         $cache = Get-PreviousMd5 -Path $tree.Report -File $files
         Mock -ModuleName DuplicateFinder Get-FileMd5 { throw 'read again' }

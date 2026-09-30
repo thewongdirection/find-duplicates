@@ -669,7 +669,7 @@ class PreviousMd5Tests(TempDirTestCase):
 
         previous = validate.previous_md5(report, list(iter_files(root)))
 
-        self.assertEqual(sorted(previous), [os.path.join(root, p) for p in ("a/x.txt", "b/x.txt", "d/y.txt")])
+        self.assertEqual(sorted(previous), [os.path.join(root, *p.split("/")) for p in ("a/x.txt", "b/x.txt", "d/y.txt")])
         self.assertEqual(previous[os.path.join(root, "a", "x.txt")], md5_file(os.path.join(root, "a", "x.txt")))
 
     def test_does_not_read_files_again_whose_md5_the_previous_report_holds(self):
