@@ -40,7 +40,7 @@ python -m find_duplicates --validate [report] [--dry-run] [-v]
 |---|---|---|
 | `path` | current folder | Folder to scan, including all sub folders. |
 | `output`, `-o FILE`, `--output-file FILE` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced. |
-| `-j N`, `--throttle-limit N` | `1` | How many files to hash, and folders to list, at the same time (1-64). Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk. |
+| `-j N`, `--throttle-limit N` | `1` | How many files to hash, and folders to list, at the same time (1-64); see [Threads](#threads). Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk. |
 | `--folders` | off | Also find [duplicate folders](../README.md#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
 | `--ignore-empty-files` | off | Leave files of 0 bytes out of the duplicate files. |
 | `--rehash` | off | Read every candidate file again. Without it, when the report already exists (from an earlier scan), files it lists whose size and saved date have not changed keep the MD5 recorded there instead of being read again. |
@@ -90,10 +90,11 @@ drive or share that cannot be reached are kept. See the
 |---|---|---|
 | `--validate` | — | Switches to validation. |
 | `report`, `-o FILE` | `duplicates.xlsx` in the current folder | Report to check and update. |
+| `-j N`, `--throttle-limit N` | `1` | How many folders to check at the same time. Try 4-8 for network shares. |
 | `--dry-run` | off | Report what would be removed, but do not change the report. |
 | `-v`, `--verbose` | off | Print every copy that is removed and why. |
 
-`--skip-cloud-only`, `--throttle-limit`, `--folders`, `--ignore-empty-files` and `--rehash` only apply to a scan.
+`--skip-cloud-only`, `--folders`, `--ignore-empty-files` and `--rehash` only apply to a scan.
 Duplicate folders, when the report has them, are re-checked too.
 
 ```sh
@@ -160,6 +161,16 @@ compared ignoring case and Unicode form (NFC), and sorted in the same (UTF-16)
 order as .NET, so both tools produce identical reports. If the console cannot
 show a character (for example output redirected to a file in a Windows code
 page), it is printed as an escape such as `\u65e5` instead of stopping the run.
+
+## Threads
+
+`-j` works like PowerShell's `-ThrottleLimit`, with one difference: Python uses
+its threads only where they are faster, for folders on a network drive (UNC
+paths and network drives on Windows; NFS, SMB and other network file systems on
+Linux) and for hashing files of 1 MB or more. Everything else is done one at a
+time: for the many small operations of listing and checking local folders,
+threads contending for Python's global lock make it many times slower. Reports
+are identical either way.
 
 ## Limits and edge cases
 

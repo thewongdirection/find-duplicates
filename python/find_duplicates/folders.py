@@ -177,7 +177,8 @@ def find_duplicate_folders(
         log.warning(
             "%d online-only cloud file(s) were not checked; folders containing them are not reported.", skipped
         )
-    full = _signatures(tree, md5_map(to_hash, throttle_limit, on_hash, md5_cache), set(scope))
+    sizes = {record.path: record.size for path in scope for record in tree.files[path]}
+    full = _signatures(tree, md5_map(to_hash, throttle_limit, on_hash, md5_cache, sizes), set(scope))
 
     # Group the candidates again, now by contents.
     confirmed = [p for group in candidate_groups for p in group if full[p].signature]

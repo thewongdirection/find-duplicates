@@ -108,7 +108,7 @@ Here each `Location` is the full path of the duplicate folder itself.
 Find-Duplicates.ps1 [[-Path] <folder>] [[-OutputFile] <report>] [-ThrottleLimit <1-64>]
                     [-IncludeFolders] [-IgnoreEmptyFiles] [-SkipCloudOnly] [-Rehash] [-PassThru] [-WhatIf] [-Verbose]
 
-Find-Duplicates.ps1 -Validate [[-OutputFile] <report>] [-PassThru] [-WhatIf] [-Verbose]
+Find-Duplicates.ps1 -Validate [[-OutputFile] <report>] [-ThrottleLimit <1-64>] [-PassThru] [-WhatIf] [-Verbose]
 ```
 
 Built-in help: `Get-Help .\Find-Duplicates.ps1 -Full`.
@@ -175,6 +175,7 @@ duplicates and want the report to catch up.
 |---|---|---|
 | `-Validate` | — | Switches to validation. Required for this mode. |
 | `-OutputFile <report>` | `duplicates.xlsx` in the current folder | Report to check and update. Also the first positional argument in this mode. |
+| `-ThrottleLimit <1-64>` | `1` | How many folders to check at the same time. Try 4-8 for network shares. |
 | `-PassThru` | off | Also return the rows that remain. |
 | `-WhatIf` | off | Report what would be removed, but do not change the report. |
 | `-Verbose` | off | Print every copy that is removed and why (`Missing` or `Changed`). |
@@ -182,8 +183,10 @@ duplicates and want the report to catch up.
 The report can be open in Excel while it is validated with `-WhatIf`; to save
 changes, close it first.
 
-For every file copy listed, one file lookup decides; for every folder copy,
-the folder is listed again (no file contents are read):
+For every file copy listed, a file lookup decides (copies in the same folder
+are all checked from one listing of it, one round trip on a network share); for
+every folder copy, the folder is listed again. No file contents are read. Each
+drive or share that cannot be reached is tried once:
 
 | Result | File copy | Folder copy | Action |
 |---|---|---|---|

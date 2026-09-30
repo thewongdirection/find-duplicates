@@ -71,7 +71,11 @@ with getter methods, e.g. `$file.get_Length()`, inside `try`).
 
 Parallel work in PowerShell goes through `Start-WorkerPool` / `Receive-WorkerResult` /
 `Stop-WorkerPool` (runspaces that load this module); in Python through
-`ThreadPoolExecutor`. `-ThrottleLimit` / `-j` sets both folder listing and hashing.
+`ThreadPoolExecutor`, but only for work on network drives and for hashing files of
+1 MB or more (`scanner.on_network_drive`, `matcher.PARALLEL_HASH_MIN_BYTES`): for small
+local operations the GIL makes threads many times slower. `-ThrottleLimit` / `-j` sets
+folder listing, hashing and validation. Python tests that exercise threads use
+`tests.helpers.as_if_on_a_network_drive()`.
 
 Code that runs per file, per cell or per row (scanning, hashing, the Excel
 writer and reader) avoids pipelines, script block comparers and advanced

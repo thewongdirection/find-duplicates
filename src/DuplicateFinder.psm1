@@ -1644,25 +1644,207 @@ function Test-DuplicateCopy {
 
     try {
         if (-not (Test-PathRootReachable -Folder $Folder -Cache $RootCache)) { return 'Unavailable' }
-        $path = [System.IO.Path]::Combine($Folder, $FileName)
-        $file = if ([System.IO.File]::Exists($path)) { [System.IO.FileInfo] $path } else { Find-FileByNameKey -Folder $Folder -FileName $FileName }
-        if (-not $file) { return 'Missing' }
+        $file = Find-CopyFile -Folder $Folder -FileName $FileName
+    }
+    catch { return 'Unavailable' }  # something that cannot be checked is kept, never removed
+    if (-not $file) { return 'Missing' }
+    Get-CopyState -File $file -SizeBytes $SizeBytes -LastWriteTime $LastWriteTime -UtcOffset $UtcOffset
+}
+
+function Find-CopyFile {
+    # A recorded copy's file: by its exact name, else ignoring case and Unicode form; $null
+    # when there is none.
+    param([Parameter(Mandatory)] [string] $Folder, [Parameter(Mandatory)] [string] $FileName)
+    $path = [System.IO.Path]::Combine($Folder, $FileName)
+    if ([System.IO.File]::Exists($path)) { return [System.IO.FileInfo] $path }
+    Find-FileByNameKey -Folder $Folder -FileName $FileName
+}
+
+function Get-CopyState {
+    # Present or Changed for a copy's file, by its size and saved date (see Test-DuplicateCopy);
+    # Missing when it was deleted while being checked; Unavailable when its details cannot be read.
+    # A simple function (no parameter validation): it runs for every copy in a report.
+    param([object] $File, [long] $SizeBytes, [datetime] $LastWriteTime, [object] $UtcOffset)
+    try {
         # (Getter methods, not properties: PowerShell turns a failing property into $null.)
-        $size  = $file.get_Length()
-        $local = $file.get_LastWriteTime()
-        $utc   = $file.get_LastWriteTimeUtc()
+        $size  = $File.get_Length()
+        $local = $File.get_LastWriteTime()
+        $utc   = $File.get_LastWriteTimeUtc()
     }
     catch {
         $reason = $_.Exception
         while ($reason.InnerException) { $reason = $reason.InnerException }
-        if ($reason -is [System.IO.FileNotFoundException]) { return 'Missing' }  # deleted while being checked
-        return 'Unavailable'  # something that cannot be checked is kept, never removed
+        if ($reason -is [System.IO.FileNotFoundException]) { return 'Missing' }
+        return 'Unavailable'
     }
-
     if ($size -ne $SizeBytes -or -not (Test-SameSavedDate -Local $local -Utc $utc -LastWriteTime $LastWriteTime -UtcOffset $UtcOffset)) {
         return 'Changed'
     }
     'Present'
+}
+
+function Test-CopyInFolder {
+    <#
+        Checks the recorded copies in one folder (see Test-DuplicateCopy), whose drive or
+        share is reachable. Several copies are checked from a single listing of the folder
+        rather than a lookup each: on a network share every lookup is a round trip.
+        $Check holds Key, FileName, SizeBytes, LastWriteTime and UtcOffset; returns Key and
+        State for each.
+    #>
+    param([Parameter(Mandatory)] [string] $Folder, [Parameter(Mandatory)] [object[]] $Check)
+
+    if ($Check.Count -eq 1) {
+        $c = $Check[0]
+        $state = 'Missing'
+        try { $file = Find-CopyFile -Folder $Folder -FileName $c.FileName }
+        catch { $file = $null; $state = 'Unavailable' }
+        if ($file) { $state = Get-CopyState -File $file -SizeBytes $c.SizeBytes -LastWriteTime $c.LastWriteTime -UtcOffset $c.UtcOffset }
+        return [pscustomobject] @{ Key = $c.Key; State = $state }
+    }
+
+    $failure = $null
+    $files = @()
+    try { $files = ([System.IO.DirectoryInfo] $Folder).GetFiles() }
+    catch {
+        $reason = $_.Exception
+        while ($reason.InnerException) { $reason = $reason.InnerException }
+        $failure = 'Unavailable'
+        if ($reason -is [System.IO.DirectoryNotFoundException]) { $failure = 'Missing' }
+    }
+    # Names searched by .NET (Array.IndexOf) rather than indexed in a PowerShell loop:
+    # folders can hold thousands of files and only a few copies.
+    $names = [string[]] @($files.Name)
+
+    $keys = $null  # name keys, worked out only when a name is not found as it is
+    foreach ($c in $Check) {
+        $state = $failure
+        if (-not $state) {
+            $file = $null
+            $at = [System.Array]::IndexOf($names, $c.FileName)
+            if ($at -lt 0) {
+                if ($null -eq $keys) { $keys = [string[]] @(foreach ($name in $names) { ConvertTo-NameKey $name }) }
+                $at = [System.Array]::IndexOf($keys, (ConvertTo-NameKey $c.FileName))
+            }
+            if ($at -ge 0) { $file = $files[$at] }
+            $state = 'Missing'
+            if ($file) { $state = Get-CopyState -File $file -SizeBytes $c.SizeBytes -LastWriteTime $c.LastWriteTime -UtcOffset $c.UtcOffset }
+        }
+        [pscustomobject] @{ Key = $c.Key; State = $state }
+    }
+}
+
+function Invoke-WorkItem {
+    # Runs $Work (taking one item) on each item, $ThrottleLimit at a time, showing progress,
+    # and returns everything the work outputs. A failure on any item is rethrown.
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Item,
+        [Parameter(Mandatory)] [scriptblock] $Work,
+        [ValidateRange(1, 64)] [int] $ThrottleLimit = 1,
+        [Parameter(Mandatory)] [string] $Activity
+    )
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastShownMs = - $script:ProgressIntervalMs
+    if ($ThrottleLimit -eq 1 -or $Item.Count -lt 2) {
+        for ($i = 0; $i -lt $Item.Count; $i++) {
+            if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
+                $lastShownMs = $timer.ElapsedMilliseconds
+                Write-Progress -Id 3 -Activity $Activity -Status "$($i + 1) of $($Item.Count)" -PercentComplete ([int] (100 * $i / $Item.Count))
+            }
+            & $Work $Item[$i]
+        }
+    }
+    else {
+        $pool = $null
+        try {
+            $pool = Start-WorkerPool -Work $Work -ThrottleLimit ([Math]::Min($ThrottleLimit, $Item.Count))
+            foreach ($one in $Item) { $pool.Queue.Add($one) }
+            for ($done = 1; $done -le $Item.Count; $done++) {
+                $result = Receive-WorkerResult -Pool $pool
+                if ($null -ne $result.Error) { throw $result.Error }
+                if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
+                    $lastShownMs = $timer.ElapsedMilliseconds
+                    Write-Progress -Id 3 -Activity $Activity -Status "$done of $($Item.Count) ($ThrottleLimit at a time)" `
+                        -PercentComplete ([int] (100 * $done / $Item.Count))
+                }
+                $result.Value
+            }
+        }
+        finally {
+            if ($null -ne $pool) { Stop-WorkerPool -Pool $pool }
+        }
+    }
+    Write-Progress -Id 3 -Activity $Activity -Completed
+}
+
+function Get-FileCopyState {
+    <#
+        Checks every copy of every file row; returns "row number|folder" -> state (see
+        Test-DuplicateCopy). Copies on a drive or share that cannot be reached are
+        Unavailable without further checks (each drive or share is tried once). The others
+        are grouped by folder and each folder checked with Test-CopyInFolder, $ThrottleLimit
+        folders at a time.
+    #>
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Row,
+        [ValidateRange(1, 64)] [int] $ThrottleLimit = 1,
+        [System.Collections.Generic.Dictionary[string, bool]] $RootCache
+    )
+    $states = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+    $byFolder = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[object]]]::new([System.StringComparer]::Ordinal)
+    for ($i = 0; $i -lt $Row.Count; $i++) {
+        foreach ($folder in $Row[$i].Folders) {
+            $key = "$i|$folder"
+            if (-not (Test-PathRootReachable -Folder $folder -Cache $RootCache)) { $states[$key] = 'Unavailable'; continue }
+            $checks = $null
+            if (-not $byFolder.TryGetValue($folder, [ref] $checks)) {
+                $checks = [System.Collections.Generic.List[object]]::new()
+                $byFolder[$folder] = $checks
+            }
+            $checks.Add([pscustomobject] @{
+                    Key = $key; FileName = $Row[$i].FileName; SizeBytes = $Row[$i].SizeBytes
+                    LastWriteTime = $Row[$i].LastWriteTime; UtcOffset = $Row[$i].UtcOffset
+                })
+        }
+    }
+    $jobs = @(foreach ($entry in $byFolder.GetEnumerator()) { [pscustomobject] @{ Folder = $entry.Key; Check = $entry.Value.ToArray() } })
+    $work = { param($Job) Test-CopyInFolder -Folder $Job.Folder -Check $Job.Check }
+    foreach ($result in (Invoke-WorkItem -Item $jobs -Work $work -ThrottleLimit $ThrottleLimit -Activity 'Validating file copies')) {
+        $states[$result.Key] = $result.State
+    }
+    , $states
+}
+
+function Get-FolderCopyState {
+    <#
+        Checks every copy of every folder row with Test-DuplicateFolderCopy, $ThrottleLimit
+        at a time; returns "row number|folder" -> state. Copies on a drive or share that
+        cannot be reached are Unavailable without further checks.
+    #>
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Row,
+        [ValidateRange(1, 64)] [int] $ThrottleLimit = 1,
+        [System.Collections.Generic.Dictionary[string, bool]] $RootCache
+    )
+    $states = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+    $jobs = [System.Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt $Row.Count; $i++) {
+        foreach ($folder in $Row[$i].Folders) {
+            $key = "$i|$folder"
+            if (-not (Test-PathRootReachable -Folder $folder -Cache $RootCache)) { $states[$key] = 'Unavailable'; continue }
+            $jobs.Add([pscustomobject] @{
+                    Key = $key; Path = $folder; FileCount = $Row[$i].FileCount; FolderCount = $Row[$i].FolderCount; SizeBytes = $Row[$i].SizeBytes
+                })
+        }
+    }
+    $work = {
+        param($Job)
+        $state = Test-DuplicateFolderCopy -Path $Job.Path -FileCount $Job.FileCount -FolderCount $Job.FolderCount -SizeBytes $Job.SizeBytes
+        [pscustomobject] @{ Key = $Job.Key; State = $state }
+    }
+    foreach ($result in (Invoke-WorkItem -Item $jobs.ToArray() -Work $work -ThrottleLimit $ThrottleLimit -Activity 'Validating folder copies')) {
+        $states[$result.Key] = $result.State
+    }
+    , $states
 }
 
 function Test-SameSavedDate {
@@ -1671,12 +1853,8 @@ function Test-SameSavedDate {
         in exact integer arithmetic as when scanning: compared as instants when the report has
         the UTC offset, as local times otherwise (reports made before the UTC Offset column).
     #>
-    param(
-        [Parameter(Mandatory)] [datetime] $Local,
-        [Parameter(Mandatory)] [datetime] $Utc,
-        [Parameter(Mandatory)] [datetime] $LastWriteTime,
-        [AllowNull()] [object] $UtcOffset
-    )
+    # A simple function (no parameter validation): it runs for every copy in a report.
+    param([datetime] $Local, [datetime] $Utc, [datetime] $LastWriteTime, [object] $UtcOffset)
     $ticks = $Local.Ticks
     $saved = $LastWriteTime.Ticks
     if ($null -ne $UtcOffset) { $ticks = $Utc.Ticks; $saved -= ([TimeSpan] $UtcOffset).Ticks }
@@ -1763,7 +1941,7 @@ function Test-DuplicateFolderCopy {
 
 function Invoke-CopyCheck {
     <#
-        Runs $TestCopy on every copy of every row. Keeps copies that are Present or
+        Runs $TestCopy (row, location, row number) on every copy of every row. Keeps copies that are Present or
         Unavailable, drops Missing and Changed ones, and drops rows left with fewer than
         two copies. Returns the rows kept and the counts.
     #>
@@ -1792,7 +1970,7 @@ function Invoke-CopyCheck {
         $present = [System.Collections.Generic.List[string]]::new()
         foreach ($location in $row.Folders) {
             $checked++
-            $state = & $TestCopy $row $location
+            $state = & $TestCopy $row $location $i
             if ($state -eq 'Present') { $present.Add($location); continue }
             if ($state -eq 'Unavailable') {
                 $unavailable++
@@ -1826,8 +2004,9 @@ function Update-DuplicateReport {
         Re-checks every copy listed in an existing report and removes the ones that
         no longer exist, without rescanning the folders.
     .DESCRIPTION
-        Each file copy is checked with a single file lookup, and each folder copy by
-        listing its tree again; no contents are read or downloaded. Copies that are
+        Each file copy is checked with a file lookup (copies in the same folder from one
+        listing of it), and each folder copy by listing its tree again; no contents are
+        read or downloaded. -ThrottleLimit checks that many folders at the same time. Copies that are
         missing or changed are removed; rows left with fewer than two copies are
         removed. Copies on a drive or network share that cannot be reached are kept.
         The report is rewritten in place only when something changed. Supports -WhatIf.
@@ -1836,23 +2015,30 @@ function Update-DuplicateReport {
         DuplicateFolderSet the folder rows ($null when the report has no folder sheet).
     #>
     [CmdletBinding(SupportsShouldProcess)]
-    param([Parameter(Mandatory)] [string] $Path)
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+
+        # How many folders to check at the same time.
+        [ValidateRange(1, 64)]
+        [int] $ThrottleLimit = 1
+    )
 
     $Path = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($Path)
     $workbook = Read-DuplicateWorkbook -Path $Path
     $rootCache = [System.Collections.Generic.Dictionary[string, bool]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
+    $fileStates = Get-FileCopyState -Row $workbook.Files -ThrottleLimit $ThrottleLimit -RootCache $rootCache
     $files = Invoke-CopyCheck -Set $workbook.Files -NameProperty FileName -Noun '' -TestCopy {
-        param($row, $location)
-        Test-DuplicateCopy -Folder $location -FileName $row.FileName -SizeBytes $row.SizeBytes -LastWriteTime $row.LastWriteTime `
-            -UtcOffset $row.UtcOffset -RootCache $rootCache
+        param($row, $location, $number)
+        $fileStates["$number|$location"]
     }
 
     $folders = $null
     if ($null -ne $workbook.Folders) {
+        $folderStates = Get-FolderCopyState -Row $workbook.Folders -ThrottleLimit $ThrottleLimit -RootCache $rootCache
         $folders = Invoke-CopyCheck -Set $workbook.Folders -NameProperty FolderName -Noun 'folder ' -LocationIsItem -TestCopy {
-            param($row, $location)
-            Test-DuplicateFolderCopy -Path $location -FileCount $row.FileCount -FolderCount $row.FolderCount -SizeBytes $row.SizeBytes -RootCache $rootCache
+            param($row, $location, $number)
+            $folderStates["$number|$location"]
         }
     }
 

@@ -6,13 +6,16 @@ src/DuplicateFinder.psm1.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
+import queue
+import re
 import sys
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, Iterable, Iterator, List, Optional
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .names import sort_key
 
@@ -133,6 +136,64 @@ def full_path(path: str) -> str:
     return path
 
 
+# File systems reached over a network, as Linux names them in /proc/self/mounts.
+NETWORK_FILE_SYSTEMS = frozenset({
+    "9p", "afs", "ceph", "cifs", "davfs", "fuse.davfs2", "fuse.gcsfuse", "fuse.glusterfs", "fuse.rclone",
+    "fuse.s3fs", "fuse.sshfs", "glusterfs", "gpfs", "lustre", "ncpfs", "nfs", "nfs4", "smb3", "smbfs",
+})
+DRIVE_REMOTE = 4  # GetDriveTypeW: a network drive
+
+
+def on_network_drive(path: str) -> bool:
+    """True when ``path`` is on a network share: a UNC path or network drive on Windows, a
+    network file system (NFS, SMB ...) on Linux. False when unknown (macOS).
+
+    Python uses several threads (-j) only there, and for hashing large files: for the many
+    small operations of listing and checking local folders, threads contending for Python's
+    global lock make it many times slower. (PowerShell has no such lock.)
+    """
+    path = os.path.abspath(path)
+    if sys.platform == "win32":
+        drive = os.path.splitdrive(path)[0]
+        return drive.startswith(("\\\\", "//")) or _windows_drive_type(drive.upper()) == DRIVE_REMOTE
+    if sys.platform.startswith("linux"):
+        return mount_type(path, _linux_mounts()) in NETWORK_FILE_SYSTEMS
+    return False
+
+
+def mount_type(path: str, mounts: Iterable[Tuple[str, str]]) -> str:
+    """The file system type of the mount holding ``path``, given (mount point, type) pairs."""
+    best, kind = "", ""
+    for point, point_kind in mounts:
+        inside = path == point or path.startswith(point.rstrip("/") + "/")
+        if inside and len(point) > len(best):
+            best, kind = point, point_kind
+    return kind
+
+
+_OCTAL_ESCAPE = re.compile(r"\\([0-7]{3})")
+
+
+@functools.lru_cache(maxsize=None)
+def _linux_mounts() -> Tuple[Tuple[str, str], ...]:
+    # /proc/self/mounts writes spaces and some other characters in mount points as octal (\040).
+    try:
+        with open("/proc/self/mounts", encoding="utf-8", errors="replace") as mounts:
+            lines = [line.split() for line in mounts]
+    except OSError:
+        return ()
+    return tuple(
+        (_OCTAL_ESCAPE.sub(lambda m: chr(int(m.group(1), 8)), fields[1]), fields[2]) for fields in lines if len(fields) >= 3
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _windows_drive_type(drive: str) -> int:
+    import ctypes
+
+    return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\")
+
+
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _EPOCH_NAIVE = datetime(1970, 1, 1)
 
@@ -214,18 +275,26 @@ def _tree_listing(root: str, throttle_limit: int, on_folder: Optional[FolderCall
     folders at a time; returns folder path -> listing."""
     listings: Dict[str, _Listing] = {}
     file_count = 0
+    finished: "queue.SimpleQueue[Tuple[str, Future]]" = queue.SimpleQueue()
+
+    def submit(path: str) -> None:
+        # Finished listings are queued: waiting on the set of pending ones would cost a
+        # pass over all of them each time, and thousands can be pending.
+        pool.submit(_list_folder, path).add_done_callback(lambda future: finished.put((path, future)))
+
     with ThreadPoolExecutor(max_workers=throttle_limit) as pool:
-        pending = {pool.submit(_list_folder, root): root}
+        submit(root)
+        pending = 1
         while pending:
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                path = pending.pop(future)
-                listing = listings[path] = future.result()
-                file_count += len(listing.files)
-                if on_folder is not None:
-                    on_folder(path, len(listings), file_count)
-                for entry in listing.folders:
-                    pending[pool.submit(_list_folder, entry.path)] = entry.path
+            path, future = finished.get()
+            pending -= 1
+            listing = listings[path] = future.result()
+            file_count += len(listing.files)
+            if on_folder is not None:
+                on_folder(path, len(listings), file_count)
+            for entry in listing.folders:
+                submit(entry.path)
+                pending += 1
     return listings
 
 
@@ -248,8 +317,8 @@ def iter_files(
     link that is not followed, is recorded as not readable: its contents are not
     fully known, so it can never be proven identical to another folder.
 
-    With ``throttle_limit`` above 1, that many folders are listed at the same time
-    (much faster on network shares); the files come out in the same order.
+    With ``throttle_limit`` above 1, that many folders on a network drive are listed at
+    the same time (see on_network_drive); the files come out in the same order.
     """
     if not os.path.isdir(root):
         raise NotADirectoryError(f"'{root}' is not a folder.")
@@ -259,7 +328,7 @@ def iter_files(
     root = full_path(root)
     # Listing several folders at a time lists the whole tree first; it is then walked below
     # exactly as when listing one folder at a time, so the output is the same.
-    listings = _tree_listing(root, throttle_limit, on_folder) if throttle_limit > 1 else None
+    listings = _tree_listing(root, throttle_limit, on_folder) if throttle_limit > 1 and on_network_drive(root) else None
     pending = [root]
     folder_count = 0
     file_count = 0

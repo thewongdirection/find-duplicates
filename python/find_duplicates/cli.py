@@ -132,8 +132,9 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         type=_throttle_limit,
         default=1,
         metavar="N",
-        help="How many files to hash, and folders to list, at the same time (1-64, default 1). Try 4-8 "
-        "for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk.",
+        help="How many files to hash, and folders to list or check, at the same time (1-64, default 1). Try "
+        "4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk. Also speeds up "
+        "--validate.",
     )
     parser.add_argument(
         "--ignore-empty-files",
@@ -158,10 +159,9 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     args = parser.parse_args(argv)
 
     if args.validate:
-        if args.skip_cloud_only or args.throttle_limit != 1 or args.folders or args.ignore_empty_files or args.rehash:
+        if args.skip_cloud_only or args.folders or args.ignore_empty_files or args.rehash:
             parser.error(
-                "--skip-cloud-only, --throttle-limit, --folders, --ignore-empty-files and --rehash only apply to a "
-                "scan, not to --validate"
+                "--skip-cloud-only, --folders, --ignore-empty-files and --rehash only apply to a scan, not to --validate"
             )
         if len([value for value in (args.path, args.output, args.output_option) if value]) > 1:
             parser.error("--validate takes a single report")
@@ -176,13 +176,13 @@ def report_path(output: Optional[str]) -> str:
     return os.path.abspath(output)
 
 
-def _validate(report: str, dry_run: bool) -> int:
+def _validate(report: str, dry_run: bool, throttle_limit: int = 1) -> int:
     progress = ProgressLine()
     print(f"Validating '{report}' ...")
     try:
         result = validate_report(
-            report, dry_run=dry_run,
-            on_row=lambda name, done, total: progress.show(f"Row {done} of {total}  {name}"),
+            report, dry_run=dry_run, throttle_limit=throttle_limit,
+            on_progress=lambda name, done, total: progress.show(f"Checked {done} of {total}  {name}"),
         )
     except (OSError, ValueError) as exc:
         progress.clear()
@@ -297,7 +297,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     if args.validate:
-        return _validate(report_path(args.output_option or args.path or args.output), args.dry_run)
+        return _validate(report_path(args.output_option or args.path or args.output), args.dry_run, args.throttle_limit)
     return _scan(
         args.path or ".",
         report_path(args.output_option or args.output),

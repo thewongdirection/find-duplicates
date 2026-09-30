@@ -56,9 +56,9 @@
     files are then not reported.
 
 .PARAMETER ThrottleLimit
-    How many files to hash, and folders to list, at the same time (1-64, default 1).
-    Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning
-    hard disk.
+    How many files to hash, and folders to list or check, at the same time (1-64,
+    default 1). Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single
+    spinning hard disk. Also speeds up -Validate.
 
 .PARAMETER IgnoreEmptyFiles
     Leave files of 0 bytes out of the duplicate files (they all have the same
@@ -112,6 +112,7 @@ param(
     [switch] $SkipCloudOnly,
 
     [Parameter(ParameterSetName = 'Scan')]
+    [Parameter(ParameterSetName = 'Validate')]
     [ValidateRange(1, 64)]
     [int] $ThrottleLimit = 1,
 
@@ -146,7 +147,7 @@ $reportPath = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($OutputFile)
 if ($Validate) {
     Write-Host "Validating '$reportPath' ..."
     # -WhatIf does not flow into module functions on its own, so pass it on.
-    $result = Update-DuplicateReport -Path $reportPath -WhatIf:$WhatIfPreference @verbose
+    $result = Update-DuplicateReport -Path $reportPath -ThrottleLimit $ThrottleLimit -WhatIf:$WhatIfPreference @verbose
     Write-Host ("Checked {0} copies in {1} rows: {2} missing or changed, {3} unreachable (kept)." -f
         $result.CopiesChecked, $result.RowsChecked, $result.CopiesRemoved, $result.CopiesUnavailable)
     Write-Host "Removed $($result.RowsRemoved) rows that are no longer duplicates; $($result.RowsRemaining) remain."

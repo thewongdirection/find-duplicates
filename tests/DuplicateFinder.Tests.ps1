@@ -912,7 +912,7 @@ Describe 'Update-DuplicateReport' {
         $root = Add-TestRoot
         foreach ($folder in 'a', 'b') { $null = Add-TestFile $root "$folder/x.txt" }
         $report = Export-ScannedReport $root
-        Mock -ModuleName DuplicateFinder Test-DuplicateCopy { 'Unavailable' }
+        Mock -ModuleName DuplicateFinder Test-PathRootReachable { $false }
 
         $result = Update-DuplicateReport -Path $report -WarningVariable warnings -WarningAction SilentlyContinue
 
@@ -941,6 +941,65 @@ Describe 'Update-DuplicateReport' {
             Mock Find-FileByNameKey { [pscustomobject] @{ Length = [long] 1; LastWriteTime = $null } }
             Test-DuplicateCopy -Folder $Folder -FileName 'NUL' -SizeBytes 1 -LastWriteTime $Saved | Should -Be 'Unavailable'
         }
+    }
+
+    It 'checks several copies in one folder from one listing, by exact name or ignoring case' {
+        $root = Add-TestRoot
+        $present = Add-TestFile $root 'a/x.txt'
+        $cased = Add-TestFile $root 'a/Photo.JPG'
+        $changed = Add-TestFile $root 'a/changed.txt'
+        [System.IO.File]::WriteAllText($changed.FullName, 'different now')
+        $folder = $present.DirectoryName
+        $checks = @(
+            foreach ($name in 'x.txt', 'photo.jpg', 'changed.txt', 'gone.txt') {
+                [pscustomobject] @{ Key = $name; FileName = $name; SizeBytes = $present.Length; LastWriteTime = $present.LastWriteTime; UtcOffset = $null }
+            }
+        )
+        InModuleScope DuplicateFinder -Parameters @{ Folder = $folder; Checks = $checks } {
+            $states = @{}
+            foreach ($result in (Test-CopyInFolder -Folder $Folder -Check $Checks)) { $states[$result.Key] = $result.State }
+            $states['x.txt'] | Should -Be 'Present'
+            $states['photo.jpg'] | Should -Be 'Present' -Because 'Photo.JPG is the same name, ignoring case'
+            $states['changed.txt'] | Should -Be 'Changed'
+            $states['gone.txt'] | Should -Be 'Missing'
+        }
+        $null = $cased
+    }
+
+    It 'treats every copy in a folder that has gone as missing' {
+        $folder = Join-Path (Add-TestRoot) 'gone'
+        $checks = @(
+            foreach ($name in 'x.txt', 'y.txt') {
+                [pscustomobject] @{ Key = $name; FileName = $name; SizeBytes = 1; LastWriteTime = $script:Saved; UtcOffset = $null }
+            }
+        )
+        InModuleScope DuplicateFinder -Parameters @{ Folder = $folder; Checks = $checks } {
+            @(Test-CopyInFolder -Folder $Folder -Check $Checks).State | Should -Be @('Missing', 'Missing')
+        }
+    }
+
+    It 'validates the same way checking several folders at a time' {
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b', 'c') {
+            foreach ($name in 'x.txt', 'y.txt') { $null = Add-TestFile $root "$folder/$name" -Content $name }
+            $null = Add-TestFile $root "$folder/Photos/p.jpg" -Content 'photo'
+        }
+        $report = "$root.xlsx"
+        $scan = @(Get-FileInventory -Path $root)
+        $info = [System.Collections.Generic.List[object]]::new()
+        $null = @(Get-FileInventory -Path $root -FolderInfo $info)
+        Export-DuplicateReport -DuplicateSet @(Find-DuplicateFile -File $scan) -FolderSet @(Find-DuplicateFolder -File $scan -Folder $info.ToArray()) -Path $report
+        Remove-Item -LiteralPath (Join-Path $root 'a/x.txt')
+        Remove-Item -LiteralPath (Join-Path $root 'b/Photos') -Recurse
+
+        $one = Update-DuplicateReport -Path $report -WhatIf
+        $many = Update-DuplicateReport -Path $report -ThrottleLimit 4 -WhatIf
+
+        foreach ($property in 'CopiesChecked', 'CopiesRemoved', 'RowsRemaining', 'FolderCopiesChecked', 'FolderCopiesRemoved', 'FolderRowsRemaining') {
+            $many.$property | Should -Be $one.$property -Because $property
+        }
+        $one.CopiesRemoved | Should -Be 2 -Because 'a/x.txt and b/Photos/p.jpg are gone'
+        $one.FolderCopiesRemoved | Should -Be 1
     }
 
     It 'checks each drive or share only once' {
@@ -1561,6 +1620,18 @@ Describe 'Find-Duplicates.ps1' {
         $rows = @(Import-DuplicateReport -Path (Join-Path $workDir 'duplicates.xlsx'))
         $rows.Count | Should -Be 1
         $rows[0].Count | Should -Be 2
+    }
+
+    It 'checks several folders at a time with -Validate -ThrottleLimit' {
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b', 'c') { $null = Add-TestFile $root "$folder/x.txt" }
+        $out = Join-Path (Add-TestRoot) 'parallel.xlsx'
+        $null = & $script:ScriptPath -Path $root -OutputFile $out 6>$null
+        Remove-Item -LiteralPath (Join-Path $root 'a/x.txt')
+
+        $null = & $script:ScriptPath -Validate $out -ThrottleLimit 4 6>$null
+
+        @(Import-DuplicateReport -Path $out)[0].Count | Should -Be 2
     }
 
     It 'takes the report to validate as its first argument' {

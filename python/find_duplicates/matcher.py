@@ -17,13 +17,14 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-from collections import defaultdict, deque
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Dict, Hashable, Iterable, List, Optional, Sequence, TypeVar
 
 from .names import name_key, path_sort_key, sort_key
+from . import scanner
 from .scanner import FileRecord, is_cloud_only, local_time, utc_offset
 
 log = logging.getLogger("find_duplicates")
@@ -32,6 +33,9 @@ NS_PER_SECOND = 1_000_000_000
 HASH_CHUNK_BYTES = 1024 * 1024
 MIN_THROTTLE_LIMIT = 1
 MAX_THROTTLE_LIMIT = 64
+# Local files at least this large are worth hashing on a thread (hashlib releases Python's
+# global lock while hashing them); smaller local files are faster hashed one at a time.
+PARALLEL_HASH_MIN_BYTES = 1024 * 1024
 
 T = TypeVar("T")
 
@@ -83,24 +87,34 @@ def md5_map(
     throttle_limit: int = 1,
     on_hash: Optional[HashCallback] = None,
     cache: Optional[Dict[str, str]] = None,
+    sizes: Optional[Dict[str, int]] = None,
 ) -> Dict[str, str]:
     """Hash files, up to ``throttle_limit`` at a time, returning full path -> MD5.
 
     Files that cannot be read are logged as warnings and left out of the map.
     With ``cache``, files already in it are not read again and new hashes are
-    added to it.
+    added to it. Only files on a network drive, or of at least
+    PARALLEL_HASH_MIN_BYTES by ``sizes`` (all files when ``sizes`` is not given), are
+    hashed on threads; the rest are hashed one at a time meanwhile, which is faster.
     """
     if not MIN_THROTTLE_LIMIT <= throttle_limit <= MAX_THROTTLE_LIMIT:
         raise ValueError(f"throttle_limit must be {MIN_THROTTLE_LIMIT}-{MAX_THROTTLE_LIMIT}, not {throttle_limit}.")
 
     if cache is not None:
-        hashed = _md5_map(paths=[p for p in paths if p not in cache], throttle_limit=throttle_limit, on_hash=on_hash)
+        hashed = _md5_map([p for p in paths if p not in cache], throttle_limit, on_hash, sizes)
         cache.update(hashed)
         return {p: cache[p] for p in paths if p in cache}
-    return _md5_map(paths, throttle_limit, on_hash)
+    return _md5_map(paths, throttle_limit, on_hash, sizes)
 
 
-def _md5_map(paths: Sequence[str], throttle_limit: int, on_hash: Optional[HashCallback]) -> Dict[str, str]:
+def _worth_a_thread(path: str, sizes: Optional[Dict[str, int]]) -> bool:
+    size = None if sizes is None else sizes.get(path)
+    return size is None or size >= PARALLEL_HASH_MIN_BYTES or scanner.on_network_drive(path)
+
+
+def _md5_map(
+    paths: Sequence[str], throttle_limit: int, on_hash: Optional[HashCallback], sizes: Optional[Dict[str, int]]
+) -> Dict[str, str]:
     result: Dict[str, str] = {}
 
     def record(done: int, path: str, md5: Optional[str]) -> None:
@@ -109,27 +123,25 @@ def _md5_map(paths: Sequence[str], throttle_limit: int, on_hash: Optional[HashCa
         if md5 is not None:
             result[path] = md5
 
-    if throttle_limit == 1:
+    threaded = [p for p in paths if _worth_a_thread(p, sizes)] if throttle_limit > 1 else []
+    if not threaded:
         for done, path in enumerate(paths, start=1):
             record(done, path, _hash_or_none(path))
         return result
 
-    # hashlib releases the GIL while hashing, so threads hash in parallel. A bounded
-    # window of pending jobs keeps memory flat however many files there are.
-    window = throttle_limit * 4
-    pending: deque = deque()
+    # hashlib releases the GIL while hashing, so threads hash large or remote files in
+    # parallel; the others are hashed here in the meantime.
+    in_thread = set(threaded)
     done = 0
     with ThreadPoolExecutor(max_workers=throttle_limit) as pool:
+        futures = [(path, pool.submit(_hash_or_none, path)) for path in threaded]
         for path in paths:
-            pending.append((path, pool.submit(_hash_or_none, path)))
-            if len(pending) >= window:
+            if path not in in_thread:
                 done += 1
-                oldest, future = pending.popleft()
-                record(done, oldest, future.result())
-        while pending:
+                record(done, path, _hash_or_none(path))
+        for path, future in futures:
             done += 1
-            oldest, future = pending.popleft()
-            record(done, oldest, future.result())
+            record(done, path, future.result())
     return result
 
 
@@ -203,7 +215,10 @@ def find_duplicate_files(
             )
 
     # Stage 3: MD5, only for files that already match on name, date and size.
-    md5_by_path = md5_map([r.path for group in candidate_groups for r in group], throttle_limit, on_hash, md5_cache)
+    candidates = [r for group in candidate_groups for r in group]
+    md5_by_path = md5_map(
+        [r.path for r in candidates], throttle_limit, on_hash, md5_cache, sizes={r.path: r.size for r in candidates}
+    )
 
     results: List[DuplicateSet] = []
     for group in candidate_groups:

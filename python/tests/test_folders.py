@@ -23,7 +23,7 @@ from find_duplicates.validate import validate_report  # noqa: E402
 from find_duplicates.xlsx import (  # noqa: E402
     export_duplicate_report, read_duplicate_folder_report, read_duplicate_report,
 )
-from tests.helpers import SAVED, add_file, read_worksheet, sheet_names  # noqa: E402
+from tests.helpers import SAVED, add_file, as_if_on_a_network_drive, read_worksheet, sheet_names  # noqa: E402
 
 
 def folder_scan(root):
@@ -179,7 +179,8 @@ class FindDuplicateFoldersTests(TempRootTestCase):
         add_photo_folder(self.root, "two/Photos")
         add_photo_folder(self.root, "one/Other", "other")
         add_photo_folder(self.root, "two/Other", "other")
-        self.assertEqual([r.folder_name for r in self.find(throttle_limit=4)], ["Other", "Photos"])
+        with as_if_on_a_network_drive():
+            self.assertEqual([r.folder_name for r in self.find(throttle_limit=4)], ["Other", "Photos"])
 
 
 class DuplicateFoldersInTheReportTests(TempRootTestCase):

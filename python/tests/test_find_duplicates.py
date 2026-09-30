@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+import logging
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -18,6 +20,7 @@ from xml.etree import ElementTree
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from find_duplicates import cli, matcher, scanner, validate  # noqa: E402
+from find_duplicates.folders import find_duplicate_folders  # noqa: E402
 from find_duplicates.matcher import DuplicateSet, find_duplicate_files, md5_file  # noqa: E402
 from find_duplicates.scanner import FileRecord, iter_files, local_time, utc_offset  # noqa: E402
 from find_duplicates.validate import validate_report  # noqa: E402
@@ -25,7 +28,9 @@ from find_duplicates.xlsx import (  # noqa: E402
     column_name, excel_serial, export_duplicate_report, from_excel_serial, parse_utc_offset, read_duplicate_report,
     utc_offset_text,
 )
-from tests.helpers import SAVED, add_file, read_worksheet, sheet_names, time_zone  # noqa: E402
+from tests.helpers import (  # noqa: E402
+    SAVED, add_file, as_if_on_a_network_drive, read_worksheet, sheet_names, time_zone,
+)
 
 
 class TempDirTestCase(unittest.TestCase):
@@ -131,7 +136,8 @@ class IterFilesTests(TempDirTestCase):
         one, many = [], []
 
         sequential = [f.path for f in iter_files(self.root, folders=one)]
-        parallel = [f.path for f in iter_files(self.root, folders=many, throttle_limit=4)]
+        with as_if_on_a_network_drive():
+            parallel = [f.path for f in iter_files(self.root, folders=many, throttle_limit=4)]
 
         self.assertEqual(parallel, sequential)
         self.assertEqual(many, one)
@@ -426,7 +432,7 @@ class ThrottleLimitTests(TempDirTestCase):
 
     def test_finds_the_same_duplicates_hashing_several_at_a_time(self):
         for limit in (2, 8):
-            with self.subTest(limit=limit):
+            with self.subTest(limit=limit), as_if_on_a_network_drive():
                 parallel = find_duplicate_files(self.files, throttle_limit=limit)
                 self.assertEqual(len(parallel), 3)
                 self.assertEqual(parallel, self.sequential)
@@ -438,7 +444,7 @@ class ThrottleLimitTests(TempDirTestCase):
                     add_file(root, f"{folder}/x.txt")
                 files = list(iter_files(root))
                 os.remove(files[0].path)  # gone before it could be hashed
-                with self.assertLogs("find_duplicates", "WARNING") as logs:
+                with as_if_on_a_network_drive(), self.assertLogs("find_duplicates", "WARNING") as logs:
                     result = find_duplicate_files(files, throttle_limit=limit)
                 self.assertEqual(len(logs.output), 1)
                 self.assertIn(files[0].path, logs.output[0])
@@ -448,6 +454,46 @@ class ThrottleLimitTests(TempDirTestCase):
         for limit in (0, 65):
             with self.subTest(limit=limit), self.assertRaises(ValueError):
                 find_duplicate_files([], throttle_limit=limit)
+
+
+class ThreadUseTests(TempDirTestCase):
+    """Python-specific: threads (-j) are used only where they are faster (see
+    scanner.on_network_drive)."""
+
+    def test_hashes_on_threads_only_files_on_a_network_drive_or_of_1_mb_or_more(self):
+        path = add_file(self.root, "a/x.txt")
+        big = matcher.PARALLEL_HASH_MIN_BYTES
+        self.assertFalse(matcher._worth_a_thread(path, {path: 10}))
+        self.assertTrue(matcher._worth_a_thread(path, {path: big}))
+        self.assertTrue(matcher._worth_a_thread(path, None), "without sizes, as md5_map always did")
+        with as_if_on_a_network_drive():
+            self.assertTrue(matcher._worth_a_thread(path, {path: 10}))
+
+    def test_hashes_small_local_files_without_threads(self):
+        paths = [add_file(self.root, f"{folder}/x.txt") for folder in "abc"]
+        with mock.patch.object(matcher, "ThreadPoolExecutor", side_effect=AssertionError("threads used")):
+            result = matcher.md5_map(paths, 4, sizes={p: os.path.getsize(p) for p in paths})
+        self.assertEqual(len(result), 3)
+
+    def test_lists_local_folders_one_at_a_time(self):
+        add_file(self.root, "a/x.txt")
+        with mock.patch.object(scanner, "_tree_listing", side_effect=AssertionError("threads used")):
+            self.assertEqual(len(list(iter_files(self.root, throttle_limit=4))), 1)
+        with as_if_on_a_network_drive(), mock.patch.object(scanner, "_tree_listing", wraps=scanner._tree_listing) as listing:
+            list(iter_files(self.root, throttle_limit=4))
+        listing.assert_called_once()
+
+    def test_recognises_the_file_system_holding_a_path(self):
+        mounts = [("/", "ext4"), ("/mnt/share", "cifs"), ("/mnt/shared", "nfs"), ("/mnt/my share", "nfs4")]
+        self.assertEqual(scanner.mount_type("/mnt/share/photos", mounts), "cifs")
+        self.assertEqual(scanner.mount_type("/mnt/shared2", mounts), "ext4", "a longer name is not inside the mount")
+        self.assertEqual(scanner.mount_type("/mnt/my share/a", mounts), "nfs4")
+        self.assertIn("cifs", scanner.NETWORK_FILE_SYSTEMS)
+        self.assertNotIn("ext4", scanner.NETWORK_FILE_SYSTEMS)
+
+    @unittest.skipUnless(sys.platform == "win32", "UNC paths are Windows-only")
+    def test_treats_a_unc_path_as_a_network_drive(self):
+        self.assertTrue(scanner.on_network_drive("\\\\server\\share\\folder"))
 
 
 class ExcelDateTests(unittest.TestCase):
@@ -719,7 +765,7 @@ class ValidateReportTests(TempDirTestCase):
     def test_keeps_copies_on_a_drive_or_share_that_cannot_be_reached(self):
         root = self.tree("a/x.txt", "b/x.txt")
         report = self.scanned_report(root)
-        with mock.patch.object(validate, "check_copy", return_value=validate.UNAVAILABLE), \
+        with mock.patch.object(validate, "root_reachable", return_value=False), \
                 self.assertLogs("find_duplicates", "WARNING") as logs:
             result = validate_report(report)
         self.assertEqual(result.copies_unavailable, 2)
@@ -752,6 +798,68 @@ class ValidateReportTests(TempDirTestCase):
                 mock.patch.object(validate.os, "stat", return_value=device):
             state = validate.check_copy(self.root, "NUL", 0, datetime.now())
         self.assertEqual(state, validate.UNAVAILABLE)
+
+    def test_checks_several_copies_in_one_folder_from_one_listing_by_exact_name_or_ignoring_case(self):
+        present = add_file(self.root, "a/x.txt")
+        add_file(self.root, "a/Photo.JPG")
+        changed = add_file(self.root, "a/changed.txt")
+        with open(changed, "w") as stream:
+            stream.write("different now")
+        info = os.stat(present)
+        saved = local_time(info.st_mtime_ns / 1e9)
+        checks = [validate._CopyCheck(name, name, info.st_size, saved, None)
+                  for name in ("x.txt", "photo.jpg", "changed.txt", "gone.txt")]
+
+        states = dict(validate._check_copies_in_folder(os.path.dirname(present), checks))
+
+        self.assertEqual(states["x.txt"], validate.PRESENT)
+        self.assertEqual(states["photo.jpg"], validate.PRESENT, "Photo.JPG is the same name, ignoring case")
+        self.assertEqual(states["changed.txt"], validate.CHANGED)
+        self.assertEqual(states["gone.txt"], validate.MISSING)
+
+    def test_treats_every_copy_in_a_folder_that_has_gone_as_missing(self):
+        checks = [validate._CopyCheck(name, name, 1, SAVED.replace(tzinfo=None), None) for name in ("x.txt", "y.txt")]
+        states = validate._check_copies_in_folder(os.path.join(self.root, "gone"), checks)
+        self.assertEqual([state for _, state in states], [validate.MISSING, validate.MISSING])
+
+    def test_validates_the_same_way_checking_several_folders_at_a_time(self):
+        root = self.new_dir("parallel")
+        for folder in ("a", "b", "c"):
+            for name in ("x.txt", "y.txt"):
+                add_file(root, f"{folder}/{name}", name)
+            add_file(root, f"{folder}/Photos/p.jpg", "photo")
+        records = []
+        files = list(iter_files(root, folders=records))
+        report = root + ".xlsx"
+        export_duplicate_report(find_duplicate_files(files), report, find_duplicate_folders(files, records))
+        os.remove(os.path.join(root, "a", "x.txt"))
+        shutil.rmtree(os.path.join(root, "b", "Photos"))
+
+        one = validate_report(report, dry_run=True)
+        with as_if_on_a_network_drive():
+            many = validate_report(report, dry_run=True, throttle_limit=4)
+
+        for field in ("copies_checked", "copies_removed", "rows_remaining",
+                      "folder_copies_checked", "folder_copies_removed", "folder_rows_remaining"):
+            self.assertEqual(getattr(many, field), getattr(one, field), field)
+        self.assertEqual(one.copies_removed, 2, "a/x.txt and b/Photos/p.jpg are gone")
+        self.assertEqual(one.folder_copies_removed, 1)
+
+    def test_keeps_logging_after_checking_folder_copies_several_at_a_time(self):
+        # Python-specific: each thread silences only its own messages while listing a folder copy.
+        root = self.new_dir("logging")
+        for folder in ("a", "b", "c", "d"):
+            add_file(root, f"{folder}/Photos/p.jpg", "photo")
+        records = []
+        files = list(iter_files(root, folders=records))
+        report = root + ".xlsx"
+        export_duplicate_report(find_duplicate_files(files), report, find_duplicate_folders(files, records))
+
+        with as_if_on_a_network_drive():
+            validate_report(report, dry_run=True, throttle_limit=4)
+
+        with self.assertLogs("find_duplicates", "WARNING"):
+            logging.getLogger("find_duplicates").warning("still logging")
 
     def test_checks_each_drive_or_share_only_once(self):
         root_cache = {}
@@ -898,7 +1006,7 @@ class CliTests(TempDirTestCase):
 
     def test_rejects_scan_options_with_validate(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            cli.main(["--validate", "-j", "4"])
+            cli.main(["--validate", "--folders"])
 
     def test_reuses_the_previous_reports_md5_hashes_and_reads_every_file_again_with_rehash(self):
         report = os.path.join(self.new_dir("work"), "again.xlsx")
@@ -922,6 +1030,20 @@ class CliTests(TempDirTestCase):
         self.assertEqual(code, 0)
         self.assertIn(f"Not reusing MD5 hashes from '{report}'", "\n".join(logs.output))
         self.assertEqual(len(read_duplicate_report(report)), 1)
+
+    def test_checks_several_folders_at_a_time_with_validate_and_throttle_limit(self):
+        root = self.new_dir("parallel")
+        for folder in ("a", "b", "c"):
+            add_file(root, f"{folder}/x.txt")
+        report = os.path.join(self.new_dir("work"), "parallel.xlsx")
+        self.run_cli(root, report)
+        os.remove(os.path.join(root, "a", "x.txt"))
+
+        with as_if_on_a_network_drive():
+            code, _ = self.run_cli("--validate", report, "-j", "4")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(read_duplicate_report(report)[0].count, 2)
 
     def test_does_not_scan_its_own_report(self):
         report = os.path.join(self.data, "duplicates.xlsx")
