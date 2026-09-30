@@ -64,7 +64,13 @@ pass `-WhatIf`/`-Verbose` explicitly into module functions; keep
 `Array.Sort` calls on their non-generic overloads, by casting the arguments to
 `[System.Array]` and `[System.Collections.IComparer]` (otherwise PowerShell
 may pick the generic overload and sort a copy of the items); remember that
-`,` binds tighter than `+` (`@('/' + $a, $b)` is `'/' + ($a, $b)`).
+`,` binds tighter than `+` (`@('/' + $a, $b)` is `'/' + ($a, $b)`); PowerShell turns a
+.NET property whose getter throws into `$null` (so read file details that may fail
+with getter methods, e.g. `$file.get_Length()`, inside `try`).
+
+Parallel work in PowerShell goes through `Start-WorkerPool` / `Receive-WorkerResult` /
+`Stop-WorkerPool` (runspaces that load this module); in Python through
+`ThreadPoolExecutor`. `-ThrottleLimit` / `-j` sets both folder listing and hashing.
 
 Code that runs per file, per cell or per row (scanning, hashing, the Excel
 writer and reader) avoids pipelines, script block comparers and advanced

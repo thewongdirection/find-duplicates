@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import logging
 import os
-import stat
 import sys
-from dataclasses import dataclass
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Iterable, Iterator, List, Optional
+from typing import Callable, Dict, Iterable, Iterator, List, Optional
 
 from .names import sort_key
 
@@ -33,16 +33,58 @@ IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003  # a junction
 FolderCallback = Callable[[str, int, int], None]
 
 
-@dataclass(frozen=True)
 class FileRecord:
-    """The details of one file that duplicate matching needs."""
+    """The details of one file that duplicate matching needs.
 
-    path: str
-    name: str
-    folder: str
-    size: int
-    mtime_ns: int
-    attributes: int = 0  # Windows file attributes; 0 elsewhere
+    Size, saved time and attributes (Windows file attributes; 0 elsewhere) come from the
+    scan's directory entry and are read only when first used, like .NET's FileInfo: on
+    Linux, macOS and network drives each read is a request per file, and most files never
+    need them because no other file has their name. Reading them raises OSError when the
+    file has gone or cannot be read since the scan.
+    """
+
+    __slots__ = ("path", "name", "folder", "_entry", "_size", "_mtime_ns", "_attributes")
+
+    def __init__(
+        self,
+        path: str,
+        name: str,
+        folder: str,
+        size: Optional[int] = None,
+        mtime_ns: Optional[int] = None,
+        attributes: int = 0,
+        entry: Optional[os.DirEntry] = None,
+    ) -> None:
+        self.path, self.name, self.folder = path, name, folder
+        self._entry = entry
+        self._size, self._mtime_ns, self._attributes = size, mtime_ns, attributes
+
+    def _load(self) -> None:
+        info = self._entry.stat() if self._entry is not None else os.stat(self.path)
+        self._size, self._mtime_ns = info.st_size, info.st_mtime_ns
+        self._attributes = getattr(info, "st_file_attributes", 0)
+        self._entry = None  # no longer needed
+
+    @property
+    def size(self) -> int:
+        if self._size is None:
+            self._load()
+        return self._size
+
+    @property
+    def mtime_ns(self) -> int:
+        if self._mtime_ns is None:
+            self._load()
+        return self._mtime_ns
+
+    @property
+    def attributes(self) -> int:
+        if self._size is None:
+            self._load()
+        return self._attributes
+
+    def __repr__(self) -> str:
+        return f"FileRecord({self.path!r})"
 
 
 @dataclass(frozen=True)
@@ -136,11 +178,63 @@ def _same_path_key(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
 
 
+@dataclass
+class _Listing:
+    """One folder's files, sub folders and folder links, each in ordinal name order, or
+    the reason it could not be read."""
+
+    files: List[os.DirEntry] = field(default_factory=list)
+    folders: List[os.DirEntry] = field(default_factory=list)
+    links: List[os.DirEntry] = field(default_factory=list)
+    error: Optional[str] = None
+
+
+def _list_folder(path: str) -> _Listing:
+    try:
+        with os.scandir(path) as it:
+            # File systems list entries in different orders (alphabetical on NTFS,
+            # arbitrary on ext4); ordinal order matches the PowerShell tool.
+            entries = sorted(it, key=lambda e: sort_key(e.name))
+    except OSError as exc:
+        return _Listing(error=exc.strerror or str(exc))
+    listing = _Listing()
+    for entry in entries:
+        try:
+            if entry.is_dir():
+                (listing.links if is_folder_link(entry) else listing.folders).append(entry)
+            elif entry.is_file():  # not devices, pipes or sockets
+                listing.files.append(entry)
+        except OSError as exc:
+            log.warning("Skipping '%s': %s", entry.path, exc.strerror or exc)
+    return listing
+
+
+def _tree_listing(root: str, throttle_limit: int, on_folder: Optional[FolderCallback]) -> Dict[str, _Listing]:
+    """List every folder below ``root`` (folder links are not followed), ``throttle_limit``
+    folders at a time; returns folder path -> listing."""
+    listings: Dict[str, _Listing] = {}
+    file_count = 0
+    with ThreadPoolExecutor(max_workers=throttle_limit) as pool:
+        pending = {pool.submit(_list_folder, root): root}
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                path = pending.pop(future)
+                listing = listings[path] = future.result()
+                file_count += len(listing.files)
+                if on_folder is not None:
+                    on_folder(path, len(listings), file_count)
+                for entry in listing.folders:
+                    pending[pool.submit(_list_folder, entry.path)] = entry.path
+    return listings
+
+
 def iter_files(
     root: str,
     exclude: Iterable[str] = (),
     on_folder: Optional[FolderCallback] = None,
     folders: Optional[List[FolderRecord]] = None,
+    throttle_limit: int = 1,
 ) -> Iterator[FileRecord]:
     """Yield every file below ``root``, recursing into sub folders.
 
@@ -153,13 +247,20 @@ def iter_files(
     unreadable folders). A folder that holds an excluded file, and each folder
     link that is not followed, is recorded as not readable: its contents are not
     fully known, so it can never be proven identical to another folder.
+
+    With ``throttle_limit`` above 1, that many folders are listed at the same time
+    (much faster on network shares); the files come out in the same order.
     """
     if not os.path.isdir(root):
         raise NotADirectoryError(f"'{root}' is not a folder.")
 
     # Normalised like the scanned paths (long names), or a short-form path would never match.
     excluded = {_same_path_key(full_path(p)) for p in exclude}
-    pending = [full_path(root)]
+    root = full_path(root)
+    # Listing several folders at a time lists the whole tree first; it is then walked below
+    # exactly as when listing one folder at a time, so the output is the same.
+    listings = _tree_listing(root, throttle_limit, on_folder) if throttle_limit > 1 else None
+    pending = [root]
     folder_count = 0
     file_count = 0
 
@@ -167,54 +268,32 @@ def iter_files(
         folder = pending.pop()
         folder_count += 1
         log.info("Scanning %s", folder)
-        if on_folder is not None:
-            on_folder(folder, folder_count, file_count)
+        if listings is not None:
+            listing = listings[folder]
+        else:
+            if on_folder is not None:
+                on_folder(folder, folder_count, file_count)
+            listing = _list_folder(folder)
 
-        try:
-            with os.scandir(folder) as it:
-                # File systems list entries in different orders (alphabetical on NTFS,
-                # arbitrary on ext4); ordinal order matches the PowerShell tool.
-                entries = sorted(it, key=lambda e: sort_key(e.name))
-        except OSError as exc:
-            log.warning("Skipping '%s': %s", folder, exc.strerror or exc)
+        if listing.error is not None:
+            log.warning("Skipping '%s': %s", folder, listing.error)
             if folders is not None:
                 folders.append(FolderRecord(folder, readable=False))
             continue
         if folders is not None:
             folders.append(FolderRecord(folder, readable=True))
 
-        sub_folders = []
-        for entry in entries:
-            try:
-                if entry.is_dir():
-                    if is_folder_link(entry):
-                        log.info("Not following link '%s'", entry.path)
-                        if folders is not None:
-                            folders.append(FolderRecord(entry.path, readable=False))
-                    else:
-                        sub_folders.append(entry.path)
-                    continue
-                if not entry.is_file():
-                    continue
-                if _same_path_key(entry.path) in excluded:
-                    if folders is not None:
-                        folders.append(FolderRecord(folder, readable=False))
-                    continue
-                st = entry.stat()
-            except OSError as exc:
-                log.warning("Skipping '%s': %s", entry.path, exc.strerror or exc)
-                continue
-            if not stat.S_ISREG(st.st_mode):
+        for entry in listing.files:
+            if _same_path_key(entry.path) in excluded:
+                if folders is not None:
+                    folders.append(FolderRecord(folder, readable=False))
                 continue
             file_count += 1
-            yield FileRecord(
-                path=entry.path,
-                name=entry.name,
-                folder=folder,
-                size=st.st_size,
-                mtime_ns=st.st_mtime_ns,
-                attributes=getattr(st, "st_file_attributes", 0),
-            )
+            yield FileRecord(entry.path, entry.name, folder, entry=entry)
 
+        for entry in listing.links:
+            log.info("Not following link '%s'", entry.path)
+            if folders is not None:
+                folders.append(FolderRecord(entry.path, readable=False))
         # Push in reverse so folders are visited in alphabetical order.
-        pending.extend(reversed(sub_folders))
+        pending.extend(entry.path for entry in reversed(listing.folders))

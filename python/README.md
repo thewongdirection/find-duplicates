@@ -40,7 +40,7 @@ python -m find_duplicates --validate [report] [--dry-run] [-v]
 |---|---|---|
 | `path` | current folder | Folder to scan, including all sub folders. |
 | `output`, `-o FILE`, `--output-file FILE` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced. |
-| `-j N`, `--throttle-limit N` | `1` | How many files to hash at the same time (1-64). Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk. |
+| `-j N`, `--throttle-limit N` | `1` | How many files to hash, and folders to list, at the same time (1-64). Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk. |
 | `--folders` | off | Also find [duplicate folders](../README.md#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
 | `--ignore-empty-files` | off | Leave files of 0 bytes out of the duplicate files. |
 | `--skip-cloud-only` | off | Never download online-only cloud files to hash them. Duplicates among such files are then not reported. |

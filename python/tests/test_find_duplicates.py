@@ -122,6 +122,20 @@ class IterFilesTests(TempDirTestCase):
         list(iter_files(self.root, on_folder=lambda folder, *_: seen.append(folder)))
         self.assertIn(os.path.join(self.root, "sub"), seen)
 
+    def test_lists_several_folders_at_a_time_and_returns_the_same_files_in_the_same_order(self):
+        for path in ("b/x.txt", "a/y.txt", "a/deep/er/z.txt", "c/w.txt", "a/b.txt", "top.txt"):
+            add_file(self.root, path)
+        os.makedirs(os.path.join(self.root, "a", "empty"))
+        with contextlib.suppress(OSError, NotImplementedError):  # the rest is still worth checking
+            os.symlink(self.root, os.path.join(self.root, "a", "loop"), target_is_directory=True)
+        one, many = [], []
+
+        sequential = [f.path for f in iter_files(self.root, folders=one)]
+        parallel = [f.path for f in iter_files(self.root, folders=many, throttle_limit=4)]
+
+        self.assertEqual(parallel, sequential)
+        self.assertEqual(many, one)
+
     def test_skips_an_unreadable_folder_with_a_warning(self):
         add_file(self.root, "ok/a.txt")
         add_file(self.root, "locked/b.txt")
@@ -234,6 +248,28 @@ class FindDuplicateFilesTests(TempDirTestCase):
 
     def test_returns_nothing_for_an_empty_list(self):
         self.assertEqual(find_duplicate_files([]), [])
+
+    def test_never_reads_the_size_or_saved_date_of_a_file_whose_name_no_other_file_has(self):
+        paths = [add_file(self.root, "a/x.txt"), add_file(self.root, "b/x.txt")]
+        # Never created: reading its size or saved date would fail with a warning.
+        unique = FileRecord(os.path.join(self.root, "c", "unique.txt"), "unique.txt", os.path.join(self.root, "c"))
+
+        with mock.patch.object(matcher.log, "warning") as warning:
+            result = find_duplicate_files(self.records(*paths) + [unique])
+
+        warning.assert_not_called()
+        self.assertEqual(len(result), 1)
+
+    def test_skips_a_file_that_has_gone_since_the_scan_with_a_warning(self):
+        paths = [add_file(self.root, "a/x.txt"), add_file(self.root, "b/x.txt")]
+        # Listed by the scan, deleted before it was compared.
+        gone = FileRecord(os.path.join(self.root, "c", "x.txt"), "x.txt", os.path.join(self.root, "c"))
+
+        with self.assertLogs("find_duplicates", "WARNING") as logs:
+            result = find_duplicate_files(self.records(*paths) + [gone])
+
+        self.assertIn(f"Skipping '{gone.path}'", logs.output[0])
+        self.assertEqual(result[0].count, 2)
 
     def test_md5_only_when_name_date_and_size_match(self):
         cases = {

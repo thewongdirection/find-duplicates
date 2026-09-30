@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -57,8 +58,14 @@ def md5_file(path: str) -> str:
     """MD5 of a file's contents as upper-case hex (the Get-FileHash format)."""
     digest = hashlib.md5(usedforsecurity=False)  # noqa: S324 - part of the duplicate definition
     with open(path, "rb", buffering=0) as stream:
-        for chunk in iter(lambda: stream.read(HASH_CHUNK_BYTES), b""):
-            digest.update(chunk)
+        # Chunks of up to 1 MB into a buffer no larger than the file: small files, the most
+        # common, cost no large allocation.
+        buffer = memoryview(bytearray(max(1, min(HASH_CHUNK_BYTES, os.fstat(stream.fileno()).st_size))))
+        while True:
+            read = stream.readinto(buffer)
+            if not read:
+                break
+            digest.update(buffer[:read])
     return digest.hexdigest().upper()
 
 
@@ -127,8 +134,6 @@ def _md5_map(paths: Sequence[str], throttle_limit: int, on_hash: Optional[HashCa
 
 
 def _saved_date_key(record: FileRecord) -> int:
-    # Whole seconds: copies made to network shares or other file systems
-    # frequently lose sub-second precision.
     return record.mtime_ns // NS_PER_SECOND
 
 
@@ -156,16 +161,26 @@ def find_duplicate_files(
     ``md5_cache`` is shared with find_duplicate_folders so no file is read twice.
     ``ignore_empty_files`` leaves files of 0 bytes out (they all share one MD5).
     """
-    if ignore_empty_files:
-        files = [f for f in files if f.size > 0]
+    # Stage 1: name. Grouped first, so the size and saved date of a file whose name no other
+    # file has are never read: on Linux, macOS and network drives each is a request per file.
+    name_groups = groups_of_many(files, lambda f: name_key(f.name))
 
-    # Stage 1: name + saved date.
-    name_date_groups = groups_of_many(files, lambda f: (name_key(f.name), _saved_date_key(f)))
-
-    # Stage 2: size. A cheap check that avoids hashing files that cannot match.
-    candidate_groups = [
-        group for nd in name_date_groups for group in groups_of_many(nd, lambda f: f.size)
-    ]
+    # Stage 2: saved date (whole second: copies made to network shares or other file systems
+    # often lose sub-second precision) and size, a cheap check that avoids hashing files that
+    # cannot match.
+    minimum_size = 1 if ignore_empty_files else 0
+    candidate_groups: List[List[FileRecord]] = []
+    for group in name_groups:
+        keyed = []
+        for record in group:
+            try:
+                key = (_saved_date_key(record), record.size)
+            except OSError as exc:
+                log.warning("Skipping '%s': %s", record.path, exc.strerror or exc)  # gone or unreadable since the scan
+                continue
+            if key[1] >= minimum_size:
+                keyed.append((record, key))
+        candidate_groups.extend([record for record, _ in same] for same in groups_of_many(keyed, lambda pair: pair[1]))
 
     if skip_cloud_only:
         skipped = 0

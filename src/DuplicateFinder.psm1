@@ -105,6 +105,85 @@ function Get-SortedDuplicateSet {
     , $DuplicateSet
 }
 
+#region Parallel work
+
+$script:ModulePath = $PSCommandPath
+
+# Runs in each worker runspace: takes items from the pool's queue until it is completed and
+# runs the work script block on each, in this module's scope, passing back the value or the
+# failure. One runspace per worker, not per item, keeps the cost per item low.
+$script:WorkerLoop = {
+    param($Queue, $Results, [string] $Work, [string] $ModulePath)
+    $module = Get-Module | Where-Object { $_.Path -eq $ModulePath } | Select-Object -First 1
+    if (-not $module) { throw "The module '$ModulePath' did not load in a worker runspace." }
+    $run = $module.NewBoundScriptBlock([scriptblock]::Create($Work))
+    foreach ($item in $Queue.GetConsumingEnumerable()) {
+        try { $Results.Add([pscustomobject] @{ Item = $item; Value = (& $run $item); Error = $null }) }
+        catch { $Results.Add([pscustomobject] @{ Item = $item; Value = $null; Error = $_.Exception }) }
+    }
+}
+
+function Start-WorkerPool {
+    <#
+        Starts $ThrottleLimit worker runspaces, each with this module loaded, that run $Work
+        (a script block taking one item) on every item added to the pool's Queue. Take the
+        results with Receive-WorkerResult; always finish with Stop-WorkerPool.
+    #>
+    param(
+        [Parameter(Mandatory)] [scriptblock] $Work,
+        [Parameter(Mandatory)] [ValidateRange(2, 64)] [int] $ThrottleLimit
+    )
+
+    $state = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault2()
+    $state.ImportPSModule([string[]] @($script:ModulePath))
+    $runspaces = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ThrottleLimit, $state, $Host)
+    $runspaces.Open()
+    $pool = [pscustomobject] @{
+        Queue     = [System.Collections.Concurrent.BlockingCollection[object]]::new()
+        Results   = [System.Collections.Concurrent.BlockingCollection[object]]::new()
+        Workers   = [System.Collections.Generic.List[object]]::new()
+        Runspaces = $runspaces
+    }
+    for ($w = 0; $w -lt $ThrottleLimit; $w++) {
+        $shell = [System.Management.Automation.PowerShell]::Create()
+        $shell.RunspacePool = $runspaces
+        $null = $shell.AddScript($script:WorkerLoop.ToString()).AddArgument($pool.Queue).AddArgument($pool.Results).AddArgument($Work.ToString()).AddArgument($script:ModulePath)
+        $pool.Workers.Add([pscustomobject] @{ Shell = $shell; Handle = $shell.BeginInvoke() })
+    }
+    $pool
+}
+
+function Receive-WorkerResult {
+    # The pool's next result: Item, Value, and Error (the exception when the work failed on
+    # that item). Throws when every worker has stopped without finishing its items.
+    param([Parameter(Mandatory)] [object] $Pool)
+    $result = $null
+    while (-not $Pool.Results.TryTake([ref] $result, 50)) {
+        $running = $false
+        foreach ($worker in $Pool.Workers) { if (-not $worker.Handle.IsCompleted) { $running = $true } }
+        if (-not $running -and $Pool.Results.Count -eq 0) {
+            foreach ($worker in $Pool.Workers) { $null = $worker.Shell.EndInvoke($worker.Handle) }  # rethrows why
+            throw 'The parallel workers stopped before finishing their work.'
+        }
+    }
+    $result
+}
+
+function Stop-WorkerPool {
+    # Drops any items still queued (after an error or Ctrl+C), lets each worker finish its
+    # current item, and frees the runspaces.
+    param([Parameter(Mandatory)] [object] $Pool)
+    $Pool.Queue.CompleteAdding()
+    $unused = $null
+    while ($Pool.Queue.TryTake([ref] $unused)) { $unused = $null }
+    foreach ($worker in $Pool.Workers) { $worker.Shell.Dispose() }
+    $Pool.Runspaces.Dispose()
+    $Pool.Queue.Dispose()
+    $Pool.Results.Dispose()
+}
+
+#endregion
+
 #region Scanning
 
 function Get-FileInventory {
@@ -116,7 +195,9 @@ function Get-FileInventory {
         Folders that cannot be read (permissions, dropped network connection) are
         reported as warnings and skipped. Symbolic links and junctions are not
         followed, which prevents infinite loops; cloud-synced folders are followed.
-        Listing folders never downloads cloud files.
+        Listing folders never downloads cloud files, and each folder is listed once.
+        With -ThrottleLimit above 1, that many folders are listed at the same time
+        (much faster on network shares); the files come out in the same order.
     #>
     [CmdletBinding()]
     [OutputType([System.IO.FileInfo])]
@@ -132,7 +213,11 @@ function Get-FileInventory {
         # folder that holds an excluded file, and each folder link that is not followed,
         # is recorded as not readable: its contents are not fully known, so it can never
         # be proven identical to another folder.
-        [System.Collections.Generic.List[object]] $FolderInfo
+        [System.Collections.Generic.List[object]] $FolderInfo,
+
+        # How many folders to list at the same time.
+        [ValidateRange(1, 64)]
+        [int] $ThrottleLimit = 1
     )
 
     $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
@@ -143,8 +228,13 @@ function Get-FileInventory {
     $excluded = [System.Collections.Generic.HashSet[string]]::new(
         [string[]] $ExcludeFile, [System.StringComparer]::OrdinalIgnoreCase)
 
-    $pending = [System.Collections.Generic.Stack[System.IO.DirectoryInfo]]::new()
-    $pending.Push([System.IO.DirectoryInfo] $root.FullName)
+    # Listing several folders at a time lists the whole tree first; it is then walked below
+    # exactly as when listing one folder at a time, so the output is the same.
+    $listings = $null
+    if ($ThrottleLimit -gt 1) { $listings = Get-TreeListing -Path $root.FullName -ThrottleLimit $ThrottleLimit }
+
+    $pending = [System.Collections.Generic.Stack[string]]::new()
+    $pending.Push($root.FullName)
 
     $folderCount = 0
     $fileCount   = 0
@@ -155,29 +245,27 @@ function Get-FileInventory {
         $folder = $pending.Pop()
         $folderCount++
 
-        Write-Verbose "Scanning $($folder.FullName)"
-        if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
-            $lastShownMs = $timer.ElapsedMilliseconds
-            Write-Progress -Id 1 -Activity 'Scanning folders' `
-                -Status "Folders: $folderCount   Files: $fileCount" `
-                -CurrentOperation $folder.FullName
+        Write-Verbose "Scanning $folder"
+        if ($null -ne $listings) { $listing = $listings[$folder] }
+        else {
+            if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
+                $lastShownMs = $timer.ElapsedMilliseconds
+                Write-Progress -Id 1 -Activity 'Scanning folders' `
+                    -Status "Folders: $folderCount   Files: $fileCount" -CurrentOperation $folder
+            }
+            $listing = Get-FolderListing -Path $folder
         }
 
-        try {
-            # File systems list entries in different orders (alphabetical on NTFS, arbitrary on ext4).
-            $files      = Get-SortedByName -Item $folder.GetFiles()
-            $subFolders = Get-SortedByName -Item $folder.GetDirectories()
-        }
-        catch [System.UnauthorizedAccessException], [System.IO.IOException], [System.Security.SecurityException] {
-            Write-Warning "Skipping '$($folder.FullName)': $($_.Exception.Message)"
-            if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder.FullName; Readable = $false }) }
+        if ($null -ne $listing.Error) {
+            Write-Warning "Skipping '$folder': $($listing.Error)"
+            if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder; Readable = $false }) }
             continue
         }
-        if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder.FullName; Readable = $true }) }
+        if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder; Readable = $true }) }
 
-        foreach ($file in $files) {
+        foreach ($file in $listing.Files) {
             if ($excluded.Contains($file.FullName)) {
-                if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder.FullName; Readable = $false }) }
+                if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder; Readable = $false }) }
                 continue
             }
             $fileCount++
@@ -185,18 +273,88 @@ function Get-FileInventory {
         }
 
         # Push in reverse so folders are visited in alphabetical order.
-        for ($i = $subFolders.Count - 1; $i -ge 0; $i--) {
-            $sub = $subFolders[$i]
+        for ($i = $listing.Folders.Count - 1; $i -ge 0; $i--) {
+            $sub = $listing.Folders[$i]
             if (Test-FolderLink -Folder $sub) {
                 Write-Verbose "Not following link '$($sub.FullName)'"
                 if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $sub.FullName; Readable = $false }) }
                 continue
             }
-            $pending.Push($sub)
+            $pending.Push($sub.FullName)
         }
     }
 
     Write-Progress -Id 1 -Activity 'Scanning folders' -Completed
+}
+
+# .NET filters a listing into files and folders far faster than a PowerShell loop.
+$script:OfFileType   = [System.Linq.Enumerable].GetMethod('OfType').MakeGenericMethod([System.IO.FileInfo])
+$script:OfFolderType = [System.Linq.Enumerable].GetMethod('OfType').MakeGenericMethod([System.IO.DirectoryInfo])
+$script:FileArray    = [System.Linq.Enumerable].GetMethod('ToArray').MakeGenericMethod([System.IO.FileInfo])
+$script:FolderArray  = [System.Linq.Enumerable].GetMethod('ToArray').MakeGenericMethod([System.IO.DirectoryInfo])
+
+function Get-FolderListing {
+    <#
+        One folder's files and sub folders, each in ordinal name order, from a single listing
+        of the folder (over a network every listing is a round trip). Error holds the reason
+        when the folder cannot be read.
+    #>
+    param([Parameter(Mandatory)] [string] $Path)
+    try {
+        $entries = ([System.IO.DirectoryInfo] $Path).GetFileSystemInfos()
+        $files   = $script:FileArray.Invoke($null, @(, $script:OfFileType.Invoke($null, @(, $entries))))
+        $folders = $script:FolderArray.Invoke($null, @(, $script:OfFolderType.Invoke($null, @(, $entries))))
+        [pscustomobject] @{
+            Path    = $Path
+            Files   = Get-SortedByName -Item $files
+            Folders = Get-SortedByName -Item $folders
+            Error   = $null
+        }
+    }
+    catch [System.UnauthorizedAccessException], [System.IO.IOException], [System.Security.SecurityException] {
+        [pscustomobject] @{ Path = $Path; Files = @(); Folders = @(); Error = $_.Exception.Message }
+    }
+}
+
+function Get-TreeListing {
+    <#
+        Lists every folder below $Path (folder links are not followed), $ThrottleLimit folders
+        at a time, showing progress. Returns a map of folder path -> Get-FolderListing result.
+    #>
+    param([Parameter(Mandatory)] [string] $Path, [Parameter(Mandatory)] [ValidateRange(2, 64)] [int] $ThrottleLimit)
+
+    $listings = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
+    $fileCount = 0
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastShownMs = - $script:ProgressIntervalMs
+    $pool = $null
+    try {
+        $pool = Start-WorkerPool -Work { param($Folder) Get-FolderListing -Path $Folder } -ThrottleLimit $ThrottleLimit
+        $pool.Queue.Add($Path)
+        $outstanding = 1
+        while ($outstanding -gt 0) {
+            $result = Receive-WorkerResult -Pool $pool
+            $outstanding--
+            if ($null -ne $result.Error) { throw $result.Error }  # Get-FolderListing reports the expected failures itself
+            $listing = $result.Value
+            $listings[$listing.Path] = $listing
+            $fileCount += $listing.Files.Count
+            if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
+                $lastShownMs = $timer.ElapsedMilliseconds
+                Write-Progress -Id 1 -Activity 'Scanning folders' `
+                    -Status "Folders: $($listings.Count)   Files: $fileCount ($ThrottleLimit at a time)" -CurrentOperation $listing.Path
+            }
+            foreach ($sub in $listing.Folders) {
+                if (Test-FolderLink -Folder $sub) { continue }
+                $pool.Queue.Add($sub.FullName)
+                $outstanding++
+            }
+        }
+    }
+    finally {
+        if ($null -ne $pool) { Stop-WorkerPool -Pool $pool }
+    }
+    , $listings
 }
 
 function Get-SortedByName {
@@ -231,16 +389,26 @@ function Test-CloudOnlyFile {
 #region Matching
 
 # Computes the MD5 of one file as upper-case hex. Kept as a script block so the very
-# same code runs in the current session and in the parallel runspaces. The large
-# buffer and the sequential-scan hint make reads from disks and shares much faster.
+# same code runs in the current session and in the parallel runspaces. Reads go straight
+# from the file in chunks of up to 1 MB (much faster from disks and shares) into a buffer
+# no larger than the file, so small files, the most common, cost no large allocation.
 $script:ComputeMd5 = {
     param([string] $Path)
     $ErrorActionPreference = 'Stop'
     $md5 = [System.Security.Cryptography.MD5]::Create()
     try {
         $stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
-            [System.IO.FileShare] 'ReadWrite, Delete', 1MB, [System.IO.FileOptions]::SequentialScan)
-        try { [System.BitConverter]::ToString($md5.ComputeHash($stream)).Replace('-', '') }
+            [System.IO.FileShare] 'ReadWrite, Delete', 1, [System.IO.FileOptions]::SequentialScan)
+        try {
+            # [long]: with an [int] first argument PowerShell picks Math.Min(int, int), which
+            # overflows for files over 2 GB.
+            $buffer = [byte[]]::new([int] [Math]::Max([long] 1, [Math]::Min([long] 1MB, $stream.Length)))
+            while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $null = $md5.TransformBlock($buffer, 0, $read, $null, 0)
+            }
+            $null = $md5.TransformFinalBlock($buffer, 0, 0)
+            [System.BitConverter]::ToString($md5.Hash).Replace('-', '')
+        }
         finally { $stream.Dispose() }
     }
     finally { $md5.Dispose() }
@@ -302,19 +470,6 @@ function Get-FileMd5 {
     & $script:ComputeMd5 $Path
 }
 
-# Runs in each parallel runspace: hashes paths taken from a shared queue until it is empty,
-# so each worker's runspace is set up once rather than once per file. Failures are passed
-# back with the path, to be reported by the caller.
-$script:HashWorker = {
-    param($Queue, $Results, [string] $ComputeMd5)
-    $compute = [scriptblock]::Create($ComputeMd5)
-    $path = $null
-    while ($Queue.TryDequeue([ref] $path)) {
-        try { $Results.Enqueue([pscustomobject] @{ Path = $path; Md5 = [string] (& $compute $path); Error = $null }) }
-        catch { $Results.Enqueue([pscustomobject] @{ Path = $path; Md5 = $null; Error = $_.Exception }) }
-    }
-}
-
 function Get-FileMd5Map {
     <#
         Hashes files, up to $ThrottleLimit at a time, returning a map of full path -> MD5.
@@ -339,7 +494,7 @@ function Get-FileMd5Map {
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $lastShownMs = - $script:ProgressIntervalMs
 
-    if ($ThrottleLimit -eq 1) {
+    if ($ThrottleLimit -eq 1 -or $Path.Count -lt 2) {
         foreach ($p in $Path) {
             $done++
             if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
@@ -352,45 +507,27 @@ function Get-FileMd5Map {
         }
     }
     else {
-        $queue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new($Path)
-        $results = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
-        $workers = [System.Collections.Generic.List[object]]::new()
-        $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ThrottleLimit)
-        $pool.Open()
+        $pool = $null
         try {
-            for ($w = 0; $w -lt [Math]::Min($ThrottleLimit, $Path.Count); $w++) {
-                $shell = [System.Management.Automation.PowerShell]::Create()
-                $shell.RunspacePool = $pool
-                $null = $shell.AddScript($script:HashWorker.ToString()).AddArgument($queue).AddArgument($results).AddArgument($script:ComputeMd5.ToString())
-                $workers.Add([pscustomobject] @{ Shell = $shell; Handle = $shell.BeginInvoke() })
-            }
-
+            $pool = Start-WorkerPool -Work { param($File) & $script:ComputeMd5 $File } -ThrottleLimit ([Math]::Min($ThrottleLimit, $Path.Count))
+            foreach ($p in $Path) { $pool.Queue.Add($p) }
+            $result = $null
             while ($done -lt $Path.Count) {
-                $result = $null
-                if (-not $results.TryDequeue([ref] $result)) {
-                    $busy = $false
-                    foreach ($worker in $workers) { if (-not $worker.Handle.IsCompleted) { $busy = $true } }
-                    if (-not $busy -and $results.IsEmpty) { break }  # a worker failed; EndInvoke below says why
-                    Start-Sleep -Milliseconds 5
-                    continue
-                }
+                # A result that is already waiting is taken directly: a function call per file
+                # would cost more than hashing a small one.
+                if (-not $pool.Results.TryTake([ref] $result)) { $result = Receive-WorkerResult -Pool $pool }
                 $done++
                 if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
                     $lastShownMs = $timer.ElapsedMilliseconds
-                    Write-Progress -Id 2 -Activity $activity -Status "File $done of $($Path.Count)$status" -CurrentOperation $result.Path `
+                    Write-Progress -Id 2 -Activity $activity -Status "File $done of $($Path.Count)$status" -CurrentOperation $result.Item `
                         -PercentComplete ([int] (100 * $done / $Path.Count))
                 }
-                if ($null -eq $result.Error) { $map[$result.Path] = $result.Md5 }
-                else { Write-Warning "Could not hash '$($result.Path)': $(Get-InnermostMessage $result.Error)" }
+                if ($null -eq $result.Error) { $map[$result.Item] = [string] $result.Value }
+                else { Write-Warning "Could not hash '$($result.Item)': $(Get-InnermostMessage $result.Error)" }
             }
-            foreach ($worker in $workers) { $null = $worker.Shell.EndInvoke($worker.Handle) }
         }
         finally {
-            # Leave the workers nothing more to do (on an error or Ctrl+C), then clean up.
-            $unused = $null
-            while ($queue.TryDequeue([ref] $unused)) { $unused = $null }
-            foreach ($worker in $workers) { $worker.Shell.Dispose() }
-            $pool.Dispose()
+            if ($null -ne $pool) { Stop-WorkerPool -Pool $pool }
         }
     }
 
@@ -458,29 +595,40 @@ function Find-DuplicateFile {
         [switch] $IgnoreEmptyFiles
     )
 
-    if ($IgnoreEmptyFiles) { $File = [System.IO.FileInfo[]] @($File | Where-Object { $_.Length -gt 0 }) }
-
-    # Stage 1: name + saved date (UTC, whole second: copies made to network shares or
-    # other file systems often lose sub-second precision). The date key is all digits,
-    # so '|' is a safe separator.
-    $ticksPerSecond = [System.TimeSpan]::TicksPerSecond
-    $keys = [System.Collections.Generic.List[string]]::new($File.Count)
+    # Stage 1: name. Grouped first, so the size and saved date of a file whose name no other
+    # file has are never read: on Linux, macOS and network drives each is a request per file.
+    # The dictionary in Group-ByKey ignores case; only Unicode normalisation is needed here.
+    $names = [System.Collections.Generic.List[string]]::new($File.Count)
     foreach ($f in $File) {
-        $ticks = $f.LastWriteTimeUtc.Ticks
-        # Inline rather than ConvertTo-NameKey: this loop runs once per file. The dictionary
-        # in Group-ByKey ignores case; only Unicode normalisation is needed here.
+        # Inline rather than ConvertTo-NameKey: this loop runs once per file.
         $name = $f.Name
         try { if (-not $name.IsNormalized()) { $name = $name.Normalize() } }
         catch [System.ArgumentException] { Write-Debug "Cannot normalise '$name'; comparing it as it is." }
-        $keys.Add([string] ($ticks - ($ticks % $ticksPerSecond)) + '|' + $name)
+        $names.Add($name)
     }
-    $nameDateGroups = @(Group-ByKey -InputItems $File -Key $keys.ToArray())
+    $nameGroups = @(Group-ByKey -InputItems $File -Key $names.ToArray())
 
-    # Stage 2: size. A cheap check that avoids hashing files that cannot match.
-    # (Not $group.Length: on an array that is the array's own length.)
-    $candidateGroups = @(foreach ($group in $nameDateGroups) {
-            $sizes = [string[]] @(foreach ($f in $group) { $f.Length })
-            Group-ByKey -InputItems $group -Key $sizes
+    # Stage 2: saved date (UTC, whole second: copies made to network shares or other file
+    # systems often lose sub-second precision) and size, a cheap check that avoids hashing
+    # files that cannot match. Both keys are digits, so '|' is a safe separator.
+    $minimumSize = 0
+    if ($IgnoreEmptyFiles) { $minimumSize = 1 }
+    $ticksPerSecond = [System.TimeSpan]::TicksPerSecond
+    $candidateGroups = @(foreach ($group in $nameGroups) {
+            $kept = [System.Collections.Generic.List[object]]::new()
+            $keys = [System.Collections.Generic.List[string]]::new()
+            foreach ($f in $group) {
+                # Getter methods, not properties: PowerShell turns a failing property into $null.
+                try { $size = $f.get_Length(); $ticks = $f.get_LastWriteTimeUtc().Ticks }
+                catch {
+                    Write-Warning "Skipping '$($f.FullName)': $(Get-InnermostMessage $_.Exception)"  # gone or unreadable since the scan
+                    continue
+                }
+                if ($size -lt $minimumSize) { continue }
+                $kept.Add($f)
+                $keys.Add([string] ($ticks - ($ticks % $ticksPerSecond)) + '|' + $size)
+            }
+            Group-ByKey -InputItems $kept.ToArray() -Key $keys.ToArray()
         })
 
     if ($SkipCloudOnly) {
@@ -530,11 +678,18 @@ function Find-DuplicateFile {
 }
 
 function Get-SortedFolder {
-    # Folder paths in case-insensitive order (see Compare-IgnoringCase).
+    # Folder paths in case-insensitive order (see Compare-IgnoringCase), paths differing only
+    # in case in a fixed order: $script:ByPathIgnoringCase's order. Sorted on precomputed keys
+    # compared ordinally (upper case, a separator that sorts first, then the path as it is):
+    # a script block comparer would be slow for files with thousands of copies.
     param([Parameter(Mandatory)] [string[]] $Path)
-    $sorted = [System.Collections.Generic.List[string]]::new($Path)
-    $sorted.Sort($script:ByPathIgnoringCase)
-    , $sorted.ToArray()
+    $sorted = [string[]] $Path.Clone()
+    if ($sorted.Count -gt 1) {
+        $separator = [string] [char] 0
+        $keys = [string[]] @(foreach ($p in $sorted) { $p.ToUpperInvariant() + $separator + $p })
+        [System.Array]::Sort([System.Array] $keys, [System.Array] $sorted, [System.Collections.IComparer] [System.StringComparer]::Ordinal)
+    }
+    , $sorted
 }
 
 #endregion
@@ -569,19 +724,30 @@ function Get-FolderTree {
         $filesIn[$record.Path]  = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
         if (-not $record.Readable) { $null = $unreadable.Add($record.Path) }
     }
+    foreach ($f in $File) {
+        if (-not $filesIn.ContainsKey($f.DirectoryName)) { continue }
+        # Size and saved date are read here for every file; a file gone or unreadable since
+        # the scan leaves its folder's contents unknown.
+        # (A getter method, not the property: PowerShell turns a failing property into $null.
+        # Reading the size fails for a missing file and loads the saved date with it.)
+        try { $null = $f.get_Length() }
+        catch {
+            Write-Warning "Skipping '$($f.FullName)': $(Get-InnermostMessage $_.Exception)"
+            $null = $unreadable.Add($f.DirectoryName)
+            continue
+        }
+        $filesIn[$f.DirectoryName].Add($f)
+    }
     foreach ($path in @($children.Keys)) {
         if (-not $unreadable.Contains($path)) { $null = $readable.Add($path) }
         $parent = [System.IO.Path]::GetDirectoryName($path)
         if ($parent -and $children.ContainsKey($parent)) { $children[$parent].Add($path) }
     }
-    foreach ($f in $File) {
-        if ($filesIn.ContainsKey($f.DirectoryName)) { $filesIn[$f.DirectoryName].Add($f) }
-    }
 
     # Deepest first: a sub folder's path is always longer than its parent's.
     $order = [string[]] @($children.Keys)
     $lengths = [int[]] @($order | ForEach-Object { - $_.Length })
-    [System.Array]::Sort($lengths, $order, [System.Collections.Comparer]::DefaultInvariant)
+    [System.Array]::Sort([System.Array] $lengths, [System.Array] $order, [System.Collections.IComparer] [System.Collections.Comparer]::DefaultInvariant)
 
     [pscustomobject] @{ Children = $children; Files = $filesIn; Readable = $readable; DeepestFirst = $order }
 }
@@ -634,7 +800,7 @@ function Get-FolderSignature {
             if (-not $complete) { continue }
 
             $sorted = $lines.ToArray()
-            [System.Array]::Sort($sorted, [System.StringComparer]::Ordinal)
+            [System.Array]::Sort([System.Array] $sorted, [System.Collections.IComparer] [System.StringComparer]::Ordinal)
             $bytes = [System.Text.Encoding]::UTF8.GetBytes(($sorted -join "`n"))
             $info.Signature = [System.BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '')
         }
@@ -1524,12 +1690,12 @@ function Test-DuplicateFolderCopy {
         if (-not [System.IO.Directory]::Exists($Path)) { return 'Missing' }
         $folders = [System.Collections.Generic.List[object]]::new()
         $files = @(Get-FileInventory -Path $Path -FolderInfo $folders -Verbose:$false -WarningAction SilentlyContinue)
+        if (@($folders | Where-Object { -not $_.Readable }).Count -gt 0) { return 'Unavailable' }
+        $size = [long] 0
+        foreach ($f in $files) { $size += $f.get_Length() }  # a file gone since the listing throws here
     }
     catch { return 'Unavailable' }
 
-    if (@($folders | Where-Object { -not $_.Readable }).Count -gt 0) { return 'Unavailable' }
-    $size = [long] 0
-    foreach ($f in $files) { $size += $f.Length }
     if ($files.Count -ne $FileCount -or $folders.Count - 1 -ne $FolderCount -or $size -ne $SizeBytes) { return 'Changed' }
     'Present'
 }

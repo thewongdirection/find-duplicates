@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from find_duplicates import cli, folders, matcher, scanner, validate  # noqa: E402
 from find_duplicates.folders import DuplicateFolderSet, find_duplicate_folders  # noqa: E402
 from find_duplicates.matcher import find_duplicate_files  # noqa: E402
-from find_duplicates.scanner import FolderRecord, iter_files  # noqa: E402
+from find_duplicates.scanner import FileRecord, FolderRecord, iter_files  # noqa: E402
 from find_duplicates.validate import validate_report  # noqa: E402
 from find_duplicates.xlsx import (  # noqa: E402
     export_duplicate_report, read_duplicate_folder_report, read_duplicate_report,
@@ -138,6 +138,21 @@ class FindDuplicateFoldersTests(TempRootTestCase):
         except (OSError, NotImplementedError) as exc:
             self.skipTest(f"symbolic links cannot be created here: {exc}")
         self.assertEqual([r.folder_name for r in self.find()], ["sub"])
+
+    def test_does_not_report_a_folder_whose_file_has_gone_since_the_scan(self):
+        add_photo_folder(self.root, "one/Photos")
+        add_photo_folder(self.root, "two/Photos")
+        files, records = folder_scan(self.root)
+        gone = self.path("two/Photos/a.jpg")
+        # A record that reads nothing up front, as the scan's do on Linux and macOS.
+        files = [FileRecord(f.path, f.name, f.folder) if f.path == gone else f for f in files]
+        os.remove(gone)
+
+        with self.assertLogs("find_duplicates", "WARNING") as logs:
+            result = find_duplicate_folders(files, records)
+
+        self.assertIn(gone, "\n".join(logs.output))
+        self.assertEqual([r.folder_name for r in result], ["sub"], "the two sub folders are still identical")
 
     def test_does_not_read_files_again_that_the_file_scan_already_hashed(self):
         add_photo_folder(self.root, "one/Photos")

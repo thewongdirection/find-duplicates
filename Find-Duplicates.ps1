@@ -55,8 +55,9 @@
     files are then not reported.
 
 .PARAMETER ThrottleLimit
-    How many files to hash at the same time (1-64, default 1). Try 4-8 for SSDs,
-    network shares and cloud folders; keep 1 for a single spinning hard disk.
+    How many files to hash, and folders to list, at the same time (1-64, default 1).
+    Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning
+    hard disk.
 
 .PARAMETER IgnoreEmptyFiles
     Leave files of 0 bytes out of the duplicate files (they all have the same
@@ -170,7 +171,7 @@ if (Test-Path -LiteralPath $reportFolder -PathType Container) {
 Write-Host "Scanning '$scanRoot' ..."
 $folderInfo = $null  # (not "= if ...": an empty list would be unrolled into $null)
 if ($IncludeFolders) { $folderInfo = [System.Collections.Generic.List[object]]::new() }
-$files = @(Get-FileInventory -Path $scanRoot -ExcludeFile $reportPath -FolderInfo $folderInfo @verbose)
+$files = @(Get-FileInventory -Path $scanRoot -ExcludeFile $reportPath -FolderInfo $folderInfo -ThrottleLimit $ThrottleLimit @verbose)
 Write-Host "Found $($files.Count) files. Checking for duplicates ..."
 
 # Hashes are shared so that folder matching never reads a file twice.

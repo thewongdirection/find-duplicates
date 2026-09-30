@@ -162,16 +162,13 @@ def check_folder_copy(
             files = list(iter_files(path, folders=folders))
         finally:
             log.disabled = previous
+        if not all(f.readable for f in folders):
+            return UNAVAILABLE
+        total_size = sum(f.size for f in files)
     except OSError:
         return UNAVAILABLE
 
-    if not all(f.readable for f in folders):
-        return UNAVAILABLE
-    same = (
-        len(files) == file_count
-        and len(folders) - 1 == folder_count
-        and sum(f.size for f in files) == size_bytes
-    )
+    same = len(files) == file_count and len(folders) - 1 == folder_count and total_size == size_bytes
     return PRESENT if same else CHANGED
 
 

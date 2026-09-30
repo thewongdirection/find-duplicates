@@ -59,14 +59,23 @@ def _folder_tree(files: Sequence[FileRecord], folders: Sequence[FolderRecord]) -
     # A folder may be recorded more than once; recorded as not readable anywhere (an
     # excluded file, a skipped link) means not readable.
     unreadable = {record.path for record in folders if not record.readable}
+    for record in files:
+        if record.folder not in tree.files:
+            continue
+        # Size and saved date are read here for every file; a file gone or unreadable since
+        # the scan leaves its folder's contents unknown.
+        try:
+            record.size, record.mtime_ns
+        except OSError as exc:
+            log.warning("Skipping '%s': %s", record.path, exc.strerror or exc)
+            unreadable.add(record.folder)
+            continue
+        tree.files[record.folder].append(record)
     tree.readable = {path for path in tree.children if path not in unreadable}
     for path in list(tree.children):
         parent = os.path.dirname(path)
         if parent != path and parent in tree.children:
             tree.children[parent].append(path)
-    for record in files:
-        if record.folder in tree.files:
-            tree.files[record.folder].append(record)
     # Deepest first: a sub folder's path is always longer than its parent's.
     tree.deepest_first = sorted(tree.children, key=len, reverse=True)
     return tree

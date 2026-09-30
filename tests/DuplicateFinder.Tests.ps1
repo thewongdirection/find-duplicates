@@ -150,6 +150,29 @@ Describe 'Get-FileInventory' {
             Where-Object { $_ -is [System.Management.Automation.VerboseRecord] }
         $verbose.Message | Should -Contain "Scanning $(Join-Path $root 'sub')"
     }
+
+    It 'lists several folders at a time and returns the same files in the same order' {
+        $root = Add-TestRoot
+        foreach ($path in 'b/x.txt', 'a/y.txt', 'a/deep/er/z.txt', 'c/w.txt', 'a/b.txt', 'top.txt') { $null = Add-TestFile $root $path }
+        $null = New-Item -ItemType Directory -Path (Join-Path $root 'a/empty')
+        $link = Join-Path $root 'a/loop'
+        $linked = $true
+        try { $null = New-Item -ItemType SymbolicLink -Path $link -Target $root -ErrorAction Stop }
+        catch { $linked = $false }  # the rest is still worth checking
+
+        try {
+            $one = [System.Collections.Generic.List[object]]::new()
+            $many = [System.Collections.Generic.List[object]]::new()
+            $sequential = @(Get-FileInventory -Path $root -FolderInfo $one)
+            $parallel = @(Get-FileInventory -Path $root -FolderInfo $many -ThrottleLimit 4)
+
+            $parallel.FullName | Should -Be $sequential.FullName
+            @($many | ForEach-Object { "$($_.Path)|$($_.Readable)" }) | Should -Be @($one | ForEach-Object { "$($_.Path)|$($_.Readable)" })
+        }
+        finally {
+            if ($linked) { [System.IO.Directory]::Delete($link) }  # the link only; Pester's cleanup would loop
+        }
+    }
 }
 
 Describe 'Folder and cloud file detection' {
@@ -309,6 +332,29 @@ Describe 'Find-DuplicateFile' {
 
     It 'returns nothing for an empty list' {
         @(Find-DuplicateFile -File @()).Count | Should -Be 0
+    }
+
+    It 'never reads the size or saved date of a file whose name no other file has' {
+        $root = Add-TestRoot
+        $files = @(Add-TestFile $root 'a/x.txt'; Add-TestFile $root 'b/x.txt')
+        # Never created: reading its size or saved date would fail with a warning.
+        $unique = [System.IO.FileInfo] (Join-Path $root 'c/unique.txt')
+
+        $result = @(Find-DuplicateFile -File ($files + $unique) -WarningVariable warnings -WarningAction SilentlyContinue)
+
+        @($warnings).Count | Should -Be 0
+        $result.Count | Should -Be 1
+    }
+
+    It 'skips a file that has gone since the scan, with a warning' {
+        $root = Add-TestRoot
+        $files = @(Add-TestFile $root 'a/x.txt'; Add-TestFile $root 'b/x.txt')
+        $gone = [System.IO.FileInfo] (Join-Path $root 'c/x.txt')  # listed by the scan, deleted before it was compared
+
+        $result = @(Find-DuplicateFile -File ($files + $gone) -WarningVariable warnings -WarningAction SilentlyContinue)
+
+        "$warnings" | Should -BeLike "Skipping '$($gone.FullName)'*"
+        $result[0].Count | Should -Be 2
     }
 
     Context 'MD5 is only calculated when name and saved date already match' {
@@ -1055,6 +1101,22 @@ Describe 'Find-DuplicateFolder' {
 
         try { (Find-InTree $root).FolderName | Should -Be @('sub') }
         finally { [System.IO.Directory]::Delete($link) }
+    }
+
+    It 'does not report a folder whose file has gone since the scan' {
+        $root = Add-TestRoot
+        Add-PhotoFolder $root 'one/Photos'
+        Add-PhotoFolder $root 'two/Photos'
+        $scan = Get-FolderScan $root
+        $gone = Join-Path $root 'two/Photos/a.jpg'
+        # A fresh FileInfo reads nothing up front, as the scan's do on Linux and macOS.
+        $files = @(foreach ($f in $scan.Files) { if ($f.FullName -eq $gone) { [System.IO.FileInfo] $gone } else { $f } })
+        Remove-Item -LiteralPath $gone
+
+        $result = @(Find-DuplicateFolder -File $files -Folder $scan.Folders -WarningVariable warnings -WarningAction SilentlyContinue)
+
+        "$warnings" | Should -BeLike "*$gone*"
+        $result.FolderName | Should -Be @('sub') -Because 'the two sub folders are still identical'
     }
 
     It 'does not read files again that the file scan already hashed' {

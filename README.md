@@ -27,7 +27,7 @@ The tool comes in two versions with the same features and the same output: a
 | Recursive scan | Scans a folder and every sub folder; shows the folder currently being scanned. |
 | Strict duplicate rule | Name **and** saved date **and** MD5 must all match. |
 | Fast by design | MD5 is only calculated for files whose name, saved date and size already match another file. Everything else is never read. |
-| Parallel hashing | `-ThrottleLimit N` hashes up to N files at the same time (1-64). |
+| Parallel scanning and hashing | `-ThrottleLimit N` lists up to N folders and hashes up to N files at the same time (1-64). |
 | Every copy recorded | One row per duplicated file, one column per copy, with the full folder path of each. |
 | Duplicate folders | `-IncludeFolders` also finds whole folders with the same name and identical contents (every file and sub folder), on a second sheet. |
 | Excel output without Excel | Writes a real `.xlsx`: data sheets with a frozen, filterable header and real dates, plus a *Rules* sheet stating in plain words what counts as a match. Excel does not need to be installed. |
@@ -122,7 +122,7 @@ If Windows blocks the script, run it as
 |---|---|---|
 | `-Path <folder>` | current folder | Folder to scan, including all sub folders. Also the first positional argument. |
 | `-OutputFile <report>` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced. Also the second positional argument. |
-| `-ThrottleLimit <1-64>` | `1` | How many files to hash at the same time. See [Performance](#performance). |
+| `-ThrottleLimit <1-64>` | `1` | How many files to hash, and folders to list, at the same time. See [Performance](#performance). |
 | `-IncludeFolders` | off | Also find [duplicate folders](#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
 | `-IgnoreEmptyFiles` | off | Leave files of 0 bytes out of the duplicate files. |
 | `-SkipCloudOnly` | off | Never download online-only cloud files to hash them. Duplicates among such files are then not reported. |
@@ -300,14 +300,15 @@ around reading as little as possible, and these options help further:
 
 | What | Effect | When to use it |
 |---|---|---|
-| Built-in pre-filter | Files that differ in name, saved date or size are never read. | Always on. |
-| `-ThrottleLimit 4` to `8` | Hashes several files at once, hiding per-file latency. Often 2-4x faster. | SSDs, network shares, cloud folders. Keep `1` for a single spinning hard disk, where parallel reads cause seeking. |
+| Built-in pre-filter | Files that differ in name, saved date or size are never read. The size and saved date of a file whose name no other file has are never even looked up (on Linux, macOS and network drives each lookup is a request). | Always on. |
+| `-ThrottleLimit 4` to `8` | Lists several folders and hashes several files at once, hiding per-request latency. Often 2-4x faster, more on slow networks. | SSDs, network shares, cloud folders. Keep `1` for a single spinning hard disk, where parallel reads cause seeking. |
 | `-Validate` instead of a rescan | Checks only the files already in the report, without reading them. | After deleting or moving duplicates. |
 | `-SkipCloudOnly` | Avoids downloading online-only files. | Large cloud libraries on a slow connection. |
 | Run it on the file server | Local disk reads instead of network transfers. | Very large network shares. |
 | Scan the narrowest folder | Fewer files to list. | Always worthwhile. |
 
-Also built in: large read buffers with sequential-read hints; plain loops
+Also built in: each folder is listed once; large reads with sequential-read
+hints, into a buffer no larger than the file; plain loops
 instead of per-file script blocks when grouping and sorting; a progress display
 redrawn a few times a second rather than per file; parallel hashing through a
 fixed set of workers rather than a new job per file (which matters when there

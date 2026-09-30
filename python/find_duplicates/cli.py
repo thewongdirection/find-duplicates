@@ -129,8 +129,8 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         type=_throttle_limit,
         default=1,
         metavar="N",
-        help="How many files to hash at the same time (1-64, default 1). Try 4-8 for SSDs, "
-        "network shares and cloud folders; keep 1 for a single spinning hard disk.",
+        help="How many files to hash, and folders to list, at the same time (1-64, default 1). Try 4-8 "
+        "for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk.",
     )
     parser.add_argument(
         "--ignore-empty-files",
@@ -221,6 +221,7 @@ def _scan(
             exclude=[report],
             on_folder=lambda path, folders, found: progress.show(f"Folders: {folders}  Files: {found}  {path}"),
             folders=folder_records,
+            throttle_limit=throttle_limit,
         )
     )
     progress.clear()
