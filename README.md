@@ -11,11 +11,13 @@ The tool comes in two versions with the same features and the same output: a
 ## Contents
 
 - [Capabilities](#capabilities)
+- [Deployment](#deployment)
 - [What counts as a duplicate](#what-counts-as-a-duplicate)
 - [Duplicate folders](#duplicate-folders)
 - [Command reference](#command-reference)
 - [The report](#the-report)
 - [Network folders and cloud drives](#network-folders-and-cloud-drives)
+- [Limits and edge cases](#limits-and-edge-cases)
 - [Performance](#performance)
 - [Using the functions directly](#using-the-functions-directly)
 - [Running the tests](#running-the-tests)
@@ -40,6 +42,101 @@ The tool comes in two versions with the same features and the same output: a
 | Safe on any tree | Symbolic links and junctions are not followed (no loops); unreadable folders and files are warnings, not failures. |
 | Preview | `-WhatIf` shows what would be saved or removed without touching the report. |
 | No dependencies | PowerShell: Windows PowerShell 5.1 or PowerShell 7+ on Windows, Linux or macOS. Python: 3.9+, standard library only. No internet access needed. |
+
+## Deployment
+
+There is nothing to install beyond a PowerShell or Python that most computers
+already have, and nothing runs as a service. Use either version; both write the
+same report.
+
+Get the files with `git clone https://github.com/thewongdirection/find-duplicates.git`
+or, on GitHub, *Code* > *Download ZIP*.
+
+### PowerShell version
+
+**Needs:** Windows PowerShell 5.1 (part of Windows 10 and 11) or PowerShell 7+
+on Windows, Linux or macOS. No Excel, no modules, no internet access.
+
+**Copy these three files, keeping the folder layout:**
+
+```text
+Find-Duplicates.ps1
+src/DuplicateFinder.psm1
+src/DuplicateFinder.cs
+```
+
+The script loads the module from its `src` folder, and the module compiles
+`DuplicateFinder.cs` (its fast per-file code) the first time it is loaded in a
+PowerShell session, which takes about half a second.
+
+**On Windows:**
+
+- **Blocked script.** Files downloaded from the internet are marked as such, and
+  Windows may refuse to run them. Unblock them once:
+
+  ```powershell
+  Get-ChildItem -Recurse -File .\find-duplicates | Unblock-File
+  ```
+
+  or start the script with the policy relaxed for that run only:
+  `powershell -ExecutionPolicy Bypass -File .\Find-Duplicates.ps1 D:\Photos`.
+- **`AllSigned` policy.** Where only signed scripts may run, sign
+  `Find-Duplicates.ps1` and `src/DuplicateFinder.psm1` with your organisation's
+  code-signing certificate (`Set-AuthenticodeSignature`).
+- **Locked-down computers.** Where AppLocker or Windows Defender Application
+  Control puts PowerShell in Constrained Language Mode, the module cannot
+  compile its helpers and will not load; use the Python version there.
+- **Temp folder.** Windows PowerShell 5.1 compiles in `%TEMP%`, which must be
+  writable.
+
+**Check it works:** `.\Find-Duplicates.ps1 -Path . -WhatIf` scans the current
+folder and prints the totals without writing a report.
+
+### Python version
+
+**Needs:** Python 3.9 or later, standard library only. See
+[python/README.md](python/README.md) for its options.
+
+- **Without installing:** copy the `python/find_duplicates` folder and run
+  `python -m find_duplicates D:\Photos` from the folder that contains it.
+- **Installed:** from the repository root, `pip install ./python` adds a
+  `find-duplicates` command; `pip uninstall find-duplicates` removes it. (pip
+  fetches `setuptools` to build it; offline, copy the folder instead.)
+
+### Access it needs
+
+- **Read** access to every folder to scan (folders it cannot read are skipped
+  with a warning), and **write** access to the folder of the report.
+- **Network shares:** a UNC path (`\\server\share`) or a mapped drive, reachable
+  with the account that runs the tool.
+- **Cloud drives** (OneDrive, Google Drive, Dropbox ...): the provider's sync
+  client. Add `-SkipCloudOnly` (`--skip-cloud-only`) to avoid downloading
+  online-only files.
+- **The report** opens in Excel, LibreOffice Calc or Google Sheets; none is
+  needed to create it.
+
+### Running it on a schedule
+
+A scheduled scan reuses the previous report's hashes, so it only reads files
+that are new or changed. On Windows, with Task Scheduler:
+
+```powershell
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\Tools\find-duplicates\Find-Duplicates.ps1 -Path D:\Photos -OutputFile D:\Reports\photos.xlsx'
+Register-ScheduledTask -TaskName 'Find duplicate photos' -Action $action `
+    -Trigger (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 3am)
+```
+
+On Linux or macOS, with cron (`crontab -e`):
+
+```text
+0 3 * * 0  cd /opt/find-duplicates/python && python3 -m find_duplicates /srv/photos /srv/reports/photos.xlsx
+```
+
+### Updating
+
+Replace the files with the new version. Reports written by earlier versions are
+still read, validated and reused.
 
 ## What counts as a duplicate
 
