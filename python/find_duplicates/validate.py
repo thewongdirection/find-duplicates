@@ -276,7 +276,11 @@ def _file_copy_states(
 
 
 def _folder_copy_states(
-    rows: Sequence[DuplicateFolderSet], throttle_limit: int, root_cache: RootCache, on_progress: Optional[ProgressCallback]
+    rows: Sequence[DuplicateFolderSet],
+    throttle_limit: int,
+    root_cache: RootCache,
+    on_progress: Optional[ProgressCallback],
+    exclude_names: Sequence[str] = (),
 ) -> Dict[CopyKey, str]:
     """Check every copy of every folder row with check_folder_copy, ``throttle_limit`` at a
     time; returns (row number, folder) -> state. Copies on a drive or share that cannot be
@@ -292,7 +296,7 @@ def _folder_copy_states(
 
     def work(job: Tuple[CopyKey, DuplicateFolderSet]) -> Tuple[CopyKey, str]:
         key, row = job
-        return key, check_folder_copy(key[1], row.file_count, row.folder_count, row.size_bytes)
+        return key, check_folder_copy(key[1], row.file_count, row.folder_count, row.size_bytes, exclude_names=exclude_names)
 
     states.update(_run_all(jobs, work, throttle_limit, on_progress, lambda job: job[0][1]))
     return states
@@ -364,12 +368,18 @@ log.addFilter(lambda record: not getattr(_silence, "active", False))
 
 
 def check_folder_copy(
-    path: str, file_count: int, folder_count: int, size_bytes: int, root_cache: Optional[RootCache] = None
+    path: str,
+    file_count: int,
+    folder_count: int,
+    size_bytes: int,
+    root_cache: Optional[RootCache] = None,
+    exclude_names: Sequence[str] = (),
 ) -> str:
     """Check one recorded folder copy by listing its tree again (no file contents are read).
 
     PRESENT when it still has the same number of files and sub folders and the same
     total size; UNAVAILABLE when its drive or share, or part of the tree, cannot be read.
+    Files and folders whose names match ``exclude_names`` (the scan's --exclude) are left out.
     """
     try:
         if not root_reachable(path, root_cache):
@@ -378,7 +388,7 @@ def check_folder_copy(
             return MISSING
         folders: List[FolderRecord] = []
         with _silenced():  # the listing's own warnings are summed up as UNAVAILABLE below
-            files = list(iter_files(path, folders=folders))
+            files = list(iter_files(path, folders=folders, exclude_names=exclude_names))
         if not all(f.readable for f in folders):
             return UNAVAILABLE
         total_size = sum(f.size for f in files)
@@ -465,7 +475,9 @@ def validate_report(
     changed = files.removed or files.rows_removed
 
     if workbook.folders is not None:
-        folder_states = _folder_copy_states(workbook.folders, throttle_limit, root_cache, on_progress)
+        folder_states = _folder_copy_states(
+            workbook.folders, throttle_limit, root_cache, on_progress, workbook.settings.exclude_names
+        )
         folders = _check_rows(
             workbook.folders, folder_states, lambda row: row.folder_name, noun="folder ", location_is_item=True
         )
@@ -479,6 +491,6 @@ def validate_report(
         changed = changed or folders.removed or folders.rows_removed
 
     if changed and not dry_run:
-        export_duplicate_report(result.duplicates, path, result.duplicate_folders)
+        export_duplicate_report(result.duplicates, path, result.duplicate_folders, workbook.settings)
         result.saved = True
     return result

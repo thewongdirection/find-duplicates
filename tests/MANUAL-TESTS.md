@@ -24,6 +24,9 @@ Needs a second computer or a NAS sharing a folder that holds some duplicates.
    timeout for the share, not one per file.
 5. **Validate with the share back.** Reconnect and validate again: copies that
    are still there are kept, deleted ones are removed.
+6. **Several at a time by default.** Scan the share without `-ThrottleLimit` /
+   `-j`. The tool says it works on 4 folders and files at a time; with
+   `-ThrottleLimit 1` it does not, and is slower.
 
 ## OneDrive (Files On-Demand) and other cloud drives
 
@@ -64,6 +67,11 @@ Needs Excel on Windows or macOS.
    file is in use (close Excel and run it again).
 5. **Unicode.** A report of files named in Japanese, Arabic and with emoji shows
    those names correctly.
+6. **Edited scan settings.** Scan with `-Exclude Thumbs.db -MinimumSize 1KB`
+   and `-IncludeFolders`, open the report in Excel, add a pattern in a new cell
+   of the *Names left out* row on the *Rules* sheet and type `abc` as the
+   smallest size, and save. `-Validate` warns that it ignores the size, leaves
+   out the added names too, and keeps the names row when it rewrites the report.
 
 ## Very long paths on Windows PowerShell 5.1
 

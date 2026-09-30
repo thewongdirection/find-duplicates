@@ -10,6 +10,7 @@ from .scanner import FileRecord, FolderRecord, is_cloud_only, is_folder_link, it
 from .validate import ValidationResult, check_copy, check_folder_copy, previous_md5, validate_report
 from .xlsx import (
     DuplicateWorkbook,
+    ScanSettings,
     column_name,
     export_duplicate_report,
     read_duplicate_folder_report,
@@ -23,6 +24,7 @@ __all__ = [
     "DuplicateWorkbook",
     "FileRecord",
     "FolderRecord",
+    "ScanSettings",
     "ValidationResult",
     "check_copy",
     "check_folder_copy",

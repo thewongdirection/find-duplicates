@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -36,6 +37,11 @@ MAX_THROTTLE_LIMIT = 64
 # Local files at least this large are worth hashing on a thread (hashlib releases Python's
 # global lock while hashing them); smaller local files are faster hashed one at a time.
 PARALLEL_HASH_MIN_BYTES = 1024 * 1024
+# Large candidates are first compared by the MD5 of their start (see _split_by_first_bytes):
+# files that share a name, saved date and size but not their contents are then rarely read
+# in full. Only for files this large, so that true duplicates cost at most 1/16 more reading.
+FIRST_BYTES_TO_HASH = 1024 * 1024
+FIRST_BYTES_MIN_SIZE = 16 * 1024 * 1024
 
 T = TypeVar("T")
 
@@ -58,25 +64,28 @@ class DuplicateSet:
     utc_offset: Optional[timedelta] = None
 
 
-def md5_file(path: str) -> str:
-    """MD5 of a file's contents as upper-case hex (the Get-FileHash format)."""
+def md5_file(path: str, limit: int = 0) -> str:
+    """MD5 of a file's contents as upper-case hex (the Get-FileHash format); with
+    ``limit`` above 0, of its first ``limit`` bytes only."""
     digest = hashlib.md5(usedforsecurity=False)  # noqa: S324 - part of the duplicate definition
+    remaining = limit if limit > 0 else sys.maxsize
     with open(path, "rb", buffering=0) as stream:
         # Chunks of up to 1 MB into a buffer no larger than the file: small files, the most
         # common, cost no large allocation.
-        buffer = memoryview(bytearray(max(1, min(HASH_CHUNK_BYTES, os.fstat(stream.fileno()).st_size))))
-        while True:
-            read = stream.readinto(buffer)
+        buffer = memoryview(bytearray(max(1, min(HASH_CHUNK_BYTES, os.fstat(stream.fileno()).st_size, remaining))))
+        while remaining > 0:
+            read = stream.readinto(buffer[:min(len(buffer), remaining)])
             if not read:
                 break
             digest.update(buffer[:read])
+            remaining -= read
     return digest.hexdigest().upper()
 
 
-def _hash_or_none(path: str) -> Optional[str]:
+def _hash_or_none(path: str, limit: int = 0) -> Optional[str]:
     # Looks md5_file up at call time so tests can replace it.
     try:
-        return md5_file(path)
+        return md5_file(path, limit) if limit else md5_file(path)
     except OSError as exc:
         log.warning("Could not hash '%s': %s", path, exc.strerror or exc)
         return None
@@ -88,6 +97,7 @@ def md5_map(
     on_hash: Optional[HashCallback] = None,
     cache: Optional[Dict[str, str]] = None,
     sizes: Optional[Dict[str, int]] = None,
+    first_bytes: bool = False,
 ) -> Dict[str, str]:
     """Hash files, up to ``throttle_limit`` at a time, returning full path -> MD5.
 
@@ -96,15 +106,18 @@ def md5_map(
     added to it. Only files on a network drive, or of at least
     PARALLEL_HASH_MIN_BYTES by ``sizes`` (all files when ``sizes`` is not given), are
     hashed on threads; the rest are hashed one at a time meanwhile, which is faster.
+    With ``first_bytes``, only the first FIRST_BYTES_TO_HASH bytes of each file are
+    hashed (and ``cache``, which holds whole-file hashes, must not be given).
     """
     if not MIN_THROTTLE_LIMIT <= throttle_limit <= MAX_THROTTLE_LIMIT:
         raise ValueError(f"throttle_limit must be {MIN_THROTTLE_LIMIT}-{MAX_THROTTLE_LIMIT}, not {throttle_limit}.")
+    limit = FIRST_BYTES_TO_HASH if first_bytes else 0
 
     if cache is not None:
-        hashed = _md5_map([p for p in paths if p not in cache], throttle_limit, on_hash, sizes)
+        hashed = _md5_map([p for p in paths if p not in cache], throttle_limit, on_hash, sizes, limit)
         cache.update(hashed)
         return {p: cache[p] for p in paths if p in cache}
-    return _md5_map(paths, throttle_limit, on_hash, sizes)
+    return _md5_map(paths, throttle_limit, on_hash, sizes, limit)
 
 
 def _worth_a_thread(path: str, sizes: Optional[Dict[str, int]]) -> bool:
@@ -113,7 +126,11 @@ def _worth_a_thread(path: str, sizes: Optional[Dict[str, int]]) -> bool:
 
 
 def _md5_map(
-    paths: Sequence[str], throttle_limit: int, on_hash: Optional[HashCallback], sizes: Optional[Dict[str, int]]
+    paths: Sequence[str],
+    throttle_limit: int,
+    on_hash: Optional[HashCallback],
+    sizes: Optional[Dict[str, int]],
+    limit: int = 0,
 ) -> Dict[str, str]:
     result: Dict[str, str] = {}
 
@@ -126,7 +143,7 @@ def _md5_map(
     threaded = [p for p in paths if _worth_a_thread(p, sizes)] if throttle_limit > 1 else []
     if not threaded:
         for done, path in enumerate(paths, start=1):
-            record(done, path, _hash_or_none(path))
+            record(done, path, _hash_or_none(path, limit))
         return result
 
     # hashlib releases the GIL while hashing, so threads hash large or remote files in
@@ -134,15 +151,42 @@ def _md5_map(
     in_thread = set(threaded)
     done = 0
     with ThreadPoolExecutor(max_workers=throttle_limit) as pool:
-        futures = [(path, pool.submit(_hash_or_none, path)) for path in threaded]
+        futures = [(path, pool.submit(_hash_or_none, path, limit)) for path in threaded]
         for path in paths:
             if path not in in_thread:
                 done += 1
-                record(done, path, _hash_or_none(path))
+                record(done, path, _hash_or_none(path, limit))
         for path, future in futures:
             done += 1
             record(done, path, future.result())
     return result
+
+
+def _split_by_first_bytes(
+    groups: List[List[FileRecord]],
+    throttle_limit: int,
+    on_hash: Optional[HashCallback],
+    md5_cache: Optional[Dict[str, str]],
+) -> List[List[FileRecord]]:
+    """Split each group of files of FIRST_BYTES_MIN_SIZE or more by the MD5 of their first
+    FIRST_BYTES_TO_HASH bytes, keeping the groups that still hold more than one file. Other
+    groups, and groups a file of which already has its whole-file MD5 in ``md5_cache``
+    (from a previous report), are kept as they are (as Split-ByFirstBytes in PowerShell)."""
+    kept, large = [], []
+    for group in groups:
+        is_large = group[0].size >= FIRST_BYTES_MIN_SIZE  # the files share their size (stage 2)
+        if is_large and md5_cache is not None and any(r.path in md5_cache for r in group):
+            is_large = False
+        (large if is_large else kept).append(group)
+    if not large:
+        return kept
+
+    paths = [r.path for group in large for r in group]
+    starts = md5_map(paths, throttle_limit, on_hash, sizes={p: FIRST_BYTES_MIN_SIZE for p in paths}, first_bytes=True)
+    for group in large:
+        read = [(r, starts[r.path]) for r in group if r.path in starts]
+        kept.extend([r for r, _ in same] for same in groups_of_many(read, lambda pair: pair[1]))
+    return kept
 
 
 def _saved_date_key(record: FileRecord) -> int:
@@ -164,6 +208,7 @@ def find_duplicate_files(
     throttle_limit: int = 1,
     md5_cache: Optional[Dict[str, str]] = None,
     ignore_empty_files: bool = False,
+    minimum_size: int = 0,
 ) -> List[DuplicateSet]:
     """Find sets of files whose name, saved date and MD5 hash all match.
 
@@ -171,8 +216,11 @@ def find_duplicate_files(
     would download them); duplicates among such files are then not reported.
     ``throttle_limit`` is how many files to hash at the same time (1-64).
     ``md5_cache`` is shared with find_duplicate_folders so no file is read twice.
-    ``ignore_empty_files`` leaves files of 0 bytes out (they all share one MD5).
+    ``ignore_empty_files`` leaves files of 0 bytes out (they all share one MD5), and
+    ``minimum_size`` files smaller than that many bytes.
     """
+    if minimum_size < 0:
+        raise ValueError(f"minimum_size cannot be negative, not {minimum_size}.")
     # Stage 1: name. Grouped first, so the size and saved date of a file whose name no other
     # file has are never read: on Linux, macOS and network drives each is a request per file.
     name_groups = groups_of_many(files, lambda f: name_key(f.name))
@@ -180,7 +228,8 @@ def find_duplicate_files(
     # Stage 2: saved date (whole second: copies made to network shares or other file systems
     # often lose sub-second precision) and size, a cheap check that avoids hashing files that
     # cannot match.
-    minimum_size = 1 if ignore_empty_files else 0
+    if ignore_empty_files:
+        minimum_size = max(minimum_size, 1)
     candidate_groups: List[List[FileRecord]] = []
     for group in name_groups:
         keyed = []
@@ -214,7 +263,10 @@ def find_duplicate_files(
                 skipped,
             )
 
-    # Stage 3: MD5, only for files that already match on name, date and size.
+    # Stage 3: for large files, the MD5 of their start.
+    candidate_groups = _split_by_first_bytes(candidate_groups, throttle_limit, on_hash, md5_cache)
+
+    # Stage 4: MD5, only for files that already match on name, date and size.
     candidates = [r for group in candidate_groups for r in group]
     md5_by_path = md5_map(
         [r.path for r in candidates], throttle_limit, on_hash, md5_cache, sizes={r.path: r.size for r in candidates}

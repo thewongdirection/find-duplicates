@@ -51,7 +51,11 @@ class _FolderInfo:
 
 
 def _folder_tree(files: Sequence[FileRecord], folders: Sequence[FolderRecord]) -> _FolderTree:
-    """Index a scan: the sub folders and files of every folder, and which were readable."""
+    """Index a scan: the sub folders and files of every folder, and which were readable.
+
+    File details are not read here (see _confirm_tree_files): only the folders that could
+    be duplicates need them.
+    """
     tree = _FolderTree()
     for record in folders:
         tree.children.setdefault(record.path, [])
@@ -60,17 +64,8 @@ def _folder_tree(files: Sequence[FileRecord], folders: Sequence[FolderRecord]) -
     # excluded file, a skipped link) means not readable.
     unreadable = {record.path for record in folders if not record.readable}
     for record in files:
-        if record.folder not in tree.files:
-            continue
-        # Size and saved date are read here for every file; a file gone or unreadable since
-        # the scan leaves its folder's contents unknown.
-        try:
-            record.size, record.mtime_ns
-        except OSError as exc:
-            log.warning("Skipping '%s': %s", record.path, exc.strerror or exc)
-            unreadable.add(record.folder)
-            continue
-        tree.files[record.folder].append(record)
+        if record.folder in tree.files:
+            tree.files[record.folder].append(record)
     tree.readable = {path for path in tree.children if path not in unreadable}
     for path in list(tree.children):
         parent = os.path.dirname(path)
@@ -79,6 +74,40 @@ def _folder_tree(files: Sequence[FileRecord], folders: Sequence[FolderRecord]) -
     # Deepest first: a sub folder's path is always longer than its parent's.
     tree.deepest_first = sorted(tree.children, key=len, reverse=True)
     return tree
+
+
+def _confirm_tree_files(tree: _FolderTree, files: Sequence[FileRecord], scope: Set[str]) -> None:
+    """Read the size and saved date of every file in the ``scope`` folders (in scan order).
+    A file gone or unreadable since the scan is dropped with a warning, and leaves its
+    folder's contents unknown: the folder is no longer readable."""
+    for record in files:
+        if record.folder not in scope or record.folder not in tree.files:
+            continue
+        try:
+            record.size, record.mtime_ns
+        except OSError as exc:
+            log.warning("Skipping '%s': %s", record.path, exc.strerror or exc)
+            tree.files[record.folder].remove(record)
+            tree.readable.discard(record.folder)
+
+
+def _folder_scope(tree: _FolderTree, folders: Sequence[str]) -> Dict[str, None]:
+    """The given folders and every folder below them. A dict keeps insertion order, so
+    files are hashed in the same order as in PowerShell."""
+    scope: Dict[str, None] = {}
+    pending = list(folders)
+    while pending:
+        path = pending.pop()
+        if path not in scope:
+            scope[path] = None
+            pending.extend(tree.children[path])
+    return scope
+
+
+def _repeated_name_scope(tree: _FolderTree) -> Set[str]:
+    """The folders whose name (ignoring case) another folder has, and every folder below them."""
+    repeated = [p for group in groups_of_many(tree.deepest_first, lambda p: name_key(os.path.basename(p))) for p in group]
+    return set(_folder_scope(tree, repeated))
 
 
 def _signatures(
@@ -147,22 +176,21 @@ def find_duplicate_folders(
     """
     tree = _folder_tree(files, folders)
 
-    # Pass 1: names, sizes and saved dates only; nothing is read.
-    cheap = _signatures(tree)
-    candidates = [p for p in tree.deepest_first if cheap[p].signature and cheap[p].file_count > 0]
+    # Pass 1: names, sizes and saved dates only; nothing is read. Only folders whose name
+    # another folder has can be duplicates, so only they (and the folders below them, part
+    # of their fingerprint) are fingerprinted.
+    named = _repeated_name_scope(tree)
+    if not named:
+        return []
+    _confirm_tree_files(tree, files, named)
+    cheap = _signatures(tree, scope=named)
+    candidates = [p for p in tree.deepest_first if p in named and cheap[p].signature and cheap[p].file_count > 0]
     candidate_groups = groups_of_many(candidates, lambda p: _name_key(p, cheap[p].signature))
     if not candidate_groups:
         return []
 
     # Pass 2: hash every file below the candidates (hashes from the file scan are reused).
-    # A dict keeps insertion order, so files are hashed in the same order as in PowerShell.
-    scope: Dict[str, None] = {}
-    pending = [p for group in candidate_groups for p in group]
-    while pending:
-        path = pending.pop()
-        if path not in scope:
-            scope[path] = None
-            pending.extend(tree.children[path])
+    scope = _folder_scope(tree, [p for group in candidate_groups for p in group])
 
     to_hash = []
     skipped = 0

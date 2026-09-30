@@ -10,12 +10,14 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 from xml.etree import ElementTree
+from xml.sax.saxutils import escape
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -25,12 +27,18 @@ from find_duplicates.matcher import DuplicateSet, find_duplicate_files, md5_file
 from find_duplicates.scanner import FileRecord, iter_files, local_time, utc_offset  # noqa: E402
 from find_duplicates.validate import validate_report  # noqa: E402
 from find_duplicates.xlsx import (  # noqa: E402
-    column_name, excel_serial, export_duplicate_report, from_excel_serial, parse_utc_offset, read_duplicate_report,
-    utc_offset_text,
+    ScanSettings, column_name, excel_serial, export_duplicate_report, from_excel_serial, parse_utc_offset,
+    read_duplicate_report, read_duplicate_workbook, utc_offset_text,
 )
 from tests.helpers import (  # noqa: E402
     SAVED, add_file, as_if_on_a_network_drive, read_worksheet, sheet_names, time_zone,
 )
+
+
+MINIMUM_SIZE_LABEL = (
+    "Smallest file listed, in bytes (-MinimumSize or -IgnoreEmptyFiles; Python: --minimum-size or --ignore-empty-files)"
+)
+EXCLUDE_NAMES_LABEL = "Names left out (-Exclude; Python: --exclude)"
 
 
 class TempDirTestCase(unittest.TestCase):
@@ -142,6 +150,81 @@ class IterFilesTests(TempDirTestCase):
         self.assertEqual(parallel, sequential)
         self.assertEqual(many, one)
 
+    def test_leaves_out_files_and_folders_whose_names_match_exclude_names_ignoring_case(self):
+        for path in ("keep.txt", "Thumbs.db", "a.TMP", ".git/obj", "sub/.Git/x", "sub/keep2.txt"):
+            add_file(self.root, path)
+        folders = []
+
+        found = list(iter_files(self.root, exclude_names=["thumbs.db", "*.tmp", ".GIT"], folders=folders))
+
+        self.assertEqual([f.name for f in found], ["keep.txt", "keep2.txt"])
+        self.assertFalse([f for f in folders if "git" in f.path.lower()], "left-out folders are not listed")
+        self.assertTrue(all(f.readable for f in folders), "leaving names out does not make a folder unreadable")
+
+    def test_treats_characters_other_than_star_and_question_mark_in_exclude_names_literally(self):
+        for name in ("a.b", "aXb", "[ab]", "a", "file(1).txt", "x+y"):
+            add_file(self.root, name)
+
+        found = list(iter_files(self.root, exclude_names=["a.b", "[ab]", "?", "x+y"]))
+
+        self.assertEqual(sorted(f.name for f in found), ["aXb", "file(1).txt"])
+
+    def test_matches_exclude_names_patterns_against_the_whole_name(self):
+        for name in ("ab", "x.tmp.bak", "y.tmp", "abab", "aba"):
+            add_file(self.root, name)
+
+        found = list(iter_files(self.root, exclude_names=["a", "*.tmp", "*ab*ab"]))
+
+        self.assertEqual(sorted(f.name for f in found), ["ab", "aba", "x.tmp.bak"])
+
+    def test_matches_a_pattern_with_many_stars_quickly(self):
+        add_file(self.root, "a" * 200)
+        started = time.monotonic()
+
+        found = list(iter_files(self.root, exclude_names=["*a*a*a*a*a*a*a*a*b"]))
+
+        self.assertEqual(len(found), 1)
+        self.assertLess(time.monotonic() - started, 5, "patterns must never backtrack exponentially")
+
+    def test_rejects_an_exclude_name_pattern_holding_a_slash_or_backslash(self):
+        for pattern in ("photos/raw", "photos\\raw"):
+            with self.subTest(pattern=pattern), self.assertRaisesRegex(ValueError, "not paths"):
+                list(iter_files(self.root, exclude_names=[pattern]))
+
+    def test_leaves_out_a_folder_link_whose_name_matches_exclude_names_without_marking_its_folder_unreadable(self):
+        add_file(self.root, "a/x.txt")
+        try:
+            os.symlink(self.root, os.path.join(self.root, "a", ".git"), target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symbolic links cannot be created here: {exc}")
+        folders = []
+        list(iter_files(self.root, exclude_names=[".git"], folders=folders))
+        self.assertTrue(all(f.readable for f in folders))
+
+    def test_matches_exclude_names_patterns_in_any_unicode_form_and_a_character_beyond_u_ffff_with_one_question_mark(self):
+        composed = "caf\u00e9.txt"  # e-acute as one character
+        decomposed = "CAFE\u0301.*"  # E + combining acute, upper case
+        emoji = "x\U0001F600.txt"
+        for name in (composed, emoji, "keep.txt"):
+            add_file(self.root, name)
+
+        found = list(iter_files(self.root, exclude_names=[decomposed, "x?.txt"]))
+
+        self.assertEqual([f.name for f in found], ["keep.txt"])
+
+    def test_leaves_out_the_same_names_listing_several_folders_at_a_time(self):
+        for path in ("a/x.txt", "a/cache/y.txt", "b/cache/deep/z.txt", "b/w.tmp", "c/v.txt"):
+            add_file(self.root, path)
+        one, many = [], []
+
+        sequential = [f.path for f in iter_files(self.root, exclude_names=["cache", "*.tmp"], folders=one)]
+        with as_if_on_a_network_drive():
+            parallel = [f.path for f in iter_files(self.root, exclude_names=["cache", "*.tmp"], folders=many, throttle_limit=4)]
+
+        self.assertEqual([os.path.basename(p) for p in sequential], ["x.txt", "v.txt"])
+        self.assertEqual(parallel, sequential)
+        self.assertEqual([f.path for f in many], [f.path for f in one])
+
     def test_skips_an_unreadable_folder_with_a_warning(self):
         add_file(self.root, "ok/a.txt")
         add_file(self.root, "locked/b.txt")
@@ -165,6 +248,16 @@ class FolderAndCloudDetectionTests(unittest.TestCase):
         if junction is not None:
             entry.is_junction = lambda: junction
         return entry
+
+    def test_treats_a_local_folder_as_not_on_a_network_drive(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertFalse(scanner.on_network_drive(root))
+
+    def test_uses_4_at_a_time_by_default_on_a_network_drive_and_1_elsewhere(self):
+        with mock.patch.object(scanner, "on_network_drive", return_value=True):
+            self.assertEqual(scanner.default_throttle_limit("."), 4)
+        with mock.patch.object(scanner, "on_network_drive", return_value=False):
+            self.assertEqual(scanner.default_throttle_limit("."), 1)
 
     def test_follows_plain_and_cloud_synced_folders(self):
         self.assertFalse(scanner.is_folder_link(self.entry(junction=False)))
@@ -200,6 +293,46 @@ class FindDuplicateFilesTests(TempDirTestCase):
     def test_md5_matches_known_value(self):
         path = add_file(self.root, "x.txt", content="abc")
         self.assertEqual(md5_file(path), "900150983CD24FB0D6963F7D28E17F72")
+
+    def test_computes_the_md5_of_the_start_of_a_file(self):
+        path = add_file(self.root, "abcdef.txt", content="abcdef")
+        self.assertEqual(md5_file(path, 3), "900150983CD24FB0D6963F7D28E17F72")
+
+    def add_large_file(self, relative, at, value):
+        """A 3 MB file of zeros with one byte set, saved at the same date as the others."""
+        path = os.path.join(self.root, *relative.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        content = bytearray(3 << 20)
+        content[at] = value
+        with open(path, "wb") as stream:
+            stream.write(content)
+        ns = int(SAVED.timestamp()) * 1_000_000_000
+        os.utime(path, ns=(ns, ns))
+
+    def test_reads_large_files_in_full_only_when_their_start_is_the_same(self):
+        self.add_large_file("a/same.bin", 0, 1)
+        self.add_large_file("b/same.bin", 0, 1)
+        self.add_large_file("a/start.bin", 0, 1)
+        self.add_large_file("b/start.bin", 0, 2)
+        self.add_large_file("a/end.bin", 2 << 20, 1)
+        self.add_large_file("b/end.bin", 2 << 20, 2)
+        for limit in (1, 4):
+            with self.subTest(limit=limit), as_if_on_a_network_drive(), \
+                    mock.patch.object(matcher, "FIRST_BYTES_MIN_SIZE", 2 << 20):  # large: 2 MB, to keep the files small
+                cache = {}
+                result = find_duplicate_files(list(iter_files(self.root)), md5_cache=cache, throttle_limit=limit)
+                self.assertEqual([d.file_name for d in result], ["same.bin"])
+                self.assertEqual(sorted(os.path.basename(p) for p in cache), ["end.bin", "end.bin", "same.bin", "same.bin"],
+                                 "files that differ at the start are never read in full")
+
+    def test_does_not_compare_the_start_of_large_files_the_previous_report_already_hashed(self):
+        self.add_large_file("a/start.bin", 0, 1)
+        self.add_large_file("b/start.bin", 0, 2)
+        files = list(iter_files(self.root))
+        cache = {f.path: "0123456789ABCDEF0123456789ABCDEF" for f in files}
+        with mock.patch.object(matcher, "FIRST_BYTES_MIN_SIZE", 2 << 20):
+            result = find_duplicate_files(files, md5_cache=cache)
+        self.assertEqual([d.file_name for d in result], ["start.bin"], "the recorded hashes are trusted")
 
     def test_ignores_files_whose_contents_differ(self):
         paths = [add_file(self.root, "a/x.txt", "aaaa"), add_file(self.root, "b/x.txt", "bbbb")]
@@ -251,6 +384,14 @@ class FindDuplicateFilesTests(TempDirTestCase):
                  add_file(self.root, "a/full.txt"), add_file(self.root, "b/full.txt")]
         result = find_duplicate_files(self.records(*paths), ignore_empty_files=True)
         self.assertEqual([d.file_name for d in result], ["full.txt"])
+
+    def test_leaves_files_smaller_than_minimum_size_out(self):
+        paths = []
+        for folder in ("a", "b"):
+            paths += [add_file(self.root, f"{folder}/small.txt", "s" * 9), add_file(self.root, f"{folder}/exact.txt", "e" * 10),
+                      add_file(self.root, f"{folder}/large.txt", "l" * 11)]
+        result = find_duplicate_files(self.records(*paths), minimum_size=10)
+        self.assertEqual([d.file_name for d in result], ["exact.txt", "large.txt"])
 
     def test_returns_nothing_for_an_empty_list(self):
         self.assertEqual(find_duplicate_files([]), [])
@@ -382,6 +523,18 @@ class ExportDuplicateReportTests(TempDirTestCase):
         self.assertIn("Sheet 'Duplicates': duplicate files", rules)
         self.assertTrue(any(line.startswith("A file is listed when another file has ALL of") for line in rules))
         self.assertNotIn("Sheet 'Duplicate Folders': duplicate folders", rules, "no folder sheet, no folder rules")
+        self.assertNotIn("Scan settings", rules, "the scan left nothing out")
+
+    def test_records_the_scan_settings_on_the_rules_sheet(self):
+        path = os.path.join(self.root, "report.xlsx")
+        export_duplicate_report(self.SETS, path, settings=ScanSettings(["*.tmp", "Thumbs.db"], 1024))
+
+        rows = read_worksheet(path, "xl/worksheets/sheet2.xml", all_rows=True)
+        self.assertIn("Scan settings", [row[0] for row in rows])
+        (exclude,) = [row for row in rows if row[0] == "Names left out (-Exclude; Python: --exclude)"]
+        self.assertEqual(exclude[1:3], ["*.tmp", "Thumbs.db"])
+        (size,) = [row for row in rows if row[0] == MINIMUM_SIZE_LABEL]
+        self.assertEqual(size[1], "1024")
 
     def test_starts_the_table_on_row_1(self):
         path = self.export()
@@ -502,33 +655,43 @@ class ExcelDateTests(unittest.TestCase):
         self.assertEqual(from_excel_serial(excel_serial(value)), datetime(2024, 1, 2, 3, 4, 5, 678_000))
 
 
-def write_excel_saved_workbook(path, rows):
-    """A workbook shaped like one Excel has re-saved: shared strings, a renamed
-    worksheet part, and cells without explicit types."""
-    strings, sheet_rows = [], []
-    for r, row in enumerate(rows, start=1):
-        cells = []
-        for c, value in enumerate(row, start=1):
-            ref = f"{column_name(c)}{r}"
-            if value is None:
-                continue  # Excel leaves blank cells out
-            if isinstance(value, str):
-                strings.append(value)
-                cells.append(f'<c r="{ref}" t="s"><v>{len(strings) - 1}</v></c>')
-            else:
-                cells.append(f'<c r="{ref}"><v>{value!r}</v></c>')
-        sheet_rows.append(f'<row r="{r}">{"".join(cells)}</row>')
+def write_excel_saved_workbook(path, rows, rules_rows=None):
+    """A workbook shaped like one Excel has re-saved: shared strings, renamed worksheet
+    parts, and cells without explicit types; with ``rules_rows``, a Rules sheet too."""
+    strings = []
+
+    def sheet(sheet_rows):
+        xml_rows = []
+        for r, row in enumerate(sheet_rows, start=1):
+            cells = []
+            for c, value in enumerate(row, start=1):
+                ref = f"{column_name(c)}{r}"
+                if value is None:
+                    continue  # Excel leaves blank cells out
+                if isinstance(value, str):
+                    strings.append(value)
+                    cells.append(f'<c r="{ref}" t="s"><v>{len(strings) - 1}</v></c>')
+                else:
+                    cells.append(f'<c r="{ref}"><v>{value!r}</v></c>')
+            xml_rows.append(f'<row r="{r}">{"".join(cells)}</row>')
+        return f'<worksheet xmlns="{main}"><sheetData>{"".join(xml_rows)}</sheetData></worksheet>'
+
     main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rels = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    sheets = [("Duplicates", "data.xml", rows)] + ([("Rules", "notes.xml", rules_rows)] if rules_rows is not None else [])
     parts = {
         "[Content_Types].xml": '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
-        "xl/workbook.xml": f'<workbook xmlns="{main}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-                           '<sheets><sheet name="Duplicates" sheetId="1" r:id="rId7"/></sheets></workbook>',
+        "xl/workbook.xml": f'<workbook xmlns="{main}" xmlns:r="{rels}"><sheets>'
+                           + "".join(f'<sheet name="{name}" sheetId="{i}" r:id="rId{i + 6}"/>' for i, (name, _, _) in enumerate(sheets, 1))
+                           + "</sheets></workbook>",
         "xl/_rels/workbook.xml.rels": '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-                                      '<Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/data.xml"/>'
-                                      "</Relationships>",
-        "xl/sharedStrings.xml": f'<sst xmlns="{main}">' + "".join(f"<si><t>{s}</t></si>" for s in strings) + "</sst>",
-        "xl/worksheets/data.xml": f'<worksheet xmlns="{main}"><sheetData>{"".join(sheet_rows)}</sheetData></worksheet>',
+                                      + "".join(f'<Relationship Id="rId{i + 6}" Type="{rels}/worksheet" Target="worksheets/{part}"/>'
+                                                for i, (_, part, _) in enumerate(sheets, 1))
+                                      + "</Relationships>",
     }
+    for _, part, sheet_rows in sheets:
+        parts[f"xl/worksheets/{part}"] = sheet(sheet_rows)
+    parts["xl/sharedStrings.xml"] = f'<sst xmlns="{main}">' + "".join(f"<si><t>{escape(t)}</t></si>" for t in strings) + "</sst>"
     with zipfile.ZipFile(path, "w") as archive:
         for name, content in parts.items():
             archive.writestr(name, content)
@@ -586,6 +749,28 @@ class ReadDuplicateReportTests(TempDirTestCase):
         self.assertEqual(dup.last_write_time, datetime(2024, 1, 1, 12, 0, 0))
         self.assertEqual(dup.size_bytes, 10)
         self.assertEqual(dup.folders, ["C:\\a", "C:\\b"])
+
+    def test_reads_the_scan_settings_from_a_report_saved_by_excel(self):
+        path = os.path.join(self.root, "settings.xlsx")
+        write_excel_saved_workbook(
+            path,
+            [["File Name", "Last Modified", "Size (bytes)", "MD5", "Copies", "Location 1"]],
+            [["Matching rules"], [EXCLUDE_NAMES_LABEL, None, "*.tmp", "Thumbs.db"], [MINIMUM_SIZE_LABEL, 2048]],
+        )
+        self.assertEqual(read_duplicate_workbook(path).settings, ScanSettings(["*.tmp", "Thumbs.db"], 2048))
+
+    def test_ignores_a_smallest_file_size_in_the_report_that_is_not_a_whole_number_of_bytes(self):
+        for bad in ("1MB", "1.5", "-1"):
+            with self.subTest(bad=bad):
+                path = os.path.join(self.root, "bad.xlsx")
+                write_excel_saved_workbook(
+                    path, [["File Name", "Last Modified", "Size (bytes)", "MD5", "Copies", "Location 1"]],
+                    [[MINIMUM_SIZE_LABEL, bad]],
+                )
+                with self.assertLogs("find_duplicates", "WARNING") as logs:
+                    self.assertEqual(read_duplicate_workbook(path).settings.minimum_size, 0)
+                self.assertIn(f"'{bad}' is not a whole number of bytes", logs.output[0])
+                os.remove(path)
 
     def test_rejects_a_workbook_that_is_not_a_duplicates_report(self):
         path = os.path.join(self.root, "other.xlsx")
@@ -878,6 +1063,15 @@ class ValidateReportTests(TempDirTestCase):
         self.assertFalse(result.saved)
         self.assertEqual(read_duplicate_report(report)[0].count, 3)
 
+    def test_keeps_the_scan_settings_when_it_rewrites_the_report(self):
+        root = self.tree("a/x.txt", "b/x.txt", "c/x.txt")
+        report = root + ".xlsx"
+        export_duplicate_report(find_duplicate_files(list(iter_files(root))), report, settings=ScanSettings(["Thumbs.db"], 5))
+        os.remove(os.path.join(root, "c", "x.txt"))
+
+        self.assertTrue(validate_report(report).saved)
+        self.assertEqual(read_duplicate_workbook(report).settings, ScanSettings(["Thumbs.db"], 5))
+
 
 @contextlib.contextmanager
 def _chdir(path):
@@ -941,6 +1135,47 @@ class CliTests(TempDirTestCase):
         self.run_cli(root, report, "--ignore-empty-files")
         self.assertEqual(read_duplicate_report(report), [])
 
+    def test_leaves_names_out_with_exclude_and_small_files_with_minimum_size(self):
+        root = self.new_dir("excluded")
+        for folder in ("a", "b"):
+            add_file(root, f"{folder}/Thumbs.db")
+            add_file(root, f"{folder}/small.txt", "small")
+            add_file(root, f"{folder}/large.txt", "x" * 2048)
+        report = os.path.join(self.new_dir("work"), "excluded.xlsx")
+
+        self.run_cli(root, report, "--exclude", "thumbs.db", "--minimum-size", "2KB")
+
+        self.assertEqual([d.file_name for d in read_duplicate_report(report)], ["large.txt"])
+        rules = [row[0] for row in read_worksheet(report, "xl/worksheets/sheet2.xml", all_rows=True)]
+        self.assertIn("Scan settings", rules)
+
+    def test_reads_a_minimum_size_in_bytes_or_with_a_unit_and_rejects_anything_else(self):
+        root = self.new_dir("sizes")
+        for folder in ("a", "b"):
+            add_file(root, f"{folder}/x.txt")
+        for text, expected in (("1500", "1500"), ("2KB", "2048"), ("1.5MB", "1572864")):
+            with self.subTest(text=text):
+                report = os.path.join(self.root, "size.xlsx")
+                self.run_cli(root, report, "--minimum-size", text)
+                rows = read_worksheet(report, "xl/worksheets/sheet2.xml", all_rows=True)
+                (size,) = [row for row in rows if row[0] == MINIMUM_SIZE_LABEL]
+                self.assertEqual(size[1], expected)
+        for text in ("-1", "10 bytes", "KB", "\u0661\u0662"):  # the last: Arabic-Indic digits
+            with self.subTest(text=text), self.assertRaises(SystemExit):
+                self.run_cli(root, os.path.join(self.root, "bad.xlsx"), "--minimum-size", text)
+
+    def test_records_ignore_empty_files_as_a_smallest_file_size_of_1_byte(self):
+        root = self.new_dir("empty")
+        for folder in ("a", "b"):
+            add_file(root, f"{folder}/x.txt")
+        report = os.path.join(self.root, "empty.xlsx")
+
+        self.run_cli(root, report, "--ignore-empty-files")
+
+        rows = read_worksheet(report, "xl/worksheets/sheet2.xml", all_rows=True)
+        (size,) = [row for row in rows if row[0] == MINIMUM_SIZE_LABEL]
+        self.assertEqual(size[1], "1")
+
     @unittest.skipUnless(sys.platform == "win32", "UNC paths are Windows-only")
     def test_scans_and_validates_a_network_share_given_as_a_unc_path(self):
         root = self.new_dir("unc")
@@ -952,7 +1187,9 @@ class CliTests(TempDirTestCase):
             self.skipTest("the administrative share is not available")
         report = os.path.join(self.new_dir("work"), "unc.xlsx")
 
-        self.assertEqual(self.run_cli(unc, report)[0], 0)
+        code, out = self.run_cli(unc, report)
+        self.assertEqual(code, 0)
+        self.assertIn("On a network drive: working on 4 folders and files at a time", out)
         (row,) = read_duplicate_report(report)
         self.assertEqual(row.folders, [os.path.join(unc, "a"), os.path.join(unc, "b")])
 

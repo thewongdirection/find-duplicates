@@ -30,7 +30,8 @@ Built-in help: `python -m find_duplicates --help`.
 ## Command reference
 
 ```text
-python -m find_duplicates [path] [output] [-o FILE] [-j N] [--folders] [--ignore-empty-files] [--skip-cloud-only] [--rehash] [--dry-run] [-v]
+python -m find_duplicates [path] [output] [-o FILE] [-j N] [--folders] [--ignore-empty-files] [--exclude PATTERN ...]
+                          [--minimum-size SIZE] [--skip-cloud-only] [--rehash] [--dry-run] [-v]
 python -m find_duplicates --validate [report] [--dry-run] [-v]
 ```
 
@@ -40,9 +41,11 @@ python -m find_duplicates --validate [report] [--dry-run] [-v]
 |---|---|---|
 | `path` | current folder | Folder to scan, including all sub folders. |
 | `output`, `-o FILE`, `--output-file FILE` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced. |
-| `-j N`, `--throttle-limit N` | `1` | How many files to hash, and folders to list, at the same time (1-64); see [Threads](#threads). Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk. |
+| `-j N`, `--throttle-limit N` | `4` on a network share or drive, `1` otherwise | How many files to hash, and folders to list, at the same time (1-64); see [Threads](#threads). Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk. |
 | `--folders` | off | Also find [duplicate folders](../README.md#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
 | `--ignore-empty-files` | off | Leave files of 0 bytes out of the duplicate files. |
+| `--exclude PATTERN` | none | Leave files and folders with this name out; repeat for more names. `*` stands for any characters and `?` for any one character; upper/lower case is ignored; patterns match names, not paths. Left-out folders are not scanned, and duplicate folders are compared as if left-out names were not there. Recorded on the *Rules* sheet, so `--validate` leaves the same names out. |
+| `--minimum-size SIZE` | `0` | Leave files smaller than this out of the duplicate files: a number of bytes, optionally followed by `KB`, `MB`, `GB`, `TB` or `PB` (1024-based, so `1.5MB` is 1572864 bytes, as in PowerShell). Recorded on the *Rules* sheet. |
 | `--rehash` | off | Read every candidate file again. Without it, when the report already exists (from an earlier scan), files it lists whose size and saved date have not changed keep the MD5 recorded there instead of being read again. |
 | `--skip-cloud-only` | off | Never download online-only cloud files to hash them. Duplicates among such files are then not reported. |
 | `--dry-run` | off | Scan and report the totals, but do not save the report. |
@@ -67,6 +70,9 @@ python -m find_duplicates D:\Backups --folders
 
 # Leave out empty (0-byte) files
 python -m find_duplicates D:\Photos --ignore-empty-files
+
+# Leave out thumbnail caches, Git folders, temporary files and files under 100 KB
+python -m find_duplicates D:\Photos --exclude Thumbs.db --exclude .git --exclude "*.tmp" --minimum-size 100KB
 
 # OneDrive without downloading online-only files
 python -m find_duplicates "%OneDrive%" --skip-cloud-only
@@ -94,7 +100,8 @@ drive or share that cannot be reached are kept. See the
 | `--dry-run` | off | Report what would be removed, but do not change the report. |
 | `-v`, `--verbose` | off | Print every copy that is removed and why. |
 
-`--skip-cloud-only`, `--folders`, `--ignore-empty-files` and `--rehash` only apply to a scan.
+`--skip-cloud-only`, `--folders`, `--ignore-empty-files`, `--rehash`, `--exclude` and `--minimum-size`
+only apply to a scan; validation reads the names to leave out from the report.
 Duplicate folders, when the report has them, are re-checked too.
 
 ```sh
@@ -140,6 +147,8 @@ result = validate_report("duplicates.xlsx", dry_run=True)        # summary: remo
 | `-IncludeFolders` | `--folders` |
 | `-IgnoreEmptyFiles` | `--ignore-empty-files` |
 | `-Rehash` | `--rehash` |
+| `-Exclude a, b` | `--exclude a --exclude b` |
+| `-MinimumSize N` | `--minimum-size N` |
 | `-SkipCloudOnly` | `--skip-cloud-only` |
 | `-Validate` | `--validate` |
 | `-WhatIf` | `--dry-run` |
@@ -170,7 +179,12 @@ paths and network drives on Windows; NFS, SMB and other network file systems on
 Linux) and for hashing files of 1 MB or more. Everything else is done one at a
 time: for the many small operations of listing and checking local folders,
 threads contending for Python's global lock make it many times slower. Reports
-are identical either way.
+are identical either way. Without `-j`, a scan of a folder on a network drive
+uses 4 threads, as PowerShell does.
+
+The other speed-ups in the [main README](../README.md#performance) apply too:
+large files are first compared by their first 1 MB, and duplicate folders are
+only looked for among folders whose name another folder has.
 
 ## Limits and edge cases
 

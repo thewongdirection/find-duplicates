@@ -7,9 +7,9 @@ that must behave identically:
 | Part                | PowerShell (primary)                 | Python (port)                          |
 |---------------------|--------------------------------------|----------------------------------------|
 | Command line        | `Find-Duplicates.ps1`                | `python/find_duplicates/cli.py`        |
-| Folder scanning     | `Get-FileInventory`, `Test-FolderLink`, `Test-CloudOnlyFile`, `Get-SortedByName` | `python/find_duplicates/scanner.py` |
+| Folder scanning     | `Get-FileInventory`, `Test-FolderLink`, `Test-CloudOnlyFile`, `Get-SortedByName`, `Test-NetworkDrive` | `python/find_duplicates/scanner.py` |
 | Duplicate matching  | `Find-DuplicateFile`, `Get-FileMd5`, `Get-FileMd5Map`, `Get-SortedFolder` | `python/find_duplicates/matcher.py` |
-| Name comparison     | `ConvertTo-NameKey`, .NET ordinal comparers | `python/find_duplicates/names.py` |
+| Name comparison     | `ConvertTo-NameKey`, `ConvertTo-NameFilter`, .NET ordinal comparers | `python/find_duplicates/names.py` |
 | Excel output/input  | `Export-DuplicateReport`, `Import-DuplicateReport` and helpers | `python/find_duplicates/xlsx.py` |
 | Duplicate folders   | `Find-DuplicateFolder`, `Get-FolderTree`, `Get-FolderSignature` | `python/find_duplicates/folders.py` |
 | Validation, hash reuse | `Update-DuplicateReport`, `Invoke-CopyCheck`, `Test-DuplicateCopy`, `Test-DuplicateFolderCopy`, `Test-PathRootReachable`, `Test-SameSavedDate`, `Get-PreviousMd5` | `python/find_duplicates/validate.py` |
@@ -34,7 +34,7 @@ Every new feature, behaviour change or bug fix is done in this order:
 Command-line options map one to one: `-Path` ↔ `path`,
 `-OutputFile` ↔ `output` / `-o`, `-ThrottleLimit` ↔ `-j` / `--throttle-limit`,
 `-IncludeFolders` ↔ `--folders`, `-IgnoreEmptyFiles` ↔ `--ignore-empty-files`,
-`-Rehash` ↔ `--rehash`,
+`-Rehash` ↔ `--rehash`, `-Exclude` ↔ `--exclude` (repeated), `-MinimumSize` ↔ `--minimum-size`,
 `-SkipCloudOnly` ↔ `--skip-cloud-only`, `-Validate` ↔ `--validate`,
 `-WhatIf` ↔ `--dry-run`, `-Verbose` ↔ `--verbose`. `-PassThru` corresponds to
 calling `find_duplicate_files()` / `validate_report()` from Python. Console
@@ -52,8 +52,19 @@ and ordered by UTF-16 code units: `String.CompareOrdinal` on upper-cased text
 Framework (Windows PowerShell 5.1) and .NET (PowerShell 7) order characters
 beyond U+FFFF differently with it. The text of the Rules sheet
 (`$script:RulesIntro` / `RULES_INTRO`, `$script:FileRules` / `FILE_RULES`,
-`$script:FolderRules` / `FOLDER_RULES` and their titles) must be identical in both
-languages; the parity test compares every sheet.
+`$script:FolderRules` / `FOLDER_RULES`, `$script:SettingsRules` / `SETTINGS_RULES`,
+their titles, and the setting labels `$script:ExcludeNameLabel` / `EXCLUDE_NAMES_LABEL` and
+`$script:MinimumSizeLabel` / `MINIMUM_SIZE_LABEL`) must be identical in both
+languages; the parity test compares every sheet. The labels are also read back from
+reports, so changing one means still reading the old wording.
+
+Exclusion patterns (`ConvertTo-NameFilter` / `name_filter`) match the name key, so
+they ignore case and Unicode form like names do; `?` is one character, including one
+beyond U+FFFF (a UTF-16 surrogate pair in .NET). They must never backtrack: patterns
+come from the command line and from reports, and `*a*a*a*a*b` on a long name would take
+minutes with a plain `.*` regex. PowerShell takes each part between stars at its first
+place in an atomic group; Python does the same in code (Python 3.9 `re` has no atomic
+groups).
 
 PowerShell source files must stay ASCII: Windows PowerShell 5.1 reads BOM-less
 files in the ANSI code page. Build non-ASCII test data from code points.
@@ -74,7 +85,8 @@ Parallel work in PowerShell goes through `Open-WorkerPool` / `Receive-WorkerResu
 `ThreadPoolExecutor`, but only for work on network drives and for hashing files of
 1 MB or more (`scanner.on_network_drive`, `matcher.PARALLEL_HASH_MIN_BYTES`): for small
 local operations the GIL makes threads many times slower. `-ThrottleLimit` / `-j` sets
-folder listing, hashing and validation. Python tests that exercise threads use
+folder listing, hashing and validation; a scan defaults to 4 on a network drive
+(`Get-DefaultThrottleLimit` / `default_throttle_limit`), 1 otherwise. Python tests that exercise threads use
 `tests.helpers.as_if_on_a_network_drive()`.
 
 Code that runs per file, per cell or per row (scanning, hashing, the Excel

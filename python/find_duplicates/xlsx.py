@@ -15,12 +15,14 @@ Header rows are frozen and filtered.
 
 from __future__ import annotations
 
+import logging
+import math
 import os
 import re
 import uuid
 import zipfile
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
@@ -28,6 +30,8 @@ from xml.sax.saxutils import escape
 from .folders import DuplicateFolderSet
 from .matcher import DuplicateSet
 from .scanner import local_utc_offset
+
+log = logging.getLogger("find_duplicates")
 
 EXCEL_MAX_ROWS = 1_048_576
 EXCEL_MAX_COLUMNS = 16_384
@@ -76,6 +80,19 @@ FOLDER_RULES = (
     "Only the top-most duplicates are listed: a sub folder is listed on its own only when one of its copies is "
     "outside a duplicate folder. Folders that contain no files are not listed.",
     "Each row is one duplicated folder. Each Location column is the full path of one copy.",
+)
+# Written only when the scan left names or small files out. The label rows are read back, so
+# validating leaves the same names out and rewriting the report keeps the settings.
+SETTINGS_TITLE = "Scan settings"
+SETTINGS_RULES = (
+    "Files and folders whose names match a pattern below (* stands for any characters, ? for any one character, "
+    "ignoring upper/lower case) were not scanned: folders were compared, and are validated, as if they were not there.",
+    "Files smaller than the size below are not listed on the Duplicates sheet; folders are compared with all their "
+    "files.",
+)
+EXCLUDE_NAMES_LABEL = "Names left out (-Exclude; Python: --exclude)"
+MINIMUM_SIZE_LABEL = (
+    "Smallest file listed, in bytes (-MinimumSize or -IgnoreEmptyFiles; Python: --minimum-size or --ignore-empty-files)"
 )
 LOCATION_COLUMN_WIDTH = 60
 STYLE_BOLD = 1
@@ -218,25 +235,45 @@ class _Sheet:
 
 
 @dataclass
+class ScanSettings:
+    """What the scan left out, recorded on the Rules sheet: file and folder names matching
+    ``exclude_names`` (wildcard patterns) and files smaller than ``minimum_size`` bytes."""
+
+    exclude_names: List[str] = field(default_factory=list)
+    minimum_size: int = 0
+
+
+_RulesLine = Tuple[List[CellValue], bool]  # (cells, bold)
+
+
+@dataclass
 class _RulesSheet:
     name: str
-    lines: List[Optional[Tuple[str, bool]]]  # (text, bold), or None for a blank row
+    lines: List[Optional[_RulesLine]]  # None for a blank row
 
 
-def _rules_sheet(include_folders: bool) -> _RulesSheet:
-    """The Rules sheet: a title, a section per data sheet, and blank rows between."""
-    lines: List[Optional[Tuple[str, bool]]] = [(RULES_INTRO[0], True)] + [(text, False) for text in RULES_INTRO[1:]]
-    sections = [(FILE_RULES_TITLE, FILE_RULES)]
+def _rules_sheet(include_folders: bool, settings: ScanSettings) -> _RulesSheet:
+    """The Rules sheet: a title, a section per data sheet, the scan settings when the scan
+    left anything out, and blank rows between. Each line is a row of cells."""
+    lines: List[Optional[_RulesLine]] = [([RULES_INTRO[0]], True)] + [([text], False) for text in RULES_INTRO[1:]]
+    sections: List[Tuple[str, Sequence[str], List[List[CellValue]]]] = [(FILE_RULES_TITLE, FILE_RULES, [])]
     if include_folders:
-        sections.append((FOLDER_RULES_TITLE, FOLDER_RULES))
-    for title, rules in sections:
-        lines += [None, (title, True)] + [(text, False) for text in rules]
+        sections.append((FOLDER_RULES_TITLE, FOLDER_RULES, []))
+    if settings.exclude_names or settings.minimum_size > 0:
+        values: List[List[CellValue]] = []
+        if settings.exclude_names:
+            values.append([EXCLUDE_NAMES_LABEL, *settings.exclude_names])
+        if settings.minimum_size > 0:
+            values.append([MINIMUM_SIZE_LABEL, settings.minimum_size])
+        sections.append((SETTINGS_TITLE, SETTINGS_RULES, values))
+    for title, rules, values in sections:
+        lines += [None, ([title], True)] + [([text], False) for text in rules] + [(cells, False) for cells in values]
     return _RulesSheet(RULES_SHEET_NAME, lines)
 
 
 def _rules_worksheet(sheet: _RulesSheet) -> str:
     rows = [
-        _row(number, [line[0]], bold=line[1])
+        _row(number, line[0], bold=line[1])
         for number, line in enumerate(sheet.lines, start=1)
         if line is not None
     ]
@@ -352,13 +389,20 @@ def _offset_of(duplicate: DuplicateSet) -> timedelta:
 
 
 def export_duplicate_report(
-    duplicates: Sequence[DuplicateSet], path: str, folders: Optional[Sequence[DuplicateFolderSet]] = None
+    duplicates: Sequence[DuplicateSet],
+    path: str,
+    folders: Optional[Sequence[DuplicateFolderSet]] = None,
+    settings: Optional[ScanSettings] = None,
 ) -> None:
     """Save duplicate sets to an .xlsx workbook at ``path``.
 
     With ``folders`` (even an empty list) the "Duplicate Folders" sheet is added. A
-    "Rules" sheet always follows, stating the matching rules behind the other sheets.
+    "Rules" sheet always follows, stating the matching rules behind the other sheets and
+    the scan ``settings`` when the scan left anything out.
     """
+    settings = settings or ScanSettings()
+    if settings.minimum_size < 0:
+        raise ValueError(f"minimum_size cannot be negative, not {settings.minimum_size}.")
     path = os.path.abspath(path)
     sheets: List[Union[_Sheet, _RulesSheet]] = [
         _sheet(
@@ -381,7 +425,7 @@ def export_duplicate_report(
                 "folder",
             )
         )
-    sheets.append(_rules_sheet(include_folders=folders is not None))
+    sheets.append(_rules_sheet(include_folders=folders is not None, settings=settings))
 
     # Build next to the target, then swap in, so a failure never leaves a half-written report.
     temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
@@ -519,10 +563,37 @@ def _number(text: Optional[str]) -> int:
 
 @dataclass
 class DuplicateWorkbook:
-    """Both sheets of a report; ``folders`` is None when the report has no folder sheet."""
+    """A report's sheets; ``folders`` is None when the report has no folder sheet, and
+    ``settings`` are the scan settings recorded on the Rules sheet."""
 
     files: List[DuplicateSet]
     folders: Optional[List[DuplicateFolderSet]]
+    settings: ScanSettings = field(default_factory=ScanSettings)
+
+
+def _scan_settings(rows: List[List[Optional[str]]], path: str) -> ScanSettings:
+    """The scan settings from the Rules sheet's rows (see _rules_sheet); none when absent.
+
+    A smallest size that is not a whole number of bytes (the report was edited) is ignored
+    with a warning: it only ever narrowed the scan, so the rest of the report still holds.
+    """
+    settings = ScanSettings()
+    for row in rows:
+        cells = [cell for cell in row[1:] if cell]
+        if not cells:
+            continue
+        if row[0] == EXCLUDE_NAMES_LABEL:
+            settings.exclude_names.extend(cells)
+        elif row[0] == MINIMUM_SIZE_LABEL:
+            try:
+                number = float(cells[0])
+            except ValueError:
+                number = math.nan
+            if 0 <= number < 2**63 - 1 and number == math.floor(number):
+                settings.minimum_size = int(number)
+            else:
+                log.warning("Ignoring the smallest file size in '%s': '%s' is not a whole number of bytes.", path, cells[0])
+    return settings
 
 
 def _file_row(row: List[str], folders: List[str], legacy: bool, path: str) -> DuplicateSet:
@@ -552,6 +623,8 @@ def read_duplicate_workbook(path: str) -> DuplicateWorkbook:
             file_rows = _worksheet_rows(archive, sheets[0][1], shared)
             folder_sheet = next((p for name, p in sheets if name.casefold() == FOLDER_SHEET_NAME.casefold()), None)
             folder_rows = _worksheet_rows(archive, folder_sheet, shared) if folder_sheet else None
+            rules_sheet = next((p for name, p in sheets if name.casefold() == RULES_SHEET_NAME.casefold()), None)
+            rules_rows = _worksheet_rows(archive, rules_sheet, shared) if rules_sheet else []
 
         files = [
             _file_row(row, folders, legacy, path)
@@ -576,12 +649,13 @@ def read_duplicate_workbook(path: str) -> DuplicateWorkbook:
                     f"'{path}' is not a duplicates report: sheet '{FOLDER_SHEET_NAME}' has no header row",
                 )
             ]
+        settings = _scan_settings(rules_rows, path)
     except zipfile.BadZipFile:
         raise ValueError(f"'{path}' is not an Excel workbook.") from None
     except (ElementTree.ParseError, KeyError, IndexError, AttributeError, TypeError) as exc:
         # A damaged or foreign workbook: report it plainly instead of with a traceback.
         raise ValueError(f"'{path}' could not be read as a duplicates report: {exc}") from None
-    return DuplicateWorkbook(files, duplicate_folders)
+    return DuplicateWorkbook(files, duplicate_folders, settings)
 
 
 def read_duplicate_report(path: str) -> List[DuplicateSet]:

@@ -21,7 +21,7 @@ from find_duplicates.matcher import find_duplicate_files  # noqa: E402
 from find_duplicates.scanner import FileRecord, FolderRecord, iter_files  # noqa: E402
 from find_duplicates.validate import validate_report  # noqa: E402
 from find_duplicates.xlsx import (  # noqa: E402
-    export_duplicate_report, read_duplicate_folder_report, read_duplicate_report,
+    ScanSettings, export_duplicate_report, read_duplicate_folder_report, read_duplicate_report,
 )
 from tests.helpers import SAVED, add_file, as_if_on_a_network_drive, read_worksheet, sheet_names  # noqa: E402
 
@@ -66,6 +66,19 @@ class FindDuplicateFoldersTests(TempRootTestCase):
         self.assertEqual((result.file_count, result.folder_count, result.count), (2, 2, 2))
         self.assertEqual(result.size_bytes, len("a photo") + len("b photo"))
         self.assertEqual(result.folders, [self.path("one/Photos"), self.path("two/Photos")])
+
+    def test_compares_folders_as_if_files_and_folders_left_out_with_exclude_names_were_not_there(self):
+        for folder in ("one", "two"):
+            add_photo_folder(self.root, f"{folder}/Photos")
+            add_file(self.root, f"{folder}/Photos/Thumbs.db", f"thumbnails of {folder}")
+            add_file(self.root, f"{folder}/Photos/.cache/{folder}.bin", folder)
+
+        self.assertEqual([r.folder_name for r in self.find()], ["sub"], "the thumbnails and caches differ")
+        records = []
+        files = list(iter_files(self.root, folders=records, exclude_names=["Thumbs.db", ".cache"]))
+        (result,) = find_duplicate_folders(files, records)
+        self.assertEqual(result.folder_name, "Photos")
+        self.assertEqual((result.file_count, result.folder_count), (2, 2))
 
     def test_matches_folder_names_that_differ_only_by_case(self):
         add_photo_folder(self.root, "one/Photos")
@@ -138,6 +151,22 @@ class FindDuplicateFoldersTests(TempRootTestCase):
         except (OSError, NotImplementedError) as exc:
             self.skipTest(f"symbolic links cannot be created here: {exc}")
         self.assertEqual([r.folder_name for r in self.find()], ["sub"])
+
+    def test_does_not_read_the_files_of_folders_whose_name_no_other_folder_has(self):
+        add_photo_folder(self.root, "one/Photos")
+        add_photo_folder(self.root, "two/Photos")
+        add_file(self.root, "unique/x.txt")
+        files, records = folder_scan(self.root)
+        gone = self.path("unique/x.txt")
+        # A record that reads nothing up front: reading it now would fail with a warning.
+        files = [FileRecord(f.path, f.name, f.folder) if f.path == gone else f for f in files]
+        os.remove(gone)
+
+        with mock.patch.object(folders.log, "warning") as warning:
+            result = find_duplicate_folders(files, records)
+
+        warning.assert_not_called()
+        self.assertEqual([r.folder_name for r in result], ["Photos"])
 
     def test_does_not_report_a_folder_whose_file_has_gone_since_the_scan(self):
         add_photo_folder(self.root, "one/Photos")
@@ -242,6 +271,20 @@ class ValidatingDuplicateFoldersTests(TempRootTestCase):
         (row,) = read_duplicate_folder_report(report)
         self.assertEqual(row.count, 2)
         self.assertEqual(row.folders, [self.path("one/Photos"), self.path("three/Photos")])
+
+    def test_leaves_the_names_the_scan_left_out_when_validating_folder_copies(self):
+        self.add_three_copies()
+        records = []
+        files = list(iter_files(self.root, folders=records, exclude_names=["Thumbs.db"]))
+        report = self.root + ".xlsx"
+        self.addCleanup(lambda: os.path.exists(report) and os.remove(report))
+        export_duplicate_report(find_duplicate_files(files), report, find_duplicate_folders(files, records),
+                                ScanSettings(["Thumbs.db"]))
+        add_file(self.root, "two/Photos/Thumbs.db", "new thumbnails")
+
+        self.assertEqual(validate_report(report).folder_copies_removed, 0)
+        add_file(self.root, "two/Photos/new.jpg")
+        self.assertEqual(validate_report(report).folder_copies_removed, 1)
 
     def test_removes_a_folder_copy_whose_contents_changed(self):
         self.add_three_copies()

@@ -14,7 +14,8 @@
     MD5 is only calculated for files whose name and saved date already match
     another file (and whose size matches too), so most files are never read. When
     the report already exists, unchanged files keep the MD5 recorded there.
-    Files of 0 bytes are included unless -IgnoreEmptyFiles is used.
+    Files of 0 bytes are included unless -IgnoreEmptyFiles is used. -Exclude leaves
+    files and folders out by name, and -MinimumSize leaves small files out.
 
     A "Rules" sheet in the report states the matching rules in plain words.
     The report has one row per duplicated file with the columns
@@ -56,13 +57,25 @@
     files are then not reported.
 
 .PARAMETER ThrottleLimit
-    How many files to hash, and folders to list or check, at the same time (1-64,
-    default 1). Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single
-    spinning hard disk. Also speeds up -Validate.
+    How many files to hash, and folders to list or check, at the same time (1-64).
+    Default: 4 when scanning a network share or network drive, 1 otherwise. Try 4-8 for
+    SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk. Also
+    speeds up -Validate (default 1).
 
 .PARAMETER IgnoreEmptyFiles
     Leave files of 0 bytes out of the duplicate files (they all have the same
     contents). Off by default. Duplicate folders still compare every file.
+
+.PARAMETER Exclude
+    Names of files and folders to leave out, as wildcard patterns: * stands for any
+    characters and ? for any one character; upper/lower case is ignored. Patterns match
+    names, not paths. Left-out folders are not scanned, and duplicate folders are compared
+    as if left-out files and folders were not there. Recorded in the report, so -Validate
+    leaves the same names out. Example: -Exclude Thumbs.db, .DS_Store, *.tmp
+
+.PARAMETER MinimumSize
+    Leave files smaller than this many bytes out of the duplicate files, for example
+    -MinimumSize 1MB. Duplicate folders still compare every file. Recorded in the report.
 
 .PARAMETER IncludeFolders
     Also find duplicate folders and save them on the "Duplicate Folders" sheet.
@@ -95,6 +108,9 @@
     .\Find-Duplicates.ps1 -Path D:\Backups -IncludeFolders
 
 .EXAMPLE
+    .\Find-Duplicates.ps1 -Path D:\Photos -Exclude Thumbs.db, *.tmp -MinimumSize 100KB
+
+.EXAMPLE
     .\Find-Duplicates.ps1 -Validate -OutputFile C:\Reports\share-dupes.xlsx -WhatIf
 #>
 [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Scan')]
@@ -118,6 +134,14 @@ param(
 
     [Parameter(ParameterSetName = 'Scan')]
     [switch] $IgnoreEmptyFiles,
+
+    [Parameter(ParameterSetName = 'Scan')]
+    [ValidateNotNullOrEmpty()]
+    [string[]] $Exclude = @(),
+
+    [Parameter(ParameterSetName = 'Scan')]
+    [ValidateRange(0, [long]::MaxValue)]
+    [long] $MinimumSize = 0,
 
     [Parameter(ParameterSetName = 'Scan')]
     [switch] $IncludeFolders,
@@ -179,9 +203,16 @@ if (Test-Path -LiteralPath $reportFolder -PathType Container) {
 }
 
 Write-Host "Scanning '$scanRoot' ..."
+if (-not $PSBoundParameters.ContainsKey('ThrottleLimit')) {
+    $ThrottleLimit = Get-DefaultThrottleLimit -Path $scanRoot
+    if ($ThrottleLimit -gt 1) {
+        Write-Host "On a network drive: working on $ThrottleLimit folders and files at a time (-ThrottleLimit to change)."
+    }
+}
+if ($Exclude.Count) { Write-Host "Leaving out files and folders named: $($Exclude -join ', ')" }
 $folderInfo = $null  # (not "= if ...": an empty list would be unrolled into $null)
 if ($IncludeFolders) { $folderInfo = [System.Collections.Generic.List[object]]::new() }
-$files = @(Get-FileInventory -Path $scanRoot -ExcludeFile $reportPath -FolderInfo $folderInfo -ThrottleLimit $ThrottleLimit @verbose)
+$files = @(Get-FileInventory -Path $scanRoot -ExcludeFile $reportPath -FolderInfo $folderInfo -ThrottleLimit $ThrottleLimit -ExcludeName $Exclude @verbose)
 Write-Host "Found $($files.Count) files. Checking for duplicates ..."
 
 # Hashes are shared so that folder matching never reads a file twice.
@@ -198,12 +229,15 @@ if (-not $Rehash -and [System.IO.File]::Exists($reportPath)) {
 }
 $matchOptions = @{ SkipCloudOnly = $SkipCloudOnly; ThrottleLimit = $ThrottleLimit; Md5Cache = $md5Cache } + $verbose
 
-$duplicates = @(Find-DuplicateFile -File $files -IgnoreEmptyFiles:$IgnoreEmptyFiles @matchOptions)
+$duplicates = @(Find-DuplicateFile -File $files -IgnoreEmptyFiles:$IgnoreEmptyFiles -MinimumSize $MinimumSize @matchOptions)
 $copies = 0
 foreach ($set in $duplicates) { $copies += $set.Count }
 Write-Host "Found $($duplicates.Count) duplicated files ($copies copies in total)."
 
-$export = @{ DuplicateSet = $duplicates; Path = $reportPath }
+# The smallest file listed, recorded in the report: -IgnoreEmptyFiles means 1 byte.
+$smallest = $MinimumSize
+if ($IgnoreEmptyFiles -and $smallest -lt 1) { $smallest = 1 }
+$export = @{ DuplicateSet = $duplicates; Path = $reportPath; ExcludeName = $Exclude; MinimumSize = $smallest }
 if ($IncludeFolders) {
     Write-Host 'Checking for duplicate folders ...'
     $folderDuplicates = @(Find-DuplicateFolder -File $files -Folder $folderInfo.ToArray() @matchOptions)

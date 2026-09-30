@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
-from .names import sort_key
+from .names import NameFilter, matches_name_filter, name_filter, sort_key
 
 log = logging.getLogger("find_duplicates")
 
@@ -142,6 +142,9 @@ NETWORK_FILE_SYSTEMS = frozenset({
     "fuse.s3fs", "fuse.sshfs", "glusterfs", "gpfs", "lustre", "ncpfs", "nfs", "nfs4", "smb3", "smbfs",
 })
 DRIVE_REMOTE = 4  # GetDriveTypeW: a network drive
+# How many folders and files to list and hash at a time on a network drive when the
+# command line does not say (-j): each request waits on the server.
+NETWORK_THROTTLE_LIMIT = 4
 
 
 def on_network_drive(path: str) -> bool:
@@ -159,6 +162,12 @@ def on_network_drive(path: str) -> bool:
     if sys.platform.startswith("linux"):
         return mount_type(path, _linux_mounts()) in NETWORK_FILE_SYSTEMS
     return False
+
+
+def default_throttle_limit(path: str) -> int:
+    """The -j to use for a scan of ``path`` when none was given: several at a time on a
+    network drive, one otherwise."""
+    return NETWORK_THROTTLE_LIMIT if on_network_drive(path) else 1
 
 
 def mount_type(path: str, mounts: Iterable[Tuple[str, str]]) -> str:
@@ -270,9 +279,15 @@ def _list_folder(path: str) -> _Listing:
     return listing
 
 
-def _tree_listing(root: str, throttle_limit: int, on_folder: Optional[FolderCallback]) -> Dict[str, _Listing]:
+def _tree_listing(
+    root: str,
+    throttle_limit: int,
+    on_folder: Optional[FolderCallback],
+    exclude_filter: Optional[NameFilter] = None,
+) -> Dict[str, _Listing]:
     """List every folder below ``root`` (folder links are not followed), ``throttle_limit``
-    folders at a time; returns folder path -> listing."""
+    folders at a time, leaving out folders whose names match ``exclude_filter`` (see
+    name_filter); returns folder path -> listing."""
     listings: Dict[str, _Listing] = {}
     file_count = 0
     finished: "queue.SimpleQueue[Tuple[str, Future]]" = queue.SimpleQueue()
@@ -293,8 +308,9 @@ def _tree_listing(root: str, throttle_limit: int, on_folder: Optional[FolderCall
             if on_folder is not None:
                 on_folder(path, len(listings), file_count)
             for entry in listing.folders:
-                submit(entry.path)
-                pending += 1
+                if not matches_name_filter(exclude_filter, entry.name):
+                    submit(entry.path)
+                    pending += 1
     return listings
 
 
@@ -304,6 +320,7 @@ def iter_files(
     on_folder: Optional[FolderCallback] = None,
     folders: Optional[List[FolderRecord]] = None,
     throttle_limit: int = 1,
+    exclude_names: Iterable[str] = (),
 ) -> Iterator[FileRecord]:
     """Yield every file below ``root``, recursing into sub folders.
 
@@ -319,6 +336,10 @@ def iter_files(
 
     With ``throttle_limit`` above 1, that many folders on a network drive are listed at
     the same time (see on_network_drive); the files come out in the same order.
+
+    ``exclude_names`` are wildcard patterns (* and ?) of file and folder names to leave
+    out, ignoring case. Left-out folders are not scanned; ``folders`` records each folder
+    as if the left-out files and folders were not there.
     """
     if not os.path.isdir(root):
         raise NotADirectoryError(f"'{root}' is not a folder.")
@@ -326,9 +347,10 @@ def iter_files(
     # Normalised like the scanned paths (long names), or a short-form path would never match.
     excluded = {_same_path_key(full_path(p)) for p in exclude}
     root = full_path(root)
+    exclude_filter = name_filter(exclude_names)
     # Listing several folders at a time lists the whole tree first; it is then walked below
     # exactly as when listing one folder at a time, so the output is the same.
-    listings = _tree_listing(root, throttle_limit, on_folder) if throttle_limit > 1 and on_network_drive(root) else None
+    listings = _tree_listing(root, throttle_limit, on_folder, exclude_filter) if throttle_limit > 1 and on_network_drive(root) else None
     pending = [root]
     folder_count = 0
     file_count = 0
@@ -353,6 +375,8 @@ def iter_files(
             folders.append(FolderRecord(folder, readable=True))
 
         for entry in listing.files:
+            if matches_name_filter(exclude_filter, entry.name):
+                continue
             if _same_path_key(entry.path) in excluded:
                 if folders is not None:
                     folders.append(FolderRecord(folder, readable=False))
@@ -361,8 +385,11 @@ def iter_files(
             yield FileRecord(entry.path, entry.name, folder, entry=entry)
 
         for entry in listing.links:
+            if matches_name_filter(exclude_filter, entry.name):
+                continue
             log.info("Not following link '%s'", entry.path)
             if folders is not None:
                 folders.append(FolderRecord(entry.path, readable=False))
         # Push in reverse so folders are visited in alphabetical order.
-        pending.extend(entry.path for entry in reversed(listing.folders))
+        pending.extend(entry.path for entry in reversed(listing.folders)
+                       if not matches_name_filter(exclude_filter, entry.name))

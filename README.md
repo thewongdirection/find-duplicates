@@ -32,6 +32,7 @@ The tool comes in two versions with the same features and the same output: a
 | Duplicate folders | `-IncludeFolders` also finds whole folders with the same name and identical contents (every file and sub folder), on a second sheet. |
 | Excel output without Excel | Writes a real `.xlsx`: data sheets with a frozen, filterable header and real dates, plus a *Rules* sheet stating in plain words what counts as a match. Excel does not need to be installed. |
 | Empty files optional | `-IgnoreEmptyFiles` leaves files of 0 bytes out of the file duplicates. |
+| Leave things out | `-Exclude` skips files and folders by name (`Thumbs.db`, `.git`, `*.tmp`); `-MinimumSize` leaves small files out. Both are recorded in the report. |
 | Any language | File and folder names in any script (Chinese, Arabic, Cyrillic, emoji ...) are matched and stored correctly; a name typed on a Mac matches the same name saved on Windows. |
 | Validate without rescanning | `-Validate` re-checks every copy listed in an existing report (files with a quick lookup, folders by re-listing them, never reading contents) and removes those that are gone or changed. |
 | Network shares | UNC paths (`\\server\share`) and mapped drives. Unreachable folders are skipped with a warning; an unreachable share never wipes report entries. |
@@ -57,8 +58,19 @@ can have any number of duplicates, in any folders.
 
 Files of 0 bytes all have the same contents, so every same-named empty file
 with the same saved date is a duplicate. They are included by default; add
-`-IgnoreEmptyFiles` to leave them out. (Duplicate folders always compare every
-file, empty ones included.)
+`-IgnoreEmptyFiles` to leave them out, or `-MinimumSize` to leave out every file
+smaller than a given size. (Duplicate folders always compare every file, empty
+and small ones included.)
+
+`-Exclude` leaves files and folders out by name, as if they were not there:
+left-out folders are not scanned at all, and folders are compared without the
+left-out names, so two photo folders still match when only their `Thumbs.db`
+differs. Patterns use `*` for any characters and `?` for any one character, and
+ignore upper/lower case, like names do. They match whole names, not paths: a
+pattern holding `/` or `\` is refused, and the folder being scanned is never left
+out itself. Everything else in a pattern is literal. `-Validate` leaves out the
+same names, read from the report. The smallest file size (`-MinimumSize`, or 1
+byte with `-IgnoreEmptyFiles`) is recorded in the report too.
 
 Names are compared the way people read them: ignoring upper/lower case, and
 ignoring how accented letters are encoded. macOS often stores "é" as "e" plus a
@@ -106,7 +118,8 @@ Here each `Location` is the full path of the duplicate folder itself.
 
 ```text
 Find-Duplicates.ps1 [[-Path] <folder>] [[-OutputFile] <report>] [-ThrottleLimit <1-64>]
-                    [-IncludeFolders] [-IgnoreEmptyFiles] [-SkipCloudOnly] [-Rehash] [-PassThru] [-WhatIf] [-Verbose]
+                    [-IncludeFolders] [-IgnoreEmptyFiles] [-Exclude <pattern[]>] [-MinimumSize <bytes>]
+                    [-SkipCloudOnly] [-Rehash] [-PassThru] [-WhatIf] [-Verbose]
 
 Find-Duplicates.ps1 -Validate [[-OutputFile] <report>] [-ThrottleLimit <1-64>] [-PassThru] [-WhatIf] [-Verbose]
 ```
@@ -122,9 +135,11 @@ If Windows blocks the script, run it as
 |---|---|---|
 | `-Path <folder>` | current folder | Folder to scan, including all sub folders. Also the first positional argument. |
 | `-OutputFile <report>` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced, after its MD5 hashes are reused (see `-Rehash`). Also the second positional argument. |
-| `-ThrottleLimit <1-64>` | `1` | How many files to hash, and folders to list, at the same time. See [Performance](#performance). |
+| `-ThrottleLimit <1-64>` | `4` on a network share or drive, `1` otherwise | How many files to hash, and folders to list, at the same time. See [Performance](#performance). |
 | `-IncludeFolders` | off | Also find [duplicate folders](#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
 | `-IgnoreEmptyFiles` | off | Leave files of 0 bytes out of the duplicate files. |
+| `-Exclude <pattern[]>` | none | Leave files and folders with these names out: see [What counts as a duplicate](#what-counts-as-a-duplicate). Recorded on the *Rules* sheet. |
+| `-MinimumSize <bytes>` | `0` | Leave files smaller than this out of the duplicate files. Takes PowerShell sizes such as `100KB` or `1.5MB`. Recorded on the *Rules* sheet. |
 | `-SkipCloudOnly` | off | Never download online-only cloud files to hash them. Duplicates among such files are then not reported. |
 | `-Rehash` | off | Read every candidate file again. Without it, when the report already exists (from an earlier scan), files it lists whose size and saved date have not changed keep the MD5 recorded there instead of being read again. |
 | `-PassThru` | off | Also return the duplicates as PowerShell objects (for piping or scripting): file sets, then folder sets (which have a `FolderName` property). |
@@ -151,6 +166,9 @@ If Windows blocks the script, run it as
 
 # Leave out empty (0-byte) files
 .\Find-Duplicates.ps1 -Path D:\Photos -IgnoreEmptyFiles
+
+# Leave out thumbnail caches, Git folders, temporary files and files under 100 KB
+.\Find-Duplicates.ps1 -Path D:\Photos -Exclude Thumbs.db, .git, *.tmp -MinimumSize 100KB
 
 # OneDrive without downloading online-only files
 .\Find-Duplicates.ps1 -Path "$env:OneDrive" -SkipCloudOnly
@@ -233,7 +251,7 @@ The workbook has these sheets:
 |---|---|
 | **Duplicates** | One row per duplicated file (below). |
 | **Duplicate Folders** | Only with `-IncludeFolders`: one row per duplicated folder (see [Duplicate folders](#duplicate-folders)). |
-| **Rules** | The matching rules behind the other sheets, in plain words, so anyone reviewing the data can check what a match means. Rewritten with the data, so it always matches the sheets present. |
+| **Rules** | The matching rules behind the other sheets, in plain words, so anyone reviewing the data can check what a match means. Rewritten with the data, so it always matches the sheets present. When the scan used `-Exclude` or `-MinimumSize`, a *Scan settings* section records them; `-Validate` reads it back and keeps it. |
 
 On the *Duplicates* sheet: one row per duplicated file, one column per copy:
 
@@ -305,14 +323,18 @@ around reading as little as possible, and these options help further:
 | What | Effect | When to use it |
 |---|---|---|
 | Built-in pre-filter | Files that differ in name, saved date or size are never read. The size and saved date of a file whose name no other file has are never even looked up (on Linux, macOS and network drives each lookup is a request). | Always on. |
-| `-ThrottleLimit 4` to `8` | Lists several folders and hashes several files at once, hiding per-request latency. Often 2-4x faster, more on slow networks. | SSDs, network shares, cloud folders. Keep `1` for a single spinning hard disk, where parallel reads cause seeking. |
+| Large files compared by their start | Files of 16 MB or more that share a name, saved date and size are first compared by the MD5 of their first 1 MB; only those that still match are read in full. True duplicates cost at most 1/16 more reading. | Always on. |
+| Duplicate folders narrowed by name | Only folders whose name another folder has (and the folders below them) are fingerprinted and have their files looked up. | Always on with `-IncludeFolders`. |
+| `-ThrottleLimit 4` to `8` | Lists several folders and hashes several files at once, hiding per-request latency. Often 2-4x faster, more on slow networks. Scans of a network share or drive use 4 unless told otherwise. | SSDs, network shares, cloud folders. Keep `1` for a single spinning hard disk, where parallel reads cause seeking. |
+| `-Exclude` / `-MinimumSize` | Left-out folders are never listed, and small files are never compared. | Caches, version-control folders, thumbnails, tiny files. |
 | Rescanning to the same report | Files the report lists whose size and saved date have not changed keep their recorded MD5 instead of being read again (`-Rehash` to read them all). | Repeated scans of large libraries or shares. |
 | `-Validate` instead of a rescan | Checks only the files already in the report, without reading them. | After deleting or moving duplicates. |
 | `-SkipCloudOnly` | Avoids downloading online-only files. | Large cloud libraries on a slow connection. |
 | Run it on the file server | Local disk reads instead of network transfers. | Very large network shares. |
 | Scan the narrowest folder | Fewer files to list. | Always worthwhile. |
 
-Also built in: each folder is listed once; large reads with sequential-read
+Also built in: each folder is listed once, and its files and sub folders are
+sorted and split by .NET in one step; large reads with sequential-read
 hints, into a buffer no larger than the file; plain loops
 instead of per-file script blocks when grouping and sorting; a progress display
 redrawn a few times a second rather than per file; parallel hashing through a
