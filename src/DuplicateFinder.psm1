@@ -676,7 +676,7 @@ function Read-ZipXml {
     , $xml  # an XmlDocument would otherwise be enumerated into its child nodes
 }
 
-function New-SpreadsheetNamespace {
+function Get-SpreadsheetNamespace {
     # A namespace manager for one parsed part (s: SpreadsheetML, p: package relationships).
     param([Parameter(Mandatory)] [System.Xml.XmlDocument] $Xml)
     $ns = [System.Xml.XmlNamespaceManager]::new($Xml.NameTable)
@@ -701,20 +701,20 @@ function Get-WorksheetRow {
     if (-not $workbook -or -not $rels) { throw 'The file is not an Excel workbook.' }
 
     $relNs  = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
-    $relId  = $workbook.SelectSingleNode('/s:workbook/s:sheets/s:sheet', (New-SpreadsheetNamespace -Xml $workbook)).GetAttribute('id', $relNs)
-    $target = @($rels.SelectNodes('/p:Relationships/p:Relationship', (New-SpreadsheetNamespace -Xml $rels)) |
+    $relId  = $workbook.SelectSingleNode('/s:workbook/s:sheets/s:sheet', (Get-SpreadsheetNamespace -Xml $workbook)).GetAttribute('id', $relNs)
+    $target = @($rels.SelectNodes('/p:Relationships/p:Relationship', (Get-SpreadsheetNamespace -Xml $rels)) |
             Where-Object { $_.GetAttribute('Id') -eq $relId })[0].GetAttribute('Target')
     $sheetPath = if ($target.StartsWith('/')) { $target.TrimStart('/') } else { "xl/$target" }
 
     $shared = [System.Collections.Generic.List[string]]::new()
     $sharedXml = Read-ZipXml -Archive $Archive -EntryName 'xl/sharedStrings.xml'
     if ($sharedXml) {
-        $sharedNs = New-SpreadsheetNamespace -Xml $sharedXml
+        $sharedNs = Get-SpreadsheetNamespace -Xml $sharedXml
         foreach ($item in $sharedXml.SelectNodes('/s:sst/s:si', $sharedNs)) { $shared.Add((Get-CellText -Node $item -Ns $sharedNs)) }
     }
 
     $sheet = Read-ZipXml -Archive $Archive -EntryName $sheetPath
-    $sheetNs = New-SpreadsheetNamespace -Xml $sheet
+    $sheetNs = Get-SpreadsheetNamespace -Xml $sheet
 
     foreach ($row in $sheet.SelectNodes('/s:worksheet/s:sheetData/s:row', $sheetNs)) {
         $cells = [System.Collections.Generic.Dictionary[int, string]]::new()

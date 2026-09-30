@@ -11,7 +11,7 @@ import time
 from typing import List, Optional, TextIO
 
 from .matcher import MAX_THROTTLE_LIMIT, MIN_THROTTLE_LIMIT, find_duplicate_files
-from .scanner import iter_files
+from .scanner import full_path, iter_files
 from .validate import validate_report
 from .xlsx import export_duplicate_report
 
@@ -170,7 +170,7 @@ def _validate(report: str, dry_run: bool) -> int:
 
 
 def _scan(folder: str, report: str, skip_cloud_only: bool, throttle_limit: int, dry_run: bool) -> int:
-    scan_root = os.path.abspath(folder)
+    scan_root = full_path(folder)
     if not os.path.isdir(scan_root):
         print(f"error: '{folder}' is not a folder.", file=sys.stderr)
         return 1

@@ -64,6 +64,22 @@ def is_cloud_only(record: FileRecord) -> bool:
     return bool(record.attributes & CLOUD_ONLY_ATTRIBUTES)
 
 
+def full_path(path: str) -> str:
+    """Absolute path, with Windows short (8.3) names such as RUNNER~1 expanded.
+
+    Matches the paths PowerShell reports. Links are deliberately not resolved.
+    """
+    path = os.path.abspath(path)
+    if sys.platform == "win32":
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32_768)
+        length = ctypes.windll.kernel32.GetLongPathNameW(path, buffer, len(buffer))
+        if 0 < length < len(buffer):
+            return buffer.value
+    return path
+
+
 def _same_path_key(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
 
@@ -85,7 +101,7 @@ def iter_files(
         raise NotADirectoryError(f"'{root}' is not a folder.")
 
     excluded = {_same_path_key(p) for p in exclude}
-    pending = [os.path.abspath(root)]
+    pending = [full_path(root)]
     folder_count = 0
     file_count = 0
 

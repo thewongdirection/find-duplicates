@@ -88,6 +88,20 @@ class IterFilesTests(TempDirTestCase):
             self.skipTest(f"symbolic links cannot be created here: {exc}")
         self.assertEqual([r.name for r in iter_files(self.root)], ["a.txt"])
 
+    @unittest.skipUnless(sys.platform == "win32", "short (8.3) names are Windows-only")
+    def test_reports_long_folder_names_when_given_a_short_path(self):
+        import ctypes
+
+        add_file(self.root, "a long folder name/x.txt")
+        long_root = scanner.full_path(self.root)  # the temp folder itself may be a short path
+        buffer = ctypes.create_unicode_buffer(32_768)
+        ctypes.windll.kernel32.GetShortPathNameW(long_root, buffer, len(buffer))
+        if not buffer.value or buffer.value == long_root:
+            self.skipTest("short names are disabled on this volume")
+        (record,) = iter_files(buffer.value)
+        self.assertEqual(record.folder, os.path.join(long_root, "a long folder name"))
+        self.assertNotIn("~", record.folder)
+
     def test_rejects_a_path_that_is_not_a_folder(self):
         path = add_file(self.root, "a.txt")
         with self.assertRaisesRegex(NotADirectoryError, "is not a folder"):

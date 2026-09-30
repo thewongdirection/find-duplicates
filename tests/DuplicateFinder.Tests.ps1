@@ -522,7 +522,7 @@ Describe 'Import-DuplicateReport' {
             }
         )
 
-        function New-ExcelSavedWorkbook {
+        function Write-ExcelSavedWorkbook {
             # A workbook shaped like one Excel has re-saved: shared strings, a
             # renamed worksheet part, and cells without explicit types.
             param([string] $Path, [object[][]] $Rows)
@@ -575,7 +575,7 @@ Describe 'Import-DuplicateReport' {
 
     It 'reads a report after Excel has saved it (shared strings, renamed sheet part)' {
         $path = Join-Path (Add-TestRoot) 'excel.xlsx'
-        New-ExcelSavedWorkbook -Path $path -Rows @(
+        Write-ExcelSavedWorkbook -Path $path -Rows @(
             , @('File Name', 'Last Modified', 'Size (bytes)', 'MD5', 'Copies', 'Location 1', 'Location 2')
             , @('x.txt', 45292.5, 10, 'CCCC', 2, 'C:\a', 'C:\b')
         )
@@ -591,7 +591,7 @@ Describe 'Import-DuplicateReport' {
 
     It 'rejects a workbook that is not a duplicates report' {
         $path = Join-Path (Add-TestRoot) 'other.xlsx'
-        New-ExcelSavedWorkbook -Path $path -Rows @(, @('Name', 'Amount'))
+        Write-ExcelSavedWorkbook -Path $path -Rows @(, @('Name', 'Amount'))
         { Import-DuplicateReport -Path $path } | Should -Throw '*is not a duplicates report*'
     }
 
@@ -608,7 +608,7 @@ Describe 'Import-DuplicateReport' {
 
 Describe 'Update-DuplicateReport' {
     BeforeAll {
-        function New-ScannedReport {
+        function Export-ScannedReport {
             # Scans $Root into a report next to it and returns the report path.
             param([string] $Root)
             $path = "$Root.xlsx"
@@ -621,7 +621,7 @@ Describe 'Update-DuplicateReport' {
     It 'leaves the report untouched when every copy still exists' {
         $root = Add-TestRoot
         foreach ($folder in 'a', 'b') { $null = Add-TestFile $root "$folder/x.txt" }
-        $report = New-ScannedReport $root
+        $report = Export-ScannedReport $root
         $before = (Get-Item -LiteralPath $report).LastWriteTimeUtc
 
         $result = Update-DuplicateReport -Path $report
@@ -635,7 +635,7 @@ Describe 'Update-DuplicateReport' {
     It 'removes a copy that no longer exists' {
         $root = Add-TestRoot
         foreach ($folder in 'a', 'b', 'c') { $null = Add-TestFile $root "$folder/x.txt" }
-        $report = New-ScannedReport $root
+        $report = Export-ScannedReport $root
         Remove-Item -LiteralPath (Join-Path $root 'b/x.txt')
 
         $result = Update-DuplicateReport -Path $report
@@ -654,7 +654,7 @@ Describe 'Update-DuplicateReport' {
             $null = Add-TestFile $root "$folder/gone.txt" -Content 'gone'
             $null = Add-TestFile $root "$folder/kept.txt" -Content 'kept'
         }
-        $report = New-ScannedReport $root
+        $report = Export-ScannedReport $root
         Remove-Item -LiteralPath (Join-Path $root 'a/gone.txt')
 
         $result = Update-DuplicateReport -Path $report
@@ -666,7 +666,7 @@ Describe 'Update-DuplicateReport' {
     It 'removes a copy that was changed since the scan' {
         $root = Add-TestRoot
         foreach ($folder in 'a', 'b', 'c') { $null = Add-TestFile $root "$folder/x.txt" }
-        $report = New-ScannedReport $root
+        $report = Export-ScannedReport $root
         $null = Add-TestFile $root 'c/x.txt' -Content 'edited' -SavedUtc $script:Saved.AddHours(1)
 
         $result = Update-DuplicateReport -Path $report
@@ -679,7 +679,7 @@ Describe 'Update-DuplicateReport' {
         $root = Add-TestRoot
         $null = Add-TestFile $root 'a/Photo.JPG'
         $null = Add-TestFile $root 'b/photo.jpg'
-        $report = New-ScannedReport $root
+        $report = Export-ScannedReport $root
 
         $result = Update-DuplicateReport -Path $report
 
@@ -690,7 +690,7 @@ Describe 'Update-DuplicateReport' {
     It 'keeps copies on a drive or share that cannot be reached' {
         $root = Add-TestRoot
         foreach ($folder in 'a', 'b') { $null = Add-TestFile $root "$folder/x.txt" }
-        $report = New-ScannedReport $root
+        $report = Export-ScannedReport $root
         Mock -ModuleName DuplicateFinder Test-DuplicateCopy { 'Unavailable' }
 
         $result = Update-DuplicateReport -Path $report -WarningVariable warnings -WarningAction SilentlyContinue
@@ -716,7 +716,7 @@ Describe 'Update-DuplicateReport' {
     It 'changes nothing with -WhatIf' {
         $root = Add-TestRoot
         foreach ($folder in 'a', 'b', 'c') { $null = Add-TestFile $root "$folder/x.txt" }
-        $report = New-ScannedReport $root
+        $report = Export-ScannedReport $root
         Remove-Item -LiteralPath (Join-Path $root 'a/x.txt')
 
         $result = Update-DuplicateReport -Path $report -WhatIf
@@ -762,6 +762,19 @@ Describe 'Find-Duplicates.ps1' {
         $workDir = Add-TestRoot
         $null = & $script:ScriptPath -Path $script:Root -OutputFile (Join-Path $workDir 'my-report') 6>$null
         Join-Path $workDir 'my-report.xlsx' | Should -Exist
+    }
+
+    It 'reports long folder names when given a short path' {
+        if (-not $script:OnWindows) { Set-ItResult -Skipped -Because 'short (8.3) names are Windows-only'; return }
+        $root = (Get-Item -LiteralPath (Add-TestRoot)).FullName
+        $null = Add-TestFile $root 'a long folder name/x.txt'
+        $null = Add-TestFile $root 'another long name/x.txt'
+        $short = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($root).ShortPath
+        if ($short -eq $root) { Set-ItResult -Skipped -Because 'short names are disabled on this volume'; return }
+
+        $result = @(& $script:ScriptPath -Path $short -OutputFile (Join-Path (Add-TestRoot) 'short.xlsx') -PassThru 6>$null)
+
+        $result[0].Folders | ForEach-Object { $_ | Should -Not -BeLike '*~*' }
     }
 
     It 'scans a network share given as a UNC path' {
