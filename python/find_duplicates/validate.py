@@ -8,15 +8,16 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import stat
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Optional, Sequence, TypeVar
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 from .folders import DuplicateFolderSet
 from .matcher import DuplicateSet
 from .names import name_key
-from .scanner import FolderRecord, iter_files, local_time
+from .scanner import FileRecord, FolderRecord, iter_files, local_time
 from .xlsx import export_duplicate_report, read_duplicate_workbook
 
 log = logging.getLogger("find_duplicates")
@@ -126,20 +127,62 @@ def check_copy(
             # Not a plain file: a name Windows reserves for a device (NUL, CON ...). It cannot
             # be checked, so it is kept, never removed.
             return UNAVAILABLE
-        seconds = info.st_mtime_ns // 1_000_000_000
-        if utc_offset is None:
-            # Compare local wall-clock seconds, as PowerShell does; this is also correct in the
-            # repeated hour when daylight saving time ends (naive comparisons ignore "fold").
-            same_date = local_time(seconds) == last_write_time.replace(microsecond=0)
-        else:
-            # Compare instants: correct whatever this computer's time zone.
-            same_date = seconds == (last_write_time - utc_offset - _EPOCH) // timedelta(seconds=1)
+        same_date = same_saved_date(info.st_mtime_ns, last_write_time, utc_offset)
     except FileNotFoundError:
         return MISSING  # deleted while being checked
     except (OSError, OverflowError, ValueError):
         return UNAVAILABLE
 
     return PRESENT if info.st_size == size_bytes and same_date else CHANGED
+
+
+def same_saved_date(mtime_ns: int, last_write_time: datetime, utc_offset: Optional[timedelta]) -> bool:
+    """True when a file's saved time is a report's, to the whole second: compared as instants
+    when the report has the UTC offset (correct whatever this computer's time zone), as local
+    times otherwise (reports made before the UTC Offset column), as PowerShell does."""
+    seconds = mtime_ns // 1_000_000_000
+    if utc_offset is None:
+        # Also correct in the repeated hour when daylight saving time ends (naive comparisons
+        # ignore "fold").
+        return local_time(seconds) == last_write_time.replace(microsecond=0)
+    return seconds == (last_write_time - utc_offset - _EPOCH) // timedelta(seconds=1)
+
+
+_MD5 = re.compile("[0-9A-Fa-f]{32}")
+
+
+def previous_md5(report: str, files: Sequence[FileRecord]) -> Dict[str, str]:
+    """MD5 hashes to take from an earlier report instead of reading the files again.
+
+    Returns full path -> MD5 for each scanned file that the report lists (same folder and
+    name, ignoring case) whose size and saved date are still the report's. Only those
+    files' details are looked up. MD5s that are not 32 hexadecimal digits (an edited
+    report) are ignored.
+    """
+    rows = read_duplicate_workbook(report).files
+    wanted = {name_key(row.file_name) for row in rows}
+    scanned: Dict[Tuple[str, str], FileRecord] = {}
+    for record in files:
+        key = name_key(record.name)
+        if key in wanted:
+            scanned.setdefault((record.folder, key), record)
+
+    previous: Dict[str, str] = {}
+    for row in rows:
+        if not _MD5.fullmatch(row.md5 or ""):
+            continue
+        name = name_key(row.file_name)
+        for folder in row.folders:
+            record = scanned.get((folder, name))
+            if record is None:
+                continue
+            try:
+                same = record.size == row.size_bytes and same_saved_date(record.mtime_ns, row.last_write_time, row.utc_offset)
+            except OSError:
+                continue  # hashed (and reported on) as usual
+            if same:
+                previous[record.path] = row.md5.upper()
+    return previous
 
 
 def check_folder_copy(

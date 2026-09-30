@@ -13,8 +13,10 @@ from typing import Dict, List, Optional, TextIO
 from .folders import find_duplicate_folders
 from .matcher import MAX_THROTTLE_LIMIT, MIN_THROTTLE_LIMIT, find_duplicate_files
 from .scanner import FolderRecord, full_path, iter_files
-from .validate import validate_report
+from .validate import previous_md5, validate_report
 from .xlsx import export_duplicate_report
+
+log = logging.getLogger("find_duplicates")
 
 DEFAULT_OUTPUT = "duplicates.xlsx"
 PROGRESS_INTERVAL_SECONDS = 0.25
@@ -27,7 +29,8 @@ SCAN (default): two files are duplicates only when ALL three of these match:
 file name (case-insensitive), saved date (last modified time, to the whole
 second) and MD5 hash of the contents. MD5 is only calculated for files whose
 name and saved date already match another file (and whose size matches too),
-so most files are never read. Files of 0 bytes are included unless
+so most files are never read. When the report already exists, unchanged files
+keep the MD5 recorded there. Files of 0 bytes are included unless
 --ignore-empty-files is used. A "Rules" sheet in the report states the
 matching rules in plain words.
 
@@ -141,6 +144,12 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     parser.add_argument(
         "--folders", action="store_true", help='Also find duplicate folders and save them on the "Duplicate Folders" sheet.'
     )
+    parser.add_argument(
+        "--rehash",
+        action="store_true",
+        help="Read every candidate file again. Without it, when the report already exists (from an earlier "
+        "scan), files it lists whose size and saved date have not changed keep the MD5 hash recorded there.",
+    )
     parser.add_argument("--validate", action="store_true", help="Re-check an existing report instead of scanning.")
     parser.add_argument(
         "--dry-run", action="store_true", help="Show what would be saved or removed without changing the report."
@@ -149,10 +158,10 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     args = parser.parse_args(argv)
 
     if args.validate:
-        if args.skip_cloud_only or args.throttle_limit != 1 or args.folders or args.ignore_empty_files:
+        if args.skip_cloud_only or args.throttle_limit != 1 or args.folders or args.ignore_empty_files or args.rehash:
             parser.error(
-                "--skip-cloud-only, --throttle-limit, --folders and --ignore-empty-files only apply to a scan, "
-                "not to --validate"
+                "--skip-cloud-only, --throttle-limit, --folders, --ignore-empty-files and --rehash only apply to a "
+                "scan, not to --validate"
             )
         if len([value for value in (args.path, args.output, args.output_option) if value]) > 1:
             parser.error("--validate takes a single report")
@@ -206,6 +215,7 @@ def _scan(
     include_folders: bool,
     ignore_empty_files: bool,
     dry_run: bool,
+    rehash: bool = False,
 ) -> int:
     scan_root = full_path(folder)
     if not os.path.isdir(scan_root):
@@ -229,6 +239,17 @@ def _scan(
 
     # Hashes are shared so that folder matching never reads a file twice.
     md5_cache: Dict[str, str] = {}
+
+    # An earlier report's hashes are reused for files that have not changed since.
+    if not rehash and os.path.isfile(report):
+        try:
+            previous = previous_md5(report, files)
+        except (OSError, ValueError) as exc:
+            log.warning("Not reusing MD5 hashes from '%s': %s", report, exc)
+        else:
+            md5_cache.update(previous)
+            if previous:
+                print(f"Reusing {len(previous)} MD5 hashes from the previous report (--rehash to read every file again).")
     options = dict(
         skip_cloud_only=skip_cloud_only,
         throttle_limit=throttle_limit,
@@ -285,4 +306,5 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.folders,
         args.ignore_empty_files,
         args.dry_run,
+        args.rehash,
     )

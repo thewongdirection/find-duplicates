@@ -1647,26 +1647,87 @@ function Test-DuplicateCopy {
         $path = [System.IO.Path]::Combine($Folder, $FileName)
         $file = if ([System.IO.File]::Exists($path)) { [System.IO.FileInfo] $path } else { Find-FileByNameKey -Folder $Folder -FileName $FileName }
         if (-not $file) { return 'Missing' }
-        $size    = $file.Length
-        $written = $file.LastWriteTime
-        if ($null -ne $UtcOffset) { $written = $file.LastWriteTimeUtc }
+        # (Getter methods, not properties: PowerShell turns a failing property into $null.)
+        $size  = $file.get_Length()
+        $local = $file.get_LastWriteTime()
+        $utc   = $file.get_LastWriteTimeUtc()
     }
-    catch [System.IO.FileNotFoundException] { return 'Missing' }  # deleted while being checked
-    catch [System.UnauthorizedAccessException], [System.IO.IOException], [System.Security.SecurityException] {
-        return 'Unavailable'
+    catch {
+        $reason = $_.Exception
+        while ($reason.InnerException) { $reason = $reason.InnerException }
+        if ($reason -is [System.IO.FileNotFoundException]) { return 'Missing' }  # deleted while being checked
+        return 'Unavailable'  # something that cannot be checked is kept, never removed
     }
 
-    # Something that cannot be checked is kept, never removed.
-    if ($size -isnot [long] -or $written -isnot [datetime]) { return 'Unavailable' }
-
-    # Whole seconds, in exact integer arithmetic (as when scanning); in UTC when the offset is known.
-    $ticksPerSecond = [System.TimeSpan]::TicksPerSecond
-    $ticks = $written.Ticks
-    $savedTicks = $LastWriteTime.Ticks
-    if ($null -ne $UtcOffset) { $savedTicks -= ([TimeSpan] $UtcOffset).Ticks }
-    if ($size -ne $SizeBytes -or
-        ($ticks - ($ticks % $ticksPerSecond)) -ne ($savedTicks - ($savedTicks % $ticksPerSecond))) { return 'Changed' }
+    if ($size -ne $SizeBytes -or -not (Test-SameSavedDate -Local $local -Utc $utc -LastWriteTime $LastWriteTime -UtcOffset $UtcOffset)) {
+        return 'Changed'
+    }
     'Present'
+}
+
+function Test-SameSavedDate {
+    <#
+        True when a file's saved date (as $Local and $Utc) is a report's, to the whole second,
+        in exact integer arithmetic as when scanning: compared as instants when the report has
+        the UTC offset, as local times otherwise (reports made before the UTC Offset column).
+    #>
+    param(
+        [Parameter(Mandatory)] [datetime] $Local,
+        [Parameter(Mandatory)] [datetime] $Utc,
+        [Parameter(Mandatory)] [datetime] $LastWriteTime,
+        [AllowNull()] [object] $UtcOffset
+    )
+    $ticks = $Local.Ticks
+    $saved = $LastWriteTime.Ticks
+    if ($null -ne $UtcOffset) { $ticks = $Utc.Ticks; $saved -= ([TimeSpan] $UtcOffset).Ticks }
+    $ticksPerSecond = [System.TimeSpan]::TicksPerSecond
+    ($ticks - ($ticks % $ticksPerSecond)) -eq ($saved - ($saved % $ticksPerSecond))
+}
+
+function Get-PreviousMd5 {
+    <#
+    .SYNOPSIS
+        MD5 hashes to take from an earlier report instead of reading the files again.
+    .DESCRIPTION
+        Returns full path -> MD5 for each scanned file that the report lists (same folder
+        and name, ignoring case) whose size and saved date are still the report's. Only
+        those files' details are looked up. MD5s that are not 32 hexadecimal digits (an
+        edited report) are ignored.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [System.IO.FileInfo[]] $File
+    )
+
+    $rows = @((Read-DuplicateWorkbook -Path $Path).Files)
+    $names = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($row in $rows) { $null = $names.Add($row.FileName) }
+
+    # Folder + separator + name key -> scanned file, for the names the report lists.
+    $separator = [string] [char] 0
+    $scanned = [System.Collections.Generic.Dictionary[string, System.IO.FileInfo]]::new([System.StringComparer]::Ordinal)
+    foreach ($f in $File) {
+        if (-not $names.Contains($f.Name)) { continue }
+        $key = $f.DirectoryName + $separator + (ConvertTo-NameKey $f.Name)
+        if (-not $scanned.ContainsKey($key)) { $scanned[$key] = $f }
+    }
+
+    $previous = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+    foreach ($row in $rows) {
+        if ([string] $row.MD5 -notmatch '^[0-9A-Fa-f]{32}$') { continue }
+        $name = $separator + (ConvertTo-NameKey $row.FileName)
+        foreach ($folder in $row.Folders) {
+            $f = $null
+            if (-not $scanned.TryGetValue($folder + $name, [ref] $f)) { continue }
+            # A file whose details cannot be read is simply hashed (and reported on) as usual.
+            try { $size = $f.get_Length(); $local = $f.get_LastWriteTime(); $utc = $f.get_LastWriteTimeUtc() }
+            catch { continue }
+            if ($size -eq $row.SizeBytes -and (Test-SameSavedDate -Local $local -Utc $utc -LastWriteTime $row.LastWriteTime -UtcOffset $row.UtcOffset)) {
+                $previous[$f.FullName] = ([string] $row.MD5).ToUpperInvariant()
+            }
+        }
+    }
+    , $previous
 }
 
 function Test-DuplicateFolderCopy {
@@ -1832,4 +1893,4 @@ function Update-DuplicateReport {
 #endregion
 
 Export-ModuleMember -Function Get-FileInventory, Find-DuplicateFile, Find-DuplicateFolder, Export-DuplicateReport,
-    ConvertTo-ColumnName, Import-DuplicateReport, Import-DuplicateFolderReport, Update-DuplicateReport
+    ConvertTo-ColumnName, Import-DuplicateReport, Import-DuplicateFolderReport, Update-DuplicateReport, Get-PreviousMd5

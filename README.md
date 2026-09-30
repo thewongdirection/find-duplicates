@@ -106,7 +106,7 @@ Here each `Location` is the full path of the duplicate folder itself.
 
 ```text
 Find-Duplicates.ps1 [[-Path] <folder>] [[-OutputFile] <report>] [-ThrottleLimit <1-64>]
-                    [-IncludeFolders] [-IgnoreEmptyFiles] [-SkipCloudOnly] [-PassThru] [-WhatIf] [-Verbose]
+                    [-IncludeFolders] [-IgnoreEmptyFiles] [-SkipCloudOnly] [-Rehash] [-PassThru] [-WhatIf] [-Verbose]
 
 Find-Duplicates.ps1 -Validate [[-OutputFile] <report>] [-PassThru] [-WhatIf] [-Verbose]
 ```
@@ -121,11 +121,12 @@ If Windows blocks the script, run it as
 | Parameter | Default | What it does |
 |---|---|---|
 | `-Path <folder>` | current folder | Folder to scan, including all sub folders. Also the first positional argument. |
-| `-OutputFile <report>` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced. Also the second positional argument. |
+| `-OutputFile <report>` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced, after its MD5 hashes are reused (see `-Rehash`). Also the second positional argument. |
 | `-ThrottleLimit <1-64>` | `1` | How many files to hash, and folders to list, at the same time. See [Performance](#performance). |
 | `-IncludeFolders` | off | Also find [duplicate folders](#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
 | `-IgnoreEmptyFiles` | off | Leave files of 0 bytes out of the duplicate files. |
 | `-SkipCloudOnly` | off | Never download online-only cloud files to hash them. Duplicates among such files are then not reported. |
+| `-Rehash` | off | Read every candidate file again. Without it, when the report already exists (from an earlier scan), files it lists whose size and saved date have not changed keep the MD5 recorded there instead of being read again. |
 | `-PassThru` | off | Also return the duplicates as PowerShell objects (for piping or scripting): file sets, then folder sets (which have a `FolderName` property). |
 | `-WhatIf` | off | Scan and report the totals, but do not save the report. |
 | `-Verbose` | off | Print every folder as it is scanned, and every link or online-only file skipped. |
@@ -302,6 +303,7 @@ around reading as little as possible, and these options help further:
 |---|---|---|
 | Built-in pre-filter | Files that differ in name, saved date or size are never read. The size and saved date of a file whose name no other file has are never even looked up (on Linux, macOS and network drives each lookup is a request). | Always on. |
 | `-ThrottleLimit 4` to `8` | Lists several folders and hashes several files at once, hiding per-request latency. Often 2-4x faster, more on slow networks. | SSDs, network shares, cloud folders. Keep `1` for a single spinning hard disk, where parallel reads cause seeking. |
+| Rescanning to the same report | Files the report lists whose size and saved date have not changed keep their recorded MD5 instead of being read again (`-Rehash` to read them all). | Repeated scans of large libraries or shares. |
 | `-Validate` instead of a rescan | Checks only the files already in the report, without reading them. | After deleting or moving duplicates. |
 | `-SkipCloudOnly` | Avoids downloading online-only files. | Large cloud libraries on a slow connection. |
 | Run it on the file server | Local disk reads instead of network transfers. | Very large network shares. |

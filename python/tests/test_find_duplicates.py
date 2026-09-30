@@ -604,6 +604,53 @@ def add_doctype_to_workbook_part(path):
             archive.writestr(name, data)
 
 
+class PreviousMd5Tests(TempDirTestCase):
+    def scanned_tree(self):
+        """Two duplicated files, each in two folders, and a report of them."""
+        root = self.new_dir("tree")
+        for path in ("a/x.txt", "b/x.txt"):
+            add_file(root, path, "x")
+        for path in ("c/y.txt", "d/y.txt"):
+            add_file(root, path, "y")
+        report = root + ".xlsx"
+        export_duplicate_report(find_duplicate_files(list(iter_files(root))), report)
+        return root, report
+
+    def test_takes_the_md5_hashes_of_unchanged_files_from_the_previous_report(self):
+        root, report = self.scanned_tree()
+        with open(os.path.join(root, "c", "y.txt"), "w") as stream:
+            stream.write("z")  # same size, new contents, saved now
+
+        previous = validate.previous_md5(report, list(iter_files(root)))
+
+        self.assertEqual(sorted(previous), [os.path.join(root, p) for p in ("a/x.txt", "b/x.txt", "d/y.txt")])
+        self.assertEqual(previous[os.path.join(root, "a", "x.txt")], md5_file(os.path.join(root, "a", "x.txt")))
+
+    def test_does_not_read_files_again_whose_md5_the_previous_report_holds(self):
+        root, report = self.scanned_tree()
+        files = list(iter_files(root))
+        cache = validate.previous_md5(report, files)
+
+        with mock.patch.object(matcher, "md5_file", side_effect=AssertionError("read again")), \
+                mock.patch.object(matcher.log, "warning") as warning:
+            result = find_duplicate_files(files, md5_cache=cache)
+
+        warning.assert_not_called()
+        self.assertEqual(len(result), 2)
+
+    def test_ignores_an_md5_in_the_previous_report_that_is_not_an_md5(self):
+        paths = [add_file(self.root, "a/x.txt"), add_file(self.root, "b/x.txt")]
+        files = self.records(*paths)
+        report = os.path.join(self.root, "edited.xlsx")
+        first = files[0]
+        export_duplicate_report([DuplicateSet(
+            "x.txt", local_time(first.mtime_ns / 1e9), first.size, "not an md5", 2, [f.folder for f in files],
+            utc_offset=utc_offset(first.mtime_ns // 1_000_000_000),
+        )], report)
+
+        self.assertEqual(validate.previous_md5(report, files), {})
+
+
 class ValidateReportTests(TempDirTestCase):
     def scanned_report(self, root):
         """Scan root into a report next to it and return the report path."""
@@ -852,6 +899,29 @@ class CliTests(TempDirTestCase):
     def test_rejects_scan_options_with_validate(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             cli.main(["--validate", "-j", "4"])
+
+    def test_reuses_the_previous_reports_md5_hashes_and_reads_every_file_again_with_rehash(self):
+        report = os.path.join(self.new_dir("work"), "again.xlsx")
+        self.run_cli(self.data, report)
+
+        _, second = self.run_cli(self.data, report)
+        _, third = self.run_cli(self.data, report, "--rehash")
+
+        self.assertIn("Reusing 3 MD5 hashes from the previous report", second)
+        self.assertNotIn("Reusing", third)
+        self.assertEqual(len(read_duplicate_report(report)), 1)
+
+    def test_scans_normally_when_the_previous_report_cannot_be_read(self):
+        report = os.path.join(self.new_dir("work"), "damaged.xlsx")
+        with open(report, "w") as stream:
+            stream.write("not a workbook")
+
+        with self.assertLogs("find_duplicates", "WARNING") as logs:
+            code, _ = self.run_cli(self.data, report)
+
+        self.assertEqual(code, 0)
+        self.assertIn(f"Not reusing MD5 hashes from '{report}'", "\n".join(logs.output))
+        self.assertEqual(len(read_duplicate_report(report)), 1)
 
     def test_does_not_scan_its_own_report(self):
         report = os.path.join(self.data, "duplicates.xlsx")

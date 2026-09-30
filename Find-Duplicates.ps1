@@ -12,7 +12,8 @@
       * MD5 hash of the contents
 
     MD5 is only calculated for files whose name and saved date already match
-    another file (and whose size matches too), so most files are never read.
+    another file (and whose size matches too), so most files are never read. When
+    the report already exists, unchanged files keep the MD5 recorded there.
     Files of 0 bytes are included unless -IgnoreEmptyFiles is used.
 
     A "Rules" sheet in the report states the matching rules in plain words.
@@ -66,6 +67,11 @@
 .PARAMETER IncludeFolders
     Also find duplicate folders and save them on the "Duplicate Folders" sheet.
 
+.PARAMETER Rehash
+    Read every candidate file again. Without it, when the report already exists (from
+    an earlier scan), files it lists whose size and saved date have not changed keep the
+    MD5 hash recorded there instead of being read again.
+
 .PARAMETER Validate
     Re-check an existing report instead of scanning.
 
@@ -114,6 +120,9 @@ param(
 
     [Parameter(ParameterSetName = 'Scan')]
     [switch] $IncludeFolders,
+
+    [Parameter(ParameterSetName = 'Scan')]
+    [switch] $Rehash,
 
     [Parameter(ParameterSetName = 'Validate', Mandatory)]
     [switch] $Validate,
@@ -176,6 +185,16 @@ Write-Host "Found $($files.Count) files. Checking for duplicates ..."
 
 # Hashes are shared so that folder matching never reads a file twice.
 $md5Cache = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+
+# An earlier report's hashes are reused for files that have not changed since.
+if (-not $Rehash -and [System.IO.File]::Exists($reportPath)) {
+    try {
+        $previous = Get-PreviousMd5 -Path $reportPath -File $files
+        foreach ($entry in $previous.GetEnumerator()) { $md5Cache[$entry.Key] = $entry.Value }
+        if ($previous.Count) { Write-Host "Reusing $($previous.Count) MD5 hashes from the previous report (-Rehash to read every file again)." }
+    }
+    catch { Write-Warning "Not reusing MD5 hashes from '$reportPath': $($_.Exception.Message)" }
+}
 $matchOptions = @{ SkipCloudOnly = $SkipCloudOnly; ThrottleLimit = $ThrottleLimit; Md5Cache = $md5Cache } + $verbose
 
 $duplicates = @(Find-DuplicateFile -File $files -IgnoreEmptyFiles:$IgnoreEmptyFiles @matchOptions)

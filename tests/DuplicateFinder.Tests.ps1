@@ -968,6 +968,54 @@ Describe 'Update-DuplicateReport' {
     }
 }
 
+Describe 'Get-PreviousMd5' {
+    BeforeAll {
+        function New-ScannedTree {
+            # Two duplicated files, each in two folders, and a report of them.
+            $root = Add-TestRoot
+            foreach ($path in 'a/x.txt', 'b/x.txt') { $null = Add-TestFile $root $path -Content 'x' }
+            foreach ($path in 'c/y.txt', 'd/y.txt') { $null = Add-TestFile $root $path -Content 'y' }
+            $report = "$root.xlsx"
+            Export-DuplicateReport -DuplicateSet @(Find-DuplicateFile -File @(Get-FileInventory -Path $root)) -Path $report
+            [pscustomobject] @{ Root = $root; Report = $report }
+        }
+    }
+
+    It 'takes the MD5 hashes of unchanged files from the previous report' {
+        $tree = New-ScannedTree
+        [System.IO.File]::WriteAllText((Join-Path $tree.Root 'c/y.txt'), 'z')  # same size, new contents, saved now
+
+        $previous = Get-PreviousMd5 -Path $tree.Report -File @(Get-FileInventory -Path $tree.Root)
+
+        @($previous.Keys | Sort-Object) | Should -Be @('a/x.txt', 'b/x.txt', 'd/y.txt' | ForEach-Object { Join-Path $tree.Root $_ })
+        $previous[(Join-Path $tree.Root 'a/x.txt')] | Should -Be (Get-FileHash -LiteralPath (Join-Path $tree.Root 'a/x.txt') -Algorithm MD5).Hash
+    }
+
+    It 'does not read files again whose MD5 the previous report holds' {
+        $tree = New-ScannedTree
+        $files = @(Get-FileInventory -Path $tree.Root)
+        $cache = Get-PreviousMd5 -Path $tree.Report -File $files
+        Mock -ModuleName DuplicateFinder Get-FileMd5 { throw 'read again' }
+
+        $result = @(Find-DuplicateFile -File $files -Md5Cache $cache -WarningVariable warnings -WarningAction SilentlyContinue)
+
+        @($warnings).Count | Should -Be 0
+        $result.Count | Should -Be 2
+    }
+
+    It 'ignores an MD5 in the previous report that is not an MD5' {
+        $root = Add-TestRoot
+        $files = @(Add-TestFile $root 'a/x.txt'; Add-TestFile $root 'b/x.txt')
+        $report = "$root.xlsx"
+        Export-DuplicateReport -Path $report -DuplicateSet @([pscustomobject] @{
+                FileName = 'x.txt'; LastWriteTime = $files[0].LastWriteTime; UtcOffset = $files[0].LastWriteTime - $files[0].LastWriteTimeUtc
+                SizeBytes = $files[0].Length; MD5 = 'not an md5'; Count = 2; Folders = [string[]] $files.DirectoryName
+            })
+
+        (Get-PreviousMd5 -Path $report -File $files).Count | Should -Be 0
+    }
+}
+
 Describe 'Find-DuplicateFolder' {
     BeforeAll {
         function Get-FolderScan {
@@ -1553,6 +1601,32 @@ Describe 'Find-Duplicates.ps1' {
         $null = & $script:ScriptPath -Validate $out 6>$null
 
         @(Import-DuplicateFolderReport -Path $out)[0].Count | Should -Be 2
+    }
+
+    It 'reuses the previous report''s MD5 hashes, and reads every file again with -Rehash' {
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b') { $null = Add-TestFile $root "$folder/x.txt" }
+        $out = Join-Path (Add-TestRoot) 'again.xlsx'
+        $null = & $script:ScriptPath -Path $root -OutputFile $out 6>$null
+
+        $second = & $script:ScriptPath -Path $root -OutputFile $out 6>&1 | Out-String
+        $third = & $script:ScriptPath -Path $root -OutputFile $out -Rehash 6>&1 | Out-String
+
+        $second | Should -BeLike '*Reusing 2 MD5 hashes from the previous report*'
+        $third | Should -Not -BeLike '*Reusing*'
+        @(Import-DuplicateReport -Path $out).Count | Should -Be 1
+    }
+
+    It 'scans normally when the previous report cannot be read' {
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b') { $null = Add-TestFile $root "$folder/x.txt" }
+        $out = Join-Path (Add-TestRoot) 'damaged.xlsx'
+        Set-Content -LiteralPath $out -Value 'not a workbook'
+
+        $null = & $script:ScriptPath -Path $root -OutputFile $out -WarningVariable warnings -WarningAction SilentlyContinue 6>$null
+
+        "$warnings" | Should -BeLike "*Not reusing MD5 hashes from '$out'*"
+        @(Import-DuplicateReport -Path $out).Count | Should -Be 1
     }
 
     It 'does not scan its own report when it is saved inside the scanned folder' {

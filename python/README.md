@@ -30,7 +30,7 @@ Built-in help: `python -m find_duplicates --help`.
 ## Command reference
 
 ```text
-python -m find_duplicates [path] [output] [-o FILE] [-j N] [--folders] [--ignore-empty-files] [--skip-cloud-only] [--dry-run] [-v]
+python -m find_duplicates [path] [output] [-o FILE] [-j N] [--folders] [--ignore-empty-files] [--skip-cloud-only] [--rehash] [--dry-run] [-v]
 python -m find_duplicates --validate [report] [--dry-run] [-v]
 ```
 
@@ -43,6 +43,7 @@ python -m find_duplicates --validate [report] [--dry-run] [-v]
 | `-j N`, `--throttle-limit N` | `1` | How many files to hash, and folders to list, at the same time (1-64). Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk. |
 | `--folders` | off | Also find [duplicate folders](../README.md#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
 | `--ignore-empty-files` | off | Leave files of 0 bytes out of the duplicate files. |
+| `--rehash` | off | Read every candidate file again. Without it, when the report already exists (from an earlier scan), files it lists whose size and saved date have not changed keep the MD5 recorded there instead of being read again. |
 | `--skip-cloud-only` | off | Never download online-only cloud files to hash them. Duplicates among such files are then not reported. |
 | `--dry-run` | off | Scan and report the totals, but do not save the report. |
 | `-v`, `--verbose` | off | Print every folder as it is scanned, and every link or online-only file skipped. |
@@ -92,7 +93,7 @@ drive or share that cannot be reached are kept. See the
 | `--dry-run` | off | Report what would be removed, but do not change the report. |
 | `-v`, `--verbose` | off | Print every copy that is removed and why. |
 
-`--skip-cloud-only`, `--throttle-limit`, `--folders` and `--ignore-empty-files` only apply to a scan.
+`--skip-cloud-only`, `--throttle-limit`, `--folders`, `--ignore-empty-files` and `--rehash` only apply to a scan.
 Duplicate folders, when the report has them, are re-checked too.
 
 ```sh
@@ -137,6 +138,7 @@ result = validate_report("duplicates.xlsx", dry_run=True)        # summary: remo
 | `-ThrottleLimit N` | `-j N` / `--throttle-limit N` |
 | `-IncludeFolders` | `--folders` |
 | `-IgnoreEmptyFiles` | `--ignore-empty-files` |
+| `-Rehash` | `--rehash` |
 | `-SkipCloudOnly` | `--skip-cloud-only` |
 | `-Validate` | `--validate` |
 | `-WhatIf` | `--dry-run` |
@@ -149,6 +151,7 @@ result = validate_report("duplicates.xlsx", dry_run=True)        # summary: remo
 | `Import-DuplicateReport` | `read_duplicate_report()` |
 | `Import-DuplicateFolderReport` | `read_duplicate_folder_report()` |
 | `Update-DuplicateReport` | `validate_report()` |
+| `Get-PreviousMd5` | `previous_md5()` |
 
 ## Unicode
 

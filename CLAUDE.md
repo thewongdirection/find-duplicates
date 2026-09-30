@@ -12,7 +12,7 @@ that must behave identically:
 | Name comparison     | `ConvertTo-NameKey`, .NET ordinal comparers | `python/find_duplicates/names.py` |
 | Excel output/input  | `Export-DuplicateReport`, `Import-DuplicateReport` and helpers | `python/find_duplicates/xlsx.py` |
 | Duplicate folders   | `Find-DuplicateFolder`, `Get-FolderTree`, `Get-FolderSignature` | `python/find_duplicates/folders.py` |
-| Validation          | `Update-DuplicateReport`, `Invoke-CopyCheck`, `Test-DuplicateCopy`, `Test-DuplicateFolderCopy`, `Test-PathRootReachable` | `python/find_duplicates/validate.py` |
+| Validation, hash reuse | `Update-DuplicateReport`, `Invoke-CopyCheck`, `Test-DuplicateCopy`, `Test-DuplicateFolderCopy`, `Test-PathRootReachable`, `Test-SameSavedDate`, `Get-PreviousMd5` | `python/find_duplicates/validate.py` |
 | Tests               | `tests/DuplicateFinder.Tests.ps1`    | `python/tests/test_find_duplicates.py`, `test_folders.py`, `test_unicode.py`, `test_edge_cases.py` |
 | Cross-language test | —                                    | `python/tests/test_parity.py`          |
 
@@ -34,6 +34,7 @@ Every new feature, behaviour change or bug fix is done in this order:
 Command-line options map one to one: `-Path` ↔ `path`,
 `-OutputFile` ↔ `output` / `-o`, `-ThrottleLimit` ↔ `-j` / `--throttle-limit`,
 `-IncludeFolders` ↔ `--folders`, `-IgnoreEmptyFiles` ↔ `--ignore-empty-files`,
+`-Rehash` ↔ `--rehash`,
 `-SkipCloudOnly` ↔ `--skip-cloud-only`, `-Validate` ↔ `--validate`,
 `-WhatIf` ↔ `--dry-run`, `-Verbose` ↔ `--verbose`. `-PassThru` corresponds to
 calling `find_duplicate_files()` / `validate_report()` from Python. Console
