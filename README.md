@@ -3,6 +3,8 @@
 A PowerShell tool that scans a folder and all of its sub folders for duplicate
 files and saves every match to an Excel workbook.
 
+A Python version with the same features lives in [`python/`](python/README.md).
+
 ## What counts as a duplicate
 
 Two files are duplicates only when **all three** of these match:
@@ -91,4 +93,5 @@ Invoke-Pester ./tests
 ```
 
 The tests also run on every push via GitHub Actions (Windows, Linux, macOS,
-and Windows PowerShell 5.1).
+and Windows PowerShell 5.1), together with the Python tests and a parity test
+that runs both versions on the same folders and requires identical reports.

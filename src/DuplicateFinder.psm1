@@ -35,6 +35,16 @@ $script:LocationColumnWidth = 60
 # Cloud Files providers) whose contents are not stored locally. Reading them downloads them.
 $script:CloudOnlyAttributes = 0x1000 -bor 0x40000 -bor 0x400000  # Offline | RecallOnOpen | RecallOnDataAccess
 
+# Orderings shared with the Python port (python/find_duplicates) so both tools
+# report the same "first" copy and sort rows and locations identically on every OS.
+$script:ByDuplicateSet = [System.Comparison[object]] {
+    param($x, $y)
+    $order = [System.StringComparer]::OrdinalIgnoreCase.Compare($x.FileName, $y.FileName)
+    if ($order -eq 0) { $order = $x.LastWriteTime.CompareTo($y.LastWriteTime) }
+    if ($order -eq 0) { $order = [string]::CompareOrdinal($x.MD5, $y.MD5) }
+    $order
+}
+
 #region Scanning
 
 function Get-FileInventory {
@@ -87,8 +97,9 @@ function Get-FileInventory {
         }
 
         try {
-            $files      = $folder.GetFiles()
-            $subFolders = $folder.GetDirectories()
+            # File systems list entries in different orders (alphabetical on NTFS, arbitrary on ext4).
+            $files      = Get-SortedByName -Item $folder.GetFiles()
+            $subFolders = Get-SortedByName -Item $folder.GetDirectories()
         }
         catch [System.UnauthorizedAccessException], [System.IO.IOException], [System.Security.SecurityException] {
             Write-Warning "Skipping '$($folder.FullName)': $($_.Exception.Message)"
@@ -113,6 +124,16 @@ function Get-FileInventory {
     }
 
     Write-Progress -Id 1 -Activity 'Scanning folders' -Completed
+}
+
+function Get-SortedByName {
+    # Files or folders in ordinal name order, as a new array.
+    param([Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Item)
+    if ($Item.Count -gt 1) {
+        $names = [string[]] $Item.Name
+        [System.Array]::Sort($names, $Item, [System.StringComparer]::Ordinal)
+    }
+    , $Item
 }
 
 function Test-FolderLink {
@@ -249,13 +270,22 @@ function Find-DuplicateFile {
                 SizeBytes     = $first.Length
                 MD5           = $set[0].MD5
                 Count         = $set.Count
-                Folders       = [string[]] @($set | ForEach-Object { $_.File.DirectoryName } | Sort-Object)
+                Folders       = Get-SortedFolder -Path @($set | ForEach-Object { $_.File.DirectoryName })
             })
         }
     }
 
     Write-Progress -Id 2 -Activity 'Comparing MD5 hashes' -Completed
-    $results | Sort-Object FileName, LastWriteTime, MD5
+    $results.Sort($script:ByDuplicateSet)
+    $results
+}
+
+function Get-SortedFolder {
+    # Folder paths in case-insensitive ordinal order.
+    param([Parameter(Mandatory)] [string[]] $Path)
+    $sorted = [string[]] $Path.Clone()
+    [System.Array]::Sort($sorted, [System.StringComparer]::OrdinalIgnoreCase)
+    , $sorted
 }
 
 #endregion

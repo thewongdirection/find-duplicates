@@ -88,6 +88,13 @@ Describe 'Get-FileInventory' {
         $found.FullName | Should -Be @($keep.FullName)
     }
 
+    It 'lists folders and files in name order whatever order they were created in' {
+        $root = Add-TestRoot
+        foreach ($name in 'z', 'a', 'm') { $null = Add-TestFile $root "$name/$name.txt" }
+
+        (Get-FileInventory -Path $root).Name | Should -Be @('a.txt', 'm.txt', 'z.txt')
+    }
+
     It 'handles folder and file names containing wildcard characters' {
         $root = Add-TestRoot
         $null = Add-TestFile $root '[set]/file[1].txt'
@@ -220,6 +227,15 @@ Describe 'Find-DuplicateFile' {
         @(Find-DuplicateFile -File $files).Count | Should -Be 1
     }
 
+    It 'does not match names that differ beyond case' {
+        $root = Add-TestRoot
+        $files = @(
+            Add-TestFile $root "a/stra$([char] 0xDF)e.txt"
+            Add-TestFile $root 'b/STRASSE.txt'
+        )
+        @(Find-DuplicateFile -File $files).Count | Should -Be 0
+    }
+
     It 'ignores sub-second differences in the saved date' {
         $root = Add-TestRoot
         $files = @(
@@ -244,6 +260,17 @@ Describe 'Find-DuplicateFile' {
         $result.Count | Should -Be 2
         $result | ForEach-Object { $_.Count | Should -Be 2 }
         ($result.Folders | Sort-Object) | Should -Be @($files[0..3].DirectoryName | Sort-Object)
+    }
+
+    It 'names a duplicate after the copy in the first folder by name' {
+        $root = Add-TestRoot
+        $files = @(
+            Add-TestFile $root 'b/photo.jpg'
+            Add-TestFile $root 'a/Photo.JPG'
+        )
+        $scanned = @(Get-FileInventory -Path $root)
+
+        (Find-DuplicateFile -File $scanned).FileName | Should -BeExactly 'Photo.JPG'
     }
 
     It 'returns nothing for an empty list' {
