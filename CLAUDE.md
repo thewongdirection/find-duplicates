@@ -78,7 +78,9 @@ pass `-WhatIf`/`-Verbose` explicitly into module functions; keep
 may pick the generic overload and sort a copy of the items); remember that
 `,` binds tighter than `+` (`@('/' + $a, $b)` is `'/' + ($a, $b)`); PowerShell turns a
 .NET property whose getter throws into `$null` (so read file details that may fail
-with getter methods, e.g. `$file.get_Length()`, inside `try`).
+with getter methods, e.g. `$file.get_Length()`, inside `try`); Windows PowerShell 5.1
+cannot convert text such as `'2KB'` to a number (PowerShell 7 can), so sizes typed by
+users are read by `ConvertFrom-SizeText` (Python: `cli._size`).
 
 Parallel work in PowerShell goes through `Open-WorkerPool` / `Receive-WorkerResult` /
 `Close-WorkerPool` (runspaces that load this module); in Python through

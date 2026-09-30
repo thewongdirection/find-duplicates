@@ -157,6 +157,12 @@ def on_network_drive(path: str) -> bool:
     """
     path = os.path.abspath(path)
     if sys.platform == "win32":
+        # Long-path forms: \\?\UNC\server\share is a share, \\?\C:\... a drive.
+        for prefix in ("\\\\?\\", "\\\\.\\"):
+            if path.upper().startswith(prefix + "UNC\\"):
+                return True
+            if path.startswith(prefix):
+                path = path[len(prefix):]
         drive = os.path.splitdrive(path)[0]
         return drive.startswith(("\\\\", "//")) or _windows_drive_type(drive.upper()) == DRIVE_REMOTE
     if sys.platform.startswith("linux"):

@@ -73,7 +73,10 @@ NameFilter = Tuple[_Wildcard, ...]
 
 
 def check_name_pattern(pattern: str) -> None:
-    """Reject a pattern that could never match a name (it holds a path separator)."""
+    """Reject a pattern that could never match a name: empty, or holding a path separator
+    (ValueError, worded as Get-NamePatternProblem in PowerShell)."""
+    if not pattern:
+        raise ValueError("Exclusion patterns cannot be empty.")
     if "/" in pattern or "\\" in pattern:
         raise ValueError(f"Exclusion pattern '{pattern}' contains / or \\: patterns match file and folder names, not paths.")
 

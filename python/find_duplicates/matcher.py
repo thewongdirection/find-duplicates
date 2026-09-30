@@ -37,7 +37,7 @@ MAX_THROTTLE_LIMIT = 64
 # Local files at least this large are worth hashing on a thread (hashlib releases Python's
 # global lock while hashing them); smaller local files are faster hashed one at a time.
 PARALLEL_HASH_MIN_BYTES = 1024 * 1024
-# Large candidates are first compared by the MD5 of their start (see _split_by_first_bytes):
+# Large candidates are first compared by the MD5 of their start (see _split_by_start_hash):
 # files that share a name, saved date and size but not their contents are then rarely read
 # in full. Only for files this large, so that true duplicates cost at most 1/16 more reading.
 FIRST_BYTES_TO_HASH = 1024 * 1024
@@ -162,7 +162,7 @@ def _md5_map(
     return result
 
 
-def _split_by_first_bytes(
+def _split_by_start_hash(
     groups: List[List[FileRecord]],
     throttle_limit: int,
     on_hash: Optional[HashCallback],
@@ -171,7 +171,7 @@ def _split_by_first_bytes(
     """Split each group of files of FIRST_BYTES_MIN_SIZE or more by the MD5 of their first
     FIRST_BYTES_TO_HASH bytes, keeping the groups that still hold more than one file. Other
     groups, and groups a file of which already has its whole-file MD5 in ``md5_cache``
-    (from a previous report), are kept as they are (as Split-ByFirstBytes in PowerShell)."""
+    (from a previous report), are kept as they are (as Split-ByStartHash in PowerShell)."""
     kept, large = [], []
     for group in groups:
         is_large = group[0].size >= FIRST_BYTES_MIN_SIZE  # the files share their size (stage 2)
@@ -264,7 +264,7 @@ def find_duplicate_files(
             )
 
     # Stage 3: for large files, the MD5 of their start.
-    candidate_groups = _split_by_first_bytes(candidate_groups, throttle_limit, on_hash, md5_cache)
+    candidate_groups = _split_by_start_hash(candidate_groups, throttle_limit, on_hash, md5_cache)
 
     # Stage 4: MD5, only for files that already match on name, date and size.
     candidates = [r for group in candidate_groups for r in group]

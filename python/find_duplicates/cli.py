@@ -106,16 +106,20 @@ def _throttle_limit(text: str) -> int:
 
 
 _SIZE = re.compile(r"([0-9]+(?:\.[0-9]+)?)([KMGTP]B)?", re.IGNORECASE)
+MAX_SIZE = 2**63 - 1  # the largest -MinimumSize PowerShell takes ([long])
 _SIZE_UNITS = {"": 1, "KB": 1 << 10, "MB": 1 << 20, "GB": 1 << 30, "TB": 1 << 40, "PB": 1 << 50}
 
 
 def _size(text: str) -> int:
     """A size in bytes: a number, optionally followed by KB, MB, GB, TB or PB (1024-based),
-    rounded to a whole number of bytes as PowerShell reads -MinimumSize 1.5MB."""
+    rounded to a whole number of bytes (as ConvertFrom-SizeText in PowerShell)."""
     match = _SIZE.fullmatch(text)
     if not match:
         raise argparse.ArgumentTypeError("must be a number of bytes, optionally followed by KB, MB, GB, TB or PB")
-    return round(float(match.group(1)) * _SIZE_UNITS[(match.group(2) or "").upper()])
+    size = round(float(match.group(1)) * _SIZE_UNITS[(match.group(2) or "").upper()])
+    if size > MAX_SIZE:
+        raise argparse.ArgumentTypeError(f"must be at most {MAX_SIZE} bytes")
+    return size
 
 
 def _pattern(text: str) -> str:

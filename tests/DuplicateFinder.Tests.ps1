@@ -104,6 +104,16 @@ Describe 'Get-FileInventory' {
         $found.FullName | Should -Be @($keep.FullName)
     }
 
+    It 'leaves out an excluded file when the folder path ends in a separator' {
+        $root = Add-TestRoot
+        $keep = Add-TestFile $root 'keep.txt'
+        $skip = Add-TestFile $root 'duplicates.xlsx'
+
+        $found = @(Get-FileInventory -Path ($root + [System.IO.Path]::DirectorySeparatorChar) -ExcludeFile $skip.FullName)
+
+        $found.Name | Should -Be @($keep.Name)
+    }
+
     It 'lists folders and files in name order whatever order they were created in' {
         $root = Add-TestRoot
         foreach ($name in 'z', 'a', 'm') { $null = Add-TestFile $root "$name/$name.txt" }
@@ -245,6 +255,13 @@ Describe 'Get-FileInventory' {
         (Get-FileInventory -Path $root -ExcludeName $decomposed, 'x?.txt').Name | Should -Be 'keep.txt'
     }
 
+    It 'does not match a character beyond U+FFFF with two ?' {
+        $root = Add-TestRoot
+        $null = Add-TestFile $root ('x' + [char]::ConvertFromUtf32(0x1F600) + '.txt')
+
+        @(Get-FileInventory -Path $root -ExcludeName 'x??.txt').Count | Should -Be 1
+    }
+
     It 'leaves out the same names listing several folders at a time' {
         $root = Add-TestRoot
         foreach ($path in 'a/x.txt', 'a/cache/y.txt', 'b/cache/deep/z.txt', 'b/w.tmp', 'c/v.txt') { $null = Add-TestFile $root $path }
@@ -268,6 +285,12 @@ Describe 'Folder and cloud file detection' {
     It 'treats a UNC path as a network drive' {
         if (-not $script:OnWindows) { Set-ItResult -Skipped -Because 'UNC paths are Windows-only'; return }
         Test-NetworkDrive -Path '\\server\share\folder' | Should -BeTrue
+    }
+
+    It 'treats the long-path forms of a path as what they point to' {
+        if (-not $script:OnWindows) { Set-ItResult -Skipped -Because 'long-path forms are Windows-only'; return }
+        Test-NetworkDrive -Path '\\?\UNC\server\share\folder' | Should -BeTrue
+        Test-NetworkDrive -Path ('\\?\' + (Add-TestRoot)) | Should -BeFalse
     }
 
     It 'recognises the file system holding a path' {
@@ -953,6 +976,18 @@ Describe 'Import-DuplicateReport' {
             $workbook = Read-DuplicateWorkbook -Path $Report
             $workbook.ExcludeName | Should -Be @('*.tmp', 'Thumbs.db')
             $workbook.MinimumSize | Should -Be 2048
+        }
+    }
+
+    It 'ignores an exclusion pattern in the report that holds / or \' {
+        $path = Join-Path (Add-TestRoot) 'patterns.xlsx'
+        Write-ExcelSavedWorkbook -Path $path -Rows @(, @('File Name', 'Last Modified', 'Size (bytes)', 'MD5', 'Copies', 'Location 1')) `
+            -RulesRows @(, @('Names left out (-Exclude; Python: --exclude)', 'photos/raw', '*.tmp'))
+
+        InModuleScope DuplicateFinder -Parameters @{ Report = $path } {
+            $workbook = Read-DuplicateWorkbook -Path $Report -WarningVariable warnings -WarningAction SilentlyContinue
+            $workbook.ExcludeName | Should -Be @('*.tmp')
+            "$($warnings[0])" | Should -BeLike "*'photos/raw'*not paths*"
         }
     }
 
@@ -1924,6 +1959,12 @@ Describe 'Find-Duplicates.ps1' {
             { & $script:ScriptPath -Path $root -OutputFile (Join-Path (Add-TestRoot) 'bad.xlsx') -MinimumSize $bad 6>$null } |
                 Should -Throw -Because $bad
         }
+    }
+
+    It 'rejects an -Exclude pattern holding / or \ before scanning' {
+        $out = Join-Path (Add-TestRoot) 'never.xlsx'
+        { & $script:ScriptPath -Path (Add-TestRoot) -OutputFile $out -Exclude 'photos/raw' 6>$null } | Should -Throw '*not paths*'
+        $out | Should -Not -Exist
     }
 
     It 'records -IgnoreEmptyFiles as a smallest file size of 1 byte' {

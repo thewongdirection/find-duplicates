@@ -29,6 +29,7 @@ from xml.sax.saxutils import escape
 
 from .folders import DuplicateFolderSet
 from .matcher import DuplicateSet
+from .names import check_name_pattern
 from .scanner import local_utc_offset
 
 log = logging.getLogger("find_duplicates")
@@ -583,12 +584,16 @@ def _scan_settings(rows: List[List[Optional[str]]], path: str) -> ScanSettings:
         if not cells:
             continue
         if row[0] == EXCLUDE_NAMES_LABEL:
-            settings.exclude_names.extend(cells)
+            for pattern in cells:
+                try:
+                    check_name_pattern(pattern)
+                except ValueError as exc:
+                    log.warning("Ignoring an exclusion pattern in '%s': %s", path, exc)
+                else:
+                    settings.exclude_names.append(pattern)
         elif row[0] == MINIMUM_SIZE_LABEL:
-            try:
-                number = float(cells[0])
-            except ValueError:
-                number = math.nan
+            # Digits, a point and an exponent only, as .NET reads numbers (not 1_000).
+            number = float(cells[0]) if re.fullmatch(r"\s*[-+]?[0-9.]+(?:[eE][-+]?[0-9]+)?\s*", cells[0]) else math.nan
             if 0 <= number < 2**63 - 1 and number == math.floor(number):
                 settings.minimum_size = int(number)
             else:

@@ -75,7 +75,8 @@
 
 .PARAMETER MinimumSize
     Leave files smaller than this many bytes out of the duplicate files, for example
-    -MinimumSize 1MB. Duplicate folders still compare every file. Recorded in the report.
+    -MinimumSize 1MB or 1.5MB (KB, MB, GB, TB, PB: 1024-based). Duplicate folders still
+    compare every file. Recorded in the report.
 
 .PARAMETER IncludeFolders
     Also find duplicate folders and save them on the "Duplicate Folders" sheet.
@@ -136,12 +137,12 @@ param(
     [switch] $IgnoreEmptyFiles,
 
     [Parameter(ParameterSetName = 'Scan')]
-    [ValidateNotNullOrEmpty()]
+    [AllowEmptyString()]
     [string[]] $Exclude = @(),
 
     [Parameter(ParameterSetName = 'Scan')]
-    [ValidateRange(0, [long]::MaxValue)]
-    [long] $MinimumSize = 0,
+    # Text, read by ConvertFrom-SizeText: Windows PowerShell 5.1 cannot turn '2KB' into a number.
+    [string] $MinimumSize = '0',
 
     [Parameter(ParameterSetName = 'Scan')]
     [switch] $IncludeFolders,
@@ -193,6 +194,9 @@ if ($Validate) {
     return
 }
 
+# Checked before anything is scanned.
+Assert-NamePattern -Pattern $Exclude
+$minimumBytes = ConvertFrom-SizeText -Text $MinimumSize -Name '-MinimumSize'
 $scanRoot = (Resolve-Path -LiteralPath $Path).ProviderPath
 
 # Resolve the report's folder like the scan root (e.g. Windows short names expanded), so the
@@ -229,13 +233,13 @@ if (-not $Rehash -and [System.IO.File]::Exists($reportPath)) {
 }
 $matchOptions = @{ SkipCloudOnly = $SkipCloudOnly; ThrottleLimit = $ThrottleLimit; Md5Cache = $md5Cache } + $verbose
 
-$duplicates = @(Find-DuplicateFile -File $files -IgnoreEmptyFiles:$IgnoreEmptyFiles -MinimumSize $MinimumSize @matchOptions)
+$duplicates = @(Find-DuplicateFile -File $files -IgnoreEmptyFiles:$IgnoreEmptyFiles -MinimumSize $minimumBytes @matchOptions)
 $copies = 0
 foreach ($set in $duplicates) { $copies += $set.Count }
 Write-Host "Found $($duplicates.Count) duplicated files ($copies copies in total)."
 
 # The smallest file listed, recorded in the report: -IgnoreEmptyFiles means 1 byte.
-$smallest = $MinimumSize
+$smallest = $minimumBytes
 if ($IgnoreEmptyFiles -and $smallest -lt 1) { $smallest = 1 }
 $export = @{ DuplicateSet = $duplicates; Path = $reportPath; ExcludeName = $Exclude; MinimumSize = $smallest }
 if ($IncludeFolders) {

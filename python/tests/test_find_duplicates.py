@@ -93,6 +93,11 @@ class IterFilesTests(TempDirTestCase):
         skip = add_file(self.root, "duplicates.xlsx")
         self.assertEqual([r.path for r in iter_files(self.root, exclude=[skip])], [keep])
 
+    def test_leaves_out_an_excluded_file_when_the_folder_path_ends_in_a_separator(self):
+        keep = add_file(self.root, "keep.txt")
+        skip = add_file(self.root, "duplicates.xlsx")
+        self.assertEqual([r.path for r in iter_files(self.root + os.sep, exclude=[skip])], [keep])
+
     def test_lists_in_name_order_whatever_the_creation_order(self):
         for name in ("z", "a", "m"):
             add_file(self.root, f"{name}/{name}.txt")
@@ -211,6 +216,10 @@ class IterFilesTests(TempDirTestCase):
         found = list(iter_files(self.root, exclude_names=[decomposed, "x?.txt"]))
 
         self.assertEqual([f.name for f in found], ["keep.txt"])
+
+    def test_does_not_match_a_character_beyond_u_ffff_with_two_question_marks(self):
+        add_file(self.root, "x\U0001F600.txt")
+        self.assertEqual(len(list(iter_files(self.root, exclude_names=["x??.txt"]))), 1)
 
     def test_leaves_out_the_same_names_listing_several_folders_at_a_time(self):
         for path in ("a/x.txt", "a/cache/y.txt", "b/cache/deep/z.txt", "b/w.tmp", "c/v.txt"):
@@ -644,6 +653,11 @@ class ThreadUseTests(TempDirTestCase):
         self.assertIn("cifs", scanner.NETWORK_FILE_SYSTEMS)
         self.assertNotIn("ext4", scanner.NETWORK_FILE_SYSTEMS)
 
+    @unittest.skipUnless(sys.platform == "win32", "long-path forms are Windows-only")
+    def test_treats_the_long_path_forms_of_a_path_as_what_they_point_to(self):
+        self.assertTrue(scanner.on_network_drive("\\\\?\\UNC\\server\\share\\folder"))
+        self.assertFalse(scanner.on_network_drive("\\\\?\\" + self.root))
+
     @unittest.skipUnless(sys.platform == "win32", "UNC paths are Windows-only")
     def test_treats_a_unc_path_as_a_network_drive(self):
         self.assertTrue(scanner.on_network_drive("\\\\server\\share\\folder"))
@@ -758,6 +772,17 @@ class ReadDuplicateReportTests(TempDirTestCase):
             [["Matching rules"], [EXCLUDE_NAMES_LABEL, None, "*.tmp", "Thumbs.db"], [MINIMUM_SIZE_LABEL, 2048]],
         )
         self.assertEqual(read_duplicate_workbook(path).settings, ScanSettings(["*.tmp", "Thumbs.db"], 2048))
+
+    def test_ignores_an_exclusion_pattern_in_the_report_that_holds_a_slash_or_backslash(self):
+        path = os.path.join(self.root, "patterns.xlsx")
+        write_excel_saved_workbook(
+            path, [["File Name", "Last Modified", "Size (bytes)", "MD5", "Copies", "Location 1"]],
+            [[EXCLUDE_NAMES_LABEL, "photos/raw", "*.tmp"]],
+        )
+        with self.assertLogs("find_duplicates", "WARNING") as logs:
+            self.assertEqual(read_duplicate_workbook(path).settings.exclude_names, ["*.tmp"])
+        self.assertIn("'photos/raw'", logs.output[0])
+        self.assertIn("not paths", logs.output[0])
 
     def test_ignores_a_smallest_file_size_in_the_report_that_is_not_a_whole_number_of_bytes(self):
         for bad in ("1MB", "1.5", "-1"):
@@ -1163,6 +1188,12 @@ class CliTests(TempDirTestCase):
         for text in ("-1", "10 bytes", "KB", "\u0661\u0662"):  # the last: Arabic-Indic digits
             with self.subTest(text=text), self.assertRaises(SystemExit):
                 self.run_cli(root, os.path.join(self.root, "bad.xlsx"), "--minimum-size", text)
+
+    def test_rejects_an_exclude_pattern_holding_a_slash_or_backslash_before_scanning(self):
+        report = os.path.join(self.root, "never.xlsx")
+        with self.assertRaises(SystemExit):
+            self.run_cli(self.new_dir("any"), report, "--exclude", "photos/raw")
+        self.assertFalse(os.path.exists(report))
 
     def test_records_ignore_empty_files_as_a_smallest_file_size_of_1_byte(self):
         root = self.new_dir("empty")

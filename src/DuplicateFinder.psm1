@@ -289,7 +289,9 @@ function Get-FileInventory {
             $subFolders = Select-UnmatchedName -Item $subFolders -Filter $nameFilter
         }
 
-        if ($excludedIn.Contains($folder)) {
+        # (By a file's own folder, not $folder: a scan root given with a trailing separator
+        # keeps it in $folder.)
+        if ($keptFiles.Count -and $excludedIn.Contains([System.IO.Path]::GetDirectoryName($keptFiles[0].FullName))) {
             foreach ($file in $keptFiles) {
                 if ($excluded.Contains($file.FullName)) {
                     if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder; Readable = $false }) }
@@ -436,6 +438,11 @@ function Test-NetworkDrive {
 
     $Path = [System.IO.Path]::GetFullPath($Path)
     if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+        # Long-path forms: \\?\UNC\server\share is a share, \\?\C:\... a drive.
+        foreach ($prefix in '\\?\', '\\.\') {
+            if ($Path.StartsWith($prefix + 'UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+            if ($Path.StartsWith($prefix)) { $Path = $Path.Substring($prefix.Length) }
+        }
         if ($Path.StartsWith('\\') -or $Path.StartsWith('//')) { return $true }
         try { return ([System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($Path))).DriveType -eq [System.IO.DriveType]::Network }
         catch { return $false }
@@ -549,7 +556,51 @@ function ConvertTo-NameKey {
 
 # One character for a ? wildcard: a surrogate pair (a character beyond U+FFFF, such as an
 # emoji) or a single UTF-16 unit, as Python's regular expressions match one code point.
-$script:AnyCharacterPattern = '(?:[\uD800-\uDBFF][\uDC00-\uDFFF]|.)'
+# Atomic, so that it never falls back to half of a pair.
+$script:AnyCharacterPattern = '(?>[\uD800-\uDBFF][\uDC00-\uDFFF]|.)'
+
+function Get-NamePatternProblem {
+    # Why an exclusion pattern can never match a name, or $null when it can.
+    param([AllowEmptyString()] [string] $Pattern)
+    if (-not $Pattern) { return 'Exclusion patterns cannot be empty.' }
+    if ($Pattern.IndexOfAny([char[]] '/\') -ge 0) {
+        return "Exclusion pattern '$Pattern' contains / or \: patterns match file and folder names, not paths."
+    }
+    $null
+}
+
+function ConvertFrom-SizeText {
+    <#
+    .SYNOPSIS
+        A size in bytes from text such as 1500, 2KB or 1.5MB: a number, optionally followed by
+        KB, MB, GB, TB or PB (1024-based, any case), rounded to a whole number of bytes. Read
+        the same way as the Python port's --minimum-size.
+    #>
+    [CmdletBinding()]
+    [OutputType([long])]
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Text, [string] $Name = 'The size')
+    $match = [regex]::Match($Text, '\A([0-9]+(?:\.[0-9]+)?)([KMGTP]B)?\z', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) { throw "$Name must be a number of bytes, optionally followed by KB, MB, GB, TB or PB." }
+    $power = 0
+    if ($match.Groups[2].Success) { $power = 'KMGTP'.IndexOf([char]::ToUpperInvariant($match.Groups[2].Value[0])) + 1 }
+    $bytes = [Math]::Round([double]::Parse($match.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture) * [Math]::Pow(1024, $power))
+    if ($bytes -ge [Math]::Pow(2, 63)) { throw "$Name must be at most $([long]::MaxValue) bytes." }
+    [long] $bytes
+}
+
+function Assert-NamePattern {
+    <#
+    .SYNOPSIS
+        Throws when an exclusion pattern could never match a file or folder name (it is
+        empty or holds a path separator), so a scan stops before it starts.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [AllowEmptyCollection()] [AllowEmptyString()] [string[]] $Pattern)
+    foreach ($p in $Pattern) {
+        $problem = Get-NamePatternProblem -Pattern $p
+        if ($problem) { throw $problem }
+    }
+}
 
 function ConvertTo-NameFilter {
     <#
@@ -566,9 +617,8 @@ function ConvertTo-NameFilter {
     if (-not $Pattern) { return $null }
     $alternatives = [System.Collections.Generic.List[string]]::new()
     foreach ($p in $Pattern) {
-        if ($p.IndexOfAny([char[]] '/\') -ge 0) {
-            throw "Exclusion pattern '$p' contains / or \: patterns match file and folder names, not paths."
-        }
+        $problem = Get-NamePatternProblem -Pattern $p
+        if ($problem) { throw $problem }
         $parts = [System.Collections.Generic.List[string]]::new()
         foreach ($part in (ConvertTo-NameKey $p).Split('*')) {
             $parts.Add((-join @(foreach ($piece in [regex]::Split($part, '(\?)')) {
@@ -644,7 +694,7 @@ function Get-FileMd5 {
     & $script:ComputeMd5 $Path $Limit
 }
 
-# Large candidates are first compared by the MD5 of their start (see Split-ByFirstBytes):
+# Large candidates are first compared by the MD5 of their start (see Split-ByStartHash):
 # files that share a name, saved date and size but not their contents are then rarely read
 # in full. Only for files this large, so that true duplicates cost at most 1/16 more reading.
 $script:FirstBytesToHash = 1MB
@@ -841,7 +891,7 @@ function Find-DuplicateFile {
     }
 
     # Stage 3: for large files, the MD5 of their start.
-    $candidateGroups = @(Split-ByFirstBytes -Group $candidateGroups -ThrottleLimit $ThrottleLimit -Md5Cache $Md5Cache)
+    $candidateGroups = @(Split-ByStartHash -Group $candidateGroups -ThrottleLimit $ThrottleLimit -Md5Cache $Md5Cache)
 
     # Stage 4: MD5, only for files that already match on name, date and size.
     $candidates = [System.Collections.Generic.List[string]]::new()
@@ -872,7 +922,7 @@ function Find-DuplicateFile {
     $sorted
 }
 
-function Split-ByFirstBytes {
+function Split-ByStartHash {
     <#
         Splits each group of files of $script:FirstBytesMinSize or more by the MD5 of their
         first $script:FirstBytesToHash bytes, keeping the groups that still hold more than one
@@ -1863,7 +1913,13 @@ function Get-ScanSetting {
     foreach ($values in $Row) {
         if ($null -eq $values -or $values.Count -lt 2) { continue }
         $cells = [string[]] @(for ($c = 1; $c -lt $values.Count; $c++) { if ($values[$c]) { $values[$c] } })
-        if ($values[0] -ceq $script:ExcludeNameLabel) { $excludeName.AddRange($cells) }
+        if ($values[0] -ceq $script:ExcludeNameLabel) {
+            foreach ($pattern in $cells) {
+                $problem = Get-NamePatternProblem -Pattern $pattern
+                if ($problem) { Write-Warning "Ignoring an exclusion pattern in '$Path': $problem" }
+                else { $excludeName.Add($pattern) }
+            }
+        }
         elseif ($values[0] -ceq $script:MinimumSizeLabel -and $cells.Count) {
             $number = 0.0
             if ([double]::TryParse($cells[0], [System.Globalization.NumberStyles]::Float,
@@ -2402,4 +2458,4 @@ function Update-DuplicateReport {
 
 Export-ModuleMember -Function Get-FileInventory, Find-DuplicateFile, Find-DuplicateFolder, Export-DuplicateReport,
     ConvertTo-ColumnName, Import-DuplicateReport, Import-DuplicateFolderReport, Update-DuplicateReport, Get-PreviousMd5,
-    Test-NetworkDrive, Get-DefaultThrottleLimit
+    Test-NetworkDrive, Get-DefaultThrottleLimit, Assert-NamePattern, ConvertFrom-SizeText
