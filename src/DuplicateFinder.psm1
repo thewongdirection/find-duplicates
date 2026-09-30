@@ -157,34 +157,114 @@ function Test-CloudOnlyFile {
 
 #region Matching
 
-function Get-SavedDateKey {
-    # Saved date in UTC, truncated to the whole second. Copies made to network
-    # shares or other file systems frequently lose sub-second precision.
-    param([Parameter(Mandatory)] [System.IO.FileInfo] $File)
+# Computes the MD5 of one file as upper-case hex. Kept as a script block so the very
+# same code runs in the current session and in the parallel runspaces. The large
+# buffer and the sequential-scan hint make reads from disks and shares much faster.
+$script:ComputeMd5 = {
+    param([string] $Path)
+    $ErrorActionPreference = 'Stop'
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    try {
+        $stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+            [System.IO.FileShare] 'ReadWrite, Delete', 1MB, [System.IO.FileOptions]::SequentialScan)
+        try { [System.BitConverter]::ToString($md5.ComputeHash($stream)).Replace('-', '') }
+        finally { $stream.Dispose() }
+    }
+    finally { $md5.Dispose() }
+}
 
-    $ticks = $File.LastWriteTimeUtc.Ticks
-    $ticks - ($ticks % [System.TimeSpan]::TicksPerSecond)
+function Get-FileMd5 {
+    # MD5 of one file's contents as upper-case hex (the Get-FileHash format).
+    param([Parameter(Mandatory)] [string] $Path)
+    & $script:ComputeMd5 $Path
+}
+
+function Get-FileMd5Map {
+    <#
+        Hashes files, up to $ThrottleLimit at a time, returning a map of full path -> MD5.
+        Files that cannot be read are reported as warnings and left out of the map.
+    #>
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $Path,
+        [ValidateRange(1, 64)] [int] $ThrottleLimit = 1
+    )
+
+    $map = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+    $activity = 'Comparing MD5 hashes'
+    $done = 0
+
+    if ($ThrottleLimit -eq 1) {
+        foreach ($p in $Path) {
+            $done++
+            Write-Progress -Id 2 -Activity $activity -Status "File $done of $($Path.Count)" -CurrentOperation $p `
+                -PercentComplete ([int] (100 * $done / $Path.Count))
+            try { $map[$p] = Get-FileMd5 -Path $p }
+            catch { Write-Warning "Could not hash '$p': $($_.Exception.Message)" }
+        }
+    }
+    else {
+        # A bounded window of jobs keeps memory flat however many files there are.
+        $window = $ThrottleLimit * 4
+        $inFlight = [System.Collections.Generic.Queue[object]]::new()
+        $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ThrottleLimit)
+        $pool.Open()
+        try {
+            $next = 0
+            while ($next -lt $Path.Count -or $inFlight.Count -gt 0) {
+                while ($next -lt $Path.Count -and $inFlight.Count -lt $window) {
+                    $shell = [System.Management.Automation.PowerShell]::Create()
+                    $shell.RunspacePool = $pool
+                    $null = $shell.AddScript($script:ComputeMd5.ToString()).AddArgument($Path[$next])
+                    $inFlight.Enqueue([pscustomobject] @{ Path = $Path[$next]; Shell = $shell; Handle = $shell.BeginInvoke() })
+                    $next++
+                }
+
+                $job = $inFlight.Dequeue()
+                $done++
+                Write-Progress -Id 2 -Activity $activity -Status "File $done of $($Path.Count) ($ThrottleLimit at a time)" `
+                    -CurrentOperation $job.Path -PercentComplete ([int] (100 * $done / $Path.Count))
+                try {
+                    $output = $job.Shell.EndInvoke($job.Handle)
+                    if ($job.Shell.Streams.Error.Count -gt 0) { throw $job.Shell.Streams.Error[0].Exception }
+                    $map[$job.Path] = [string] $output[0]
+                }
+                catch {
+                    $reason = $_.Exception
+                    while ($reason.InnerException) { $reason = $reason.InnerException }
+                    Write-Warning "Could not hash '$($job.Path)': $($reason.Message)"
+                }
+                finally { $job.Shell.Dispose() }
+            }
+        }
+        finally {
+            foreach ($job in $inFlight) { $job.Shell.Dispose() }
+            $pool.Dispose()
+        }
+    }
+
+    Write-Progress -Id 2 -Activity $activity -Completed
+    $map
 }
 
 function Group-ByKey {
-    # Groups items into lists keyed by the result of a script block,
-    # returning only the groups that hold more than one item.
+    # Groups items by the matching entry in $Key, returning only the groups that hold
+    # more than one item. Keys are computed by the caller in plain loops, which is far
+    # faster than invoking a script block per item on large trees.
     param(
         [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $InputItems,
-        [Parameter(Mandatory)] [scriptblock] $KeySelector
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $Key
     )
 
     $groups = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[object]]]::new(
         [System.StringComparer]::OrdinalIgnoreCase)
 
-    foreach ($item in $InputItems) {
-        $key = [string] (& $KeySelector $item)
+    for ($i = 0; $i -lt $InputItems.Count; $i++) {
         $list = $null
-        if (-not $groups.TryGetValue($key, [ref] $list)) {
+        if (-not $groups.TryGetValue($Key[$i], [ref] $list)) {
             $list = [System.Collections.Generic.List[object]]::new()
-            $groups.Add($key, $list)
+            $groups.Add($Key[$i], $list)
         }
-        $list.Add($item)
+        $list.Add($InputItems[$i])
     }
 
     foreach ($list in $groups.Values) {
@@ -200,8 +280,6 @@ function Find-DuplicateFile {
         One object per duplicate set: FileName, LastWriteTime, SizeBytes, MD5,
         Count and Folders (full folder path of every copy, sorted).
     #>
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingBrokenHashAlgorithms', '',
-        Justification = 'MD5 is part of the duplicate definition and is not used for security.')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -210,17 +288,29 @@ function Find-DuplicateFile {
 
         # Do not hash cloud files that are not stored locally (hashing would download them).
         # Duplicates among such files are then not reported.
-        [switch] $SkipCloudOnly
+        [switch] $SkipCloudOnly,
+
+        # How many files to hash at the same time.
+        [ValidateRange(1, 64)]
+        [int] $ThrottleLimit = 1
     )
 
-    # Stage 1: name + saved date. The date key is all digits, so '|' is a safe separator.
-    $nameDateGroups = @(Group-ByKey -InputItems $File -KeySelector {
-            param($f) '{0}|{1}' -f (Get-SavedDateKey -File $f), $f.Name
-        })
+    # Stage 1: name + saved date (UTC, whole second: copies made to network shares or
+    # other file systems often lose sub-second precision). The date key is all digits,
+    # so '|' is a safe separator.
+    $ticksPerSecond = [System.TimeSpan]::TicksPerSecond
+    $keys = [System.Collections.Generic.List[string]]::new($File.Count)
+    foreach ($f in $File) {
+        $ticks = $f.LastWriteTimeUtc.Ticks
+        $keys.Add([string] ($ticks - ($ticks % $ticksPerSecond)) + '|' + $f.Name)
+    }
+    $nameDateGroups = @(Group-ByKey -InputItems $File -Key $keys.ToArray())
 
     # Stage 2: size. A cheap check that avoids hashing files that cannot match.
+    # (Not $group.Length: on an array that is the array's own length.)
     $candidateGroups = @(foreach ($group in $nameDateGroups) {
-            Group-ByKey -InputItems $group -KeySelector { param($f) $f.Length }
+            $sizes = [string[]] @(foreach ($f in $group) { $f.Length })
+            Group-ByKey -InputItems $group -Key $sizes
         })
 
     if ($SkipCloudOnly) {
@@ -240,42 +330,29 @@ function Find-DuplicateFile {
         }
     }
 
-    $toHash = 0
-    foreach ($group in $candidateGroups) { $toHash += $group.Count }
-    $hashed = 0
-
     # Stage 3: MD5, only for files that already match on name, date and size.
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    foreach ($group in $candidateGroups) { foreach ($f in $group) { $candidates.Add($f.FullName) } }
+    $md5ByPath = Get-FileMd5Map -Path $candidates.ToArray() -ThrottleLimit $ThrottleLimit
+
     $results = [System.Collections.Generic.List[object]]::new()
     foreach ($group in $candidateGroups) {
-        $hashedFiles = [System.Collections.Generic.List[object]]::new()
-        foreach ($f in $group) {
-            $hashed++
-            Write-Progress -Id 2 -Activity 'Comparing MD5 hashes' `
-                -Status "File $hashed of $toHash" -CurrentOperation $f.FullName `
-                -PercentComplete ([int] (100 * $hashed / [Math]::Max($toHash, 1)))
-            try {
-                $md5 = (Get-FileHash -LiteralPath $f.FullName -Algorithm MD5 -ErrorAction Stop).Hash
-                $hashedFiles.Add([pscustomobject] @{ File = $f; MD5 = $md5 })
-            }
-            catch {
-                Write-Warning "Could not hash '$($f.FullName)': $($_.Exception.Message)"
-            }
-        }
+        $hashed = @($group | Where-Object { $md5ByPath.ContainsKey($_.FullName) })
+        $md5s = [string[]] @($hashed | ForEach-Object { $md5ByPath[$_.FullName] })
 
-        foreach ($set in @(Group-ByKey -InputItems $hashedFiles.ToArray() -KeySelector { param($h) $h.MD5 })) {
-            $first = $set[0].File
+        foreach ($set in @(Group-ByKey -InputItems $hashed -Key $md5s)) {
+            $first = $set[0]
             $results.Add([pscustomobject] @{
                 FileName      = $first.Name
                 LastWriteTime = $first.LastWriteTime
                 SizeBytes     = $first.Length
-                MD5           = $set[0].MD5
+                MD5           = $md5ByPath[$first.FullName]
                 Count         = $set.Count
-                Folders       = Get-SortedFolder -Path @($set | ForEach-Object { $_.File.DirectoryName })
+                Folders       = Get-SortedFolder -Path @($set | ForEach-Object { $_.DirectoryName })
             })
         }
     }
 
-    Write-Progress -Id 2 -Activity 'Comparing MD5 hashes' -Completed
     $results.Sort($script:ByDuplicateSet)
     $results
 }
@@ -570,4 +647,278 @@ function Export-DuplicateReport {
 
 #endregion
 
-Export-ModuleMember -Function Get-FileInventory, Find-DuplicateFile, Export-DuplicateReport, ConvertTo-ColumnName
+#region Reading and validating an existing report
+
+function ConvertFrom-ColumnName {
+    # A -> 1, Z -> 26, AA -> 27 ...
+    param([Parameter(Mandatory)] [string] $Name)
+    $index = 0
+    foreach ($letter in $Name.ToUpperInvariant().ToCharArray()) { $index = $index * 26 + ([int] $letter - 64) }
+    $index
+}
+
+function Read-ZipXml {
+    # Parses one XML part of a zip package; $null when the part does not exist.
+    param(
+        [Parameter(Mandatory)] [System.IO.Compression.ZipArchive] $Archive,
+        [Parameter(Mandatory)] [string] $EntryName
+    )
+    $entry = $Archive.GetEntry($EntryName)
+    if (-not $entry) { return $null }
+
+    $reader = [System.IO.StreamReader]::new($entry.Open())
+    try {
+        $xml = [System.Xml.XmlDocument]::new()
+        $xml.XmlResolver = $null  # never resolve external entities
+        $xml.LoadXml($reader.ReadToEnd())
+    }
+    finally { $reader.Dispose() }
+    , $xml  # an XmlDocument would otherwise be enumerated into its child nodes
+}
+
+function New-SpreadsheetNamespace {
+    # A namespace manager for one parsed part (s: SpreadsheetML, p: package relationships).
+    param([Parameter(Mandatory)] [System.Xml.XmlDocument] $Xml)
+    $ns = [System.Xml.XmlNamespaceManager]::new($Xml.NameTable)
+    $ns.AddNamespace('s', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main')
+    $ns.AddNamespace('p', 'http://schemas.openxmlformats.org/package/2006/relationships')
+    , $ns  # a namespace manager would otherwise be enumerated into its prefixes
+}
+
+function Get-CellText {
+    # Text of an inline or shared string, including rich-text runs (phonetic runs excluded).
+    param([Parameter(Mandatory)] [System.Xml.XmlNode] $Node, [Parameter(Mandatory)] [System.Xml.XmlNamespaceManager] $Ns)
+    -join @($Node.SelectNodes('s:t | s:r/s:t', $Ns) | ForEach-Object { $_.InnerText })
+}
+
+function Get-WorksheetRow {
+    # The first worksheet as rows of cell text (a string[] per row, one entry per column).
+    # Handles workbooks written by this tool and the same workbook after Excel saved it.
+    param([Parameter(Mandatory)] [System.IO.Compression.ZipArchive] $Archive)
+
+    $workbook = Read-ZipXml -Archive $Archive -EntryName 'xl/workbook.xml'
+    $rels     = Read-ZipXml -Archive $Archive -EntryName 'xl/_rels/workbook.xml.rels'
+    if (-not $workbook -or -not $rels) { throw 'The file is not an Excel workbook.' }
+
+    $relNs  = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    $relId  = $workbook.SelectSingleNode('/s:workbook/s:sheets/s:sheet', (New-SpreadsheetNamespace -Xml $workbook)).GetAttribute('id', $relNs)
+    $target = @($rels.SelectNodes('/p:Relationships/p:Relationship', (New-SpreadsheetNamespace -Xml $rels)) |
+            Where-Object { $_.GetAttribute('Id') -eq $relId })[0].GetAttribute('Target')
+    $sheetPath = if ($target.StartsWith('/')) { $target.TrimStart('/') } else { "xl/$target" }
+
+    $shared = [System.Collections.Generic.List[string]]::new()
+    $sharedXml = Read-ZipXml -Archive $Archive -EntryName 'xl/sharedStrings.xml'
+    if ($sharedXml) {
+        $sharedNs = New-SpreadsheetNamespace -Xml $sharedXml
+        foreach ($item in $sharedXml.SelectNodes('/s:sst/s:si', $sharedNs)) { $shared.Add((Get-CellText -Node $item -Ns $sharedNs)) }
+    }
+
+    $sheet = Read-ZipXml -Archive $Archive -EntryName $sheetPath
+    $sheetNs = New-SpreadsheetNamespace -Xml $sheet
+
+    foreach ($row in $sheet.SelectNodes('/s:worksheet/s:sheetData/s:row', $sheetNs)) {
+        $cells = [System.Collections.Generic.Dictionary[int, string]]::new()
+        $column = 0
+        foreach ($cell in $row.SelectNodes('s:c', $sheetNs)) {
+            $reference = $cell.GetAttribute('r')
+            # Excel may leave out empty cells, so place each by its reference when present.
+            $column = if ($reference) { ConvertFrom-ColumnName ($reference -replace '\d', '') } else { $column + 1 }
+            $value = $cell.SelectSingleNode('s:v', $sheetNs)
+            $cells[$column] = switch ($cell.GetAttribute('t')) {
+                's'         { $shared[[int] $value.InnerText] }
+                'inlineStr' { Get-CellText -Node $cell.SelectSingleNode('s:is', $sheetNs) -Ns $sheetNs }
+                default     { if ($value) { $value.InnerText } else { '' } }
+            }
+        }
+
+        $width = 0
+        foreach ($c in $cells.Keys) { $width = [Math]::Max($width, $c) }
+        $values = [string[]]::new($width)
+        foreach ($c in $cells.Keys) { $values[$c - 1] = $cells[$c] }
+        , $values
+    }
+}
+
+function Import-DuplicateReport {
+    <#
+    .SYNOPSIS
+        Reads a report written by Export-DuplicateReport back into duplicate sets.
+    .OUTPUTS
+        The same objects Find-DuplicateFile returns.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $Path)
+
+    $Path = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($Path)
+    if (-not [System.IO.File]::Exists($Path)) { throw "Report '$Path' was not found." }
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $zip = [System.IO.Compression.ZipArchive]::new($stream, [System.IO.Compression.ZipArchiveMode]::Read)
+        try { $rows = @(Get-WorksheetRow -Archive $zip) }
+        finally { $zip.Dispose() }
+    }
+    catch [System.IO.InvalidDataException] { throw "'$Path' is not an Excel workbook." }
+    finally { $stream.Dispose() }
+
+    $expected = @($script:FixedColumns | ForEach-Object { $_.Header })
+    if ($rows.Count -eq 0 -or $rows[0].Count -lt $expected.Count -or
+        (Compare-Object $expected ($rows[0][0..($expected.Count - 1)]) -SyncWindow 0)) {
+        throw "'$Path' is not a duplicates report: its header row is not '$($expected -join ', ')'."
+    }
+
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $firstLocation = $expected.Count
+    for ($r = 1; $r -lt $rows.Count; $r++) {
+        $row = $rows[$r]
+        if ($row.Count -lt $firstLocation -or -not $row[0]) { continue }
+        $folders = if ($row.Count -gt $firstLocation) { @($row[$firstLocation..($row.Count - 1)] | Where-Object { $_ }) } else { @() }
+        [pscustomobject] @{
+            FileName      = $row[0]
+            LastWriteTime = [datetime]::FromOADate([double]::Parse($row[1], $invariant))
+            SizeBytes     = [long] [double]::Parse($row[2], $invariant)
+            MD5           = $row[3]
+            Count         = $folders.Count
+            Folders       = [string[]] $folders
+        }
+    }
+}
+
+function Find-FileIgnoringCase {
+    # The file in $Folder whose name matches $FileName ignoring case, or $null.
+    # Only needed on case-sensitive file systems (Linux, some macOS volumes).
+    param([Parameter(Mandatory)] [string] $Folder, [Parameter(Mandatory)] [string] $FileName)
+    if (-not [System.IO.Directory]::Exists($Folder)) { return $null }
+    foreach ($candidate in [System.IO.Directory]::GetFiles($Folder)) {
+        if ([System.StringComparer]::OrdinalIgnoreCase.Equals([System.IO.Path]::GetFileName($candidate), $FileName)) {
+            return [System.IO.FileInfo] $candidate
+        }
+    }
+    $null
+}
+
+function Test-DuplicateCopy {
+    <#
+        Checks one recorded copy without reading its contents:
+          Present     - still there with the same size and saved date
+          Missing     - no longer there
+          Changed     - still there but its size or saved date changed
+          Unavailable - its drive or network share cannot be reached (kept as is)
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Folder,
+        [Parameter(Mandatory)] [string] $FileName,
+        [Parameter(Mandatory)] [long] $SizeBytes,
+        [Parameter(Mandatory)] [datetime] $LastWriteTime
+    )
+
+    try {
+        $path = [System.IO.Path]::Combine($Folder, $FileName)
+        $file = if ([System.IO.File]::Exists($path)) { [System.IO.FileInfo] $path } else { Find-FileIgnoringCase -Folder $Folder -FileName $FileName }
+        if (-not $file) {
+            $root = [System.IO.Path]::GetPathRoot($Folder)
+            if ($root -and -not [System.IO.Directory]::Exists($root)) { return 'Unavailable' }
+            return 'Missing'
+        }
+        $size  = $file.Length
+        $ticks = $file.LastWriteTime.Ticks
+    }
+    catch [System.IO.FileNotFoundException] { return 'Missing' }  # deleted while being checked
+    catch [System.UnauthorizedAccessException], [System.IO.IOException], [System.Security.SecurityException] {
+        return 'Unavailable'
+    }
+
+    # Whole seconds, in exact integer arithmetic (as when scanning).
+    $ticksPerSecond = [System.TimeSpan]::TicksPerSecond
+    $savedTicks = $LastWriteTime.Ticks
+    if ($size -ne $SizeBytes -or
+        ($ticks - ($ticks % $ticksPerSecond)) -ne ($savedTicks - ($savedTicks % $ticksPerSecond))) { return 'Changed' }
+    'Present'
+}
+
+function Update-DuplicateReport {
+    <#
+    .SYNOPSIS
+        Re-checks every copy listed in an existing report and removes the ones that
+        no longer exist, without rescanning the folders.
+    .DESCRIPTION
+        Each copy is checked with a single file lookup (no contents are read or
+        downloaded). Copies that are missing, or whose size or saved date changed,
+        are removed; rows left with fewer than two copies are removed. Copies on a
+        drive or network share that cannot be reached are kept. The report is
+        rewritten in place only when something changed. Supports -WhatIf.
+    .OUTPUTS
+        A summary object; its DuplicateSet property holds the rows that remain.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)] [string] $Path)
+
+    $Path = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($Path)
+    $sets = @(Import-DuplicateReport -Path $Path)
+
+    $kept = [System.Collections.Generic.List[object]]::new()
+    $checked = 0; $removed = 0; $unavailable = 0; $rowsRemoved = 0
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastShownMs = - $script:ProgressIntervalMs
+
+    for ($i = 0; $i -lt $sets.Count; $i++) {
+        $set = $sets[$i]
+        if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
+            $lastShownMs = $timer.ElapsedMilliseconds
+            Write-Progress -Id 3 -Activity 'Validating report' -Status "Row $($i + 1) of $($sets.Count)" `
+                -CurrentOperation $set.FileName -PercentComplete ([int] (100 * $i / $sets.Count))
+        }
+
+        $present = [System.Collections.Generic.List[string]]::new()
+        foreach ($folder in $set.Folders) {
+            $checked++
+            $state = Test-DuplicateCopy -Folder $folder -FileName $set.FileName -SizeBytes $set.SizeBytes -LastWriteTime $set.LastWriteTime
+            if ($state -eq 'Present') { $present.Add($folder); continue }
+            if ($state -eq 'Unavailable') {
+                $unavailable++
+                $present.Add($folder)
+                Write-Warning "Cannot reach '$folder'; keeping its copy of '$($set.FileName)'."
+                continue
+            }
+            $removed++
+            Write-Verbose "$state`: '$([System.IO.Path]::Combine($folder, $set.FileName))'"
+        }
+
+        if ($present.Count -ge 2) {
+            $kept.Add([pscustomobject] @{
+                FileName      = $set.FileName
+                LastWriteTime = $set.LastWriteTime
+                SizeBytes     = $set.SizeBytes
+                MD5           = $set.MD5
+                Count         = $present.Count
+                Folders       = $present.ToArray()
+            })
+        }
+        else { $rowsRemoved++ }
+    }
+    Write-Progress -Id 3 -Activity 'Validating report' -Completed
+
+    $saved = $false
+    if (($removed -gt 0 -or $rowsRemoved -gt 0) -and
+        $PSCmdlet.ShouldProcess($Path, "Remove $removed copies and $rowsRemoved rows")) {
+        Export-DuplicateReport -DuplicateSet $kept.ToArray() -Path $Path
+        $saved = $true
+    }
+
+    [pscustomobject] @{
+        Path                 = $Path
+        RowsChecked          = $sets.Count
+        CopiesChecked        = $checked
+        CopiesRemoved        = $removed
+        CopiesUnavailable    = $unavailable
+        RowsRemoved          = $rowsRemoved
+        RowsRemaining        = $kept.Count
+        Saved                = $saved
+        DuplicateSet         = $kept.ToArray()
+    }
+}
+
+#endregion
+
+Export-ModuleMember -Function Get-FileInventory, Find-DuplicateFile, Export-DuplicateReport, ConvertTo-ColumnName,
+    Import-DuplicateReport, Update-DuplicateReport

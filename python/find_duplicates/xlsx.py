@@ -1,9 +1,9 @@
-"""Excel (.xlsx) report writer. Needs neither Excel nor third-party packages.
+"""Excel (.xlsx) report writer and reader. Needs neither Excel nor third-party packages.
 
-Mirrors Export-DuplicateReport in src/DuplicateFinder.psm1 and writes the same
-workbook: one row per duplicated file with the columns File Name, Last Modified,
-Size (bytes), MD5, Copies, then "Location 1..N" holding the full folder path of
-every copy. The header row is frozen and filtered.
+Mirrors Export-DuplicateReport and Import-DuplicateReport in src/DuplicateFinder.psm1
+and writes the same workbook: one row per duplicated file with the columns File
+Name, Last Modified, Size (bytes), MD5, Copies, then "Location 1..N" holding the
+full folder path of every copy. The header row is frozen and filtered.
 """
 
 from __future__ import annotations
@@ -12,8 +12,9 @@ import os
 import re
 import uuid
 import zipfile
-from datetime import datetime
-from typing import List, Sequence, Union
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Sequence, Union
+from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 from .matcher import DuplicateSet
@@ -32,6 +33,9 @@ STYLE_BOLD = 1
 STYLE_DATE = 2
 
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+PACKAGE_RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+OFFICE_RELS_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+MS_PER_DAY = 86_400_000
 XML_DECLARATION = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
 EXCEL_EPOCH = datetime(1899, 12, 30)  # day 0 of Excel/OLE Automation dates
 
@@ -101,8 +105,16 @@ def xml_safe_text(text: str) -> str:
 
 
 def excel_serial(value: datetime) -> float:
-    """A datetime as an Excel date serial number (days since 1899-12-30)."""
-    return (value - EXCEL_EPOCH).total_seconds() / 86400
+    """A datetime as an Excel date serial number (days since 1899-12-30).
+
+    Truncated to the millisecond first, exactly like .NET DateTime.ToOADate.
+    """
+    return ((value - EXCEL_EPOCH) // timedelta(milliseconds=1)) / MS_PER_DAY
+
+
+def from_excel_serial(serial: float) -> datetime:
+    """An Excel date serial number as a datetime, rounded to the millisecond like .NET DateTime.FromOADate."""
+    return EXCEL_EPOCH + timedelta(milliseconds=int(serial * MS_PER_DAY + 0.5))
 
 
 def _cell(reference: str, value: CellValue, style: int = 0) -> str:
@@ -200,3 +212,103 @@ def export_duplicate_report(duplicates: Sequence[DuplicateSet], path: str) -> No
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+def column_index(name: str) -> int:
+    """A -> 1, Z -> 26, AA -> 27 ..."""
+    index = 0
+    for letter in name.upper():
+        index = index * 26 + ord(letter) - 64
+    return index
+
+
+def _cell_text(node: ElementTree.Element) -> str:
+    """Text of an inline or shared string, including rich-text runs (phonetic runs excluded)."""
+    parts = []
+    for child in node:
+        if child.tag == f"{{{MAIN_NS}}}t":
+            parts.append(child.text or "")
+        elif child.tag == f"{{{MAIN_NS}}}r":
+            run_text = child.find(f"{{{MAIN_NS}}}t")
+            parts.append((run_text.text or "") if run_text is not None else "")
+    return "".join(parts)
+
+
+def _read_xml(archive: zipfile.ZipFile, name: str) -> Optional[ElementTree.Element]:
+    try:
+        return ElementTree.fromstring(archive.read(name))
+    except KeyError:
+        return None
+
+
+def _worksheet_rows(archive: zipfile.ZipFile) -> List[List[Optional[str]]]:
+    """The first worksheet as rows of cell text, one entry per column.
+
+    Handles workbooks written by this tool and the same workbook after Excel saved it.
+    """
+    workbook = _read_xml(archive, "xl/workbook.xml")
+    rels = _read_xml(archive, "xl/_rels/workbook.xml.rels")
+    if workbook is None or rels is None:
+        raise ValueError("The file is not an Excel workbook.")
+
+    rel_id = workbook.find(f"{{{MAIN_NS}}}sheets/{{{MAIN_NS}}}sheet").get(f"{{{OFFICE_RELS_NS}}}id")
+    target = next(r.get("Target") for r in rels.findall(f"{{{PACKAGE_RELS_NS}}}Relationship") if r.get("Id") == rel_id)
+    sheet_path = target.lstrip("/") if target.startswith("/") else f"xl/{target}"
+
+    shared_xml = _read_xml(archive, "xl/sharedStrings.xml")
+    shared = [] if shared_xml is None else [_cell_text(si) for si in shared_xml.findall(f"{{{MAIN_NS}}}si")]
+
+    rows = []
+    sheet = _read_xml(archive, sheet_path)
+    for row in sheet.findall(f"{{{MAIN_NS}}}sheetData/{{{MAIN_NS}}}row"):
+        cells: Dict[int, str] = {}
+        column = 0
+        for cell in row.findall(f"{{{MAIN_NS}}}c"):
+            reference = cell.get("r")
+            # Excel may leave out empty cells, so place each by its reference when present.
+            column = column_index(re.sub(r"\d", "", reference)) if reference else column + 1
+            value = cell.find(f"{{{MAIN_NS}}}v")
+            kind = cell.get("t")
+            if kind == "s":
+                cells[column] = shared[int(value.text)]
+            elif kind == "inlineStr":
+                cells[column] = _cell_text(cell.find(f"{{{MAIN_NS}}}is"))
+            else:
+                cells[column] = (value.text or "") if value is not None else ""
+        width = max(cells, default=0)
+        rows.append([cells.get(c) for c in range(1, width + 1)])
+    return rows
+
+
+def read_duplicate_report(path: str) -> List[DuplicateSet]:
+    """Read a report written by export_duplicate_report back into duplicate sets."""
+    path = os.path.abspath(path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Report '{path}' was not found.")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            rows = _worksheet_rows(archive)
+    except zipfile.BadZipFile:
+        raise ValueError(f"'{path}' is not an Excel workbook.") from None
+
+    expected = [header for header, _ in FIXED_COLUMNS]
+    if not rows or [(c or "").casefold() for c in rows[0][: len(expected)]] != [h.casefold() for h in expected]:
+        raise ValueError(f"'{path}' is not a duplicates report: its header row is not '{', '.join(expected)}'.")
+
+    first_location = len(expected)
+    duplicates = []
+    for row in rows[1:]:
+        if len(row) < first_location or not row[0]:
+            continue
+        folders = [folder for folder in row[first_location:] if folder]
+        duplicates.append(
+            DuplicateSet(
+                file_name=row[0],
+                last_write_time=from_excel_serial(float(row[1])),
+                size_bytes=int(float(row[2])),
+                md5=row[3],
+                count=len(folders),
+                folders=folders,
+            )
+        )
+    return duplicates

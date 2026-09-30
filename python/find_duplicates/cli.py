@@ -10,26 +10,41 @@ import sys
 import time
 from typing import List, Optional, TextIO
 
-from .matcher import find_duplicate_files
+from .matcher import MAX_THROTTLE_LIMIT, MIN_THROTTLE_LIMIT, find_duplicate_files
 from .scanner import iter_files
+from .validate import validate_report
 from .xlsx import export_duplicate_report
 
 DEFAULT_OUTPUT = "duplicates.xlsx"
 PROGRESS_INTERVAL_SECONDS = 0.25
 
 DESCRIPTION = """\
-Find duplicate files in a folder and all of its sub folders and save them to Excel.
+Find duplicate files in a folder and all of its sub folders and save them to
+Excel, or re-check an existing report without rescanning.
 
-Two files are duplicates only when ALL three of these match: file name
-(case-insensitive), saved date (last modified time, to the whole second) and
-MD5 hash of the contents. MD5 is only calculated for files whose name and saved
-date already match another file (and whose size matches too), so most files
-are never read.
+SCAN (default): two files are duplicates only when ALL three of these match:
+file name (case-insensitive), saved date (last modified time, to the whole
+second) and MD5 hash of the contents. MD5 is only calculated for files whose
+name and saved date already match another file (and whose size matches too),
+so most files are never read.
+
+VALIDATE (--validate): re-check every copy listed in an existing report with a
+quick file lookup (no contents are read) and remove copies that no longer exist
+or whose size or saved date changed. Rows left with fewer than two copies are
+removed. The report is updated in place. Copies on a drive or network share
+that cannot be reached are kept.
 
 Local folders, network shares (\\\\server\\share or mapped drives) and synced
-cloud folders (OneDrive, Google Drive, Dropbox ...) are all supported. Cloud
-files that are only stored online are downloaded when they have to be hashed,
-unless --skip-cloud-only is used. Microsoft Excel does NOT need to be installed.
+cloud folders (OneDrive, Google Drive, Dropbox ...) are all supported.
+Microsoft Excel does NOT need to be installed.
+"""
+
+EPILOG = """\
+examples:
+  python -m find_duplicates D:\\Photos
+  python -m find_duplicates \\\\server\\share C:\\Reports\\share-dupes.xlsx -j 8
+  python -m find_duplicates "%OneDrive%" --skip-cloud-only
+  python -m find_duplicates --validate C:\\Reports\\share-dupes.xlsx --dry-run
 """
 
 
@@ -61,28 +76,63 @@ class ProgressLine:
             self._shown = False
 
 
+def _throttle_limit(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if not MIN_THROTTLE_LIMIT <= value <= MAX_THROTTLE_LIMIT:
+        raise argparse.ArgumentTypeError(f"must be a whole number from {MIN_THROTTLE_LIMIT} to {MAX_THROTTLE_LIMIT}")
+    return value
+
+
 def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="find-duplicates",
         description=DESCRIPTION,
+        epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("path", nargs="?", default=".", help="Folder to scan. Defaults to the current folder.")
+    parser.add_argument(
+        "path",
+        nargs="?",
+        help="Folder to scan (default: the current folder). With --validate: the report to check.",
+    )
     parser.add_argument(
         "output",
         nargs="?",
-        help=f'Workbook to write. Defaults to "{DEFAULT_OUTPUT}" in the current folder. '
+        help=f'Report to write. Defaults to "{DEFAULT_OUTPUT}" in the current folder. '
         '".xlsx" is appended when no extension is given.',
     )
-    parser.add_argument("-o", "--output-file", dest="output_option", help="Same as the OUTPUT argument.")
+    parser.add_argument("-o", "--output-file", dest="output_option", metavar="FILE", help="Same as the OUTPUT argument.")
     parser.add_argument(
         "--skip-cloud-only",
         action="store_true",
         help="Never download online-only cloud files to hash them. "
         "Duplicates among such files are then not reported.",
     )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Print every folder as it is scanned.")
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "-j",
+        "--throttle-limit",
+        type=_throttle_limit,
+        default=1,
+        metavar="N",
+        help="How many files to hash at the same time (1-64, default 1). Try 4-8 for SSDs, "
+        "network shares and cloud folders; keep 1 for a single spinning hard disk.",
+    )
+    parser.add_argument("--validate", action="store_true", help="Re-check an existing report instead of scanning.")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show what would be saved or removed without changing the report."
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print every folder (or removed copy) as it goes.")
+    args = parser.parse_args(argv)
+
+    if args.validate:
+        if args.skip_cloud_only or args.throttle_limit != 1:
+            parser.error("--skip-cloud-only and --throttle-limit only apply to a scan, not to --validate")
+        if len([value for value in (args.path, args.output, args.output_option) if value]) > 1:
+            parser.error("--validate takes a single report")
+    return args
 
 
 def report_path(output: Optional[str]) -> str:
@@ -93,6 +143,68 @@ def report_path(output: Optional[str]) -> str:
     return os.path.abspath(output)
 
 
+def _validate(report: str, dry_run: bool) -> int:
+    progress = ProgressLine()
+    print(f"Validating '{report}' ...")
+    try:
+        result = validate_report(
+            report, dry_run=dry_run,
+            on_row=lambda name, done, total: progress.show(f"Row {done} of {total}  {name}"),
+        )
+    except (OSError, ValueError) as exc:
+        progress.clear()
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    progress.clear()
+
+    print(f"Checked {result.copies_checked} copies in {result.rows_checked} rows: "
+          f"{result.copies_removed} missing or changed, {result.copies_unavailable} unreachable (kept).")
+    print(f"Removed {result.rows_removed} rows that are no longer duplicates; {result.rows_remaining} remain.")
+    if result.saved:
+        print(f"Report updated: '{report}'.")
+    elif result.copies_removed or result.rows_removed:
+        print("Report not changed (--dry-run).")
+    else:
+        print("Report is up to date; nothing to change.")
+    return 0
+
+
+def _scan(folder: str, report: str, skip_cloud_only: bool, throttle_limit: int, dry_run: bool) -> int:
+    scan_root = os.path.abspath(folder)
+    if not os.path.isdir(scan_root):
+        print(f"error: '{folder}' is not a folder.", file=sys.stderr)
+        return 1
+
+    progress = ProgressLine()
+    print(f"Scanning '{scan_root}' ...")
+    files = list(
+        iter_files(
+            scan_root,
+            exclude=[report],
+            on_folder=lambda path, folders, found: progress.show(f"Folders: {folders}  Files: {found}  {path}"),
+        )
+    )
+    progress.clear()
+    print(f"Found {len(files)} files. Checking for duplicates ...")
+
+    duplicates = find_duplicate_files(
+        files,
+        skip_cloud_only=skip_cloud_only,
+        throttle_limit=throttle_limit,
+        on_hash=lambda path, done, total: progress.show(f"Comparing MD5 {done}/{total}  {path}"),
+    )
+    progress.clear()
+
+    copies = sum(dup.count for dup in duplicates)
+    print(f"Found {len(duplicates)} duplicated files ({copies} copies in total).")
+    if dry_run:
+        print(f"Report not saved (--dry-run): '{report}'.")
+    else:
+        export_duplicate_report(duplicates, report)
+        print(f"Report saved to '{report}'.")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
     logging.basicConfig(
@@ -101,35 +213,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         stream=sys.stderr,
     )
 
-    output = report_path(args.output_option or args.output)
-    scan_root = os.path.abspath(args.path)
-    if not os.path.isdir(scan_root):
-        print(f"error: '{args.path}' is not a folder.", file=sys.stderr)
-        return 1
-
-    progress = ProgressLine()
-    print(f"Scanning '{scan_root}' ...")
-    files = list(
-        iter_files(
-            scan_root,
-            exclude=[output],
-            on_folder=lambda folder, folders, found: progress.show(
-                f"Folders: {folders}  Files: {found}  {folder}"
-            ),
-        )
+    if args.validate:
+        return _validate(report_path(args.output_option or args.path or args.output), args.dry_run)
+    return _scan(
+        args.path or ".",
+        report_path(args.output_option or args.output),
+        args.skip_cloud_only,
+        args.throttle_limit,
+        args.dry_run,
     )
-    progress.clear()
-    print(f"Found {len(files)} files. Checking for duplicates ...")
-
-    duplicates = find_duplicate_files(
-        files,
-        skip_cloud_only=args.skip_cloud_only,
-        on_hash=lambda path, done, total: progress.show(f"Comparing MD5 {done}/{total}  {path}"),
-    )
-    progress.clear()
-    export_duplicate_report(duplicates, output)
-
-    copies = sum(dup.count for dup in duplicates)
-    print(f"Found {len(duplicates)} duplicated files ({copies} copies in total).")
-    print(f"Report saved to '{output}'.")
-    return 0

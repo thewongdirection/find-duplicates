@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, Hashable, Iterable, List, Optional, Sequence, TypeVar
@@ -27,6 +28,8 @@ log = logging.getLogger("find_duplicates")
 
 NS_PER_SECOND = 1_000_000_000
 HASH_CHUNK_BYTES = 1024 * 1024
+MIN_THROTTLE_LIMIT = 1
+MAX_THROTTLE_LIMIT = 64
 
 T = TypeVar("T")
 
@@ -49,10 +52,61 @@ class DuplicateSet:
 def md5_file(path: str) -> str:
     """MD5 of a file's contents as upper-case hex (the Get-FileHash format)."""
     digest = hashlib.md5(usedforsecurity=False)  # noqa: S324 - part of the duplicate definition
-    with open(path, "rb") as stream:
+    with open(path, "rb", buffering=0) as stream:
         for chunk in iter(lambda: stream.read(HASH_CHUNK_BYTES), b""):
             digest.update(chunk)
     return digest.hexdigest().upper()
+
+
+def _hash_or_none(path: str) -> Optional[str]:
+    # Looks md5_file up at call time so tests can replace it.
+    try:
+        return md5_file(path)
+    except OSError as exc:
+        log.warning("Could not hash '%s': %s", path, exc.strerror or exc)
+        return None
+
+
+def md5_map(
+    paths: Sequence[str], throttle_limit: int = 1, on_hash: Optional[HashCallback] = None
+) -> Dict[str, str]:
+    """Hash files, up to ``throttle_limit`` at a time, returning full path -> MD5.
+
+    Files that cannot be read are logged as warnings and left out of the map.
+    """
+    if not MIN_THROTTLE_LIMIT <= throttle_limit <= MAX_THROTTLE_LIMIT:
+        raise ValueError(f"throttle_limit must be {MIN_THROTTLE_LIMIT}-{MAX_THROTTLE_LIMIT}, not {throttle_limit}.")
+
+    result: Dict[str, str] = {}
+
+    def record(done: int, path: str, md5: Optional[str]) -> None:
+        if on_hash is not None:
+            on_hash(path, done, len(paths))
+        if md5 is not None:
+            result[path] = md5
+
+    if throttle_limit == 1:
+        for done, path in enumerate(paths, start=1):
+            record(done, path, _hash_or_none(path))
+        return result
+
+    # hashlib releases the GIL while hashing, so threads hash in parallel. A bounded
+    # window of pending jobs keeps memory flat however many files there are.
+    window = throttle_limit * 4
+    pending: deque = deque()
+    done = 0
+    with ThreadPoolExecutor(max_workers=throttle_limit) as pool:
+        for path in paths:
+            pending.append((path, pool.submit(_hash_or_none, path)))
+            if len(pending) >= window:
+                done += 1
+                oldest, future = pending.popleft()
+                record(done, oldest, future.result())
+        while pending:
+            done += 1
+            oldest, future = pending.popleft()
+            record(done, oldest, future.result())
+    return result
 
 
 def _saved_date_key(record: FileRecord) -> int:
@@ -73,14 +127,16 @@ def find_duplicate_files(
     files: Sequence[FileRecord],
     skip_cloud_only: bool = False,
     on_hash: Optional[HashCallback] = None,
+    throttle_limit: int = 1,
 ) -> List[DuplicateSet]:
     """Find sets of files whose name, saved date and MD5 hash all match.
 
     With ``skip_cloud_only`` online-only cloud files are never hashed (hashing
     would download them); duplicates among such files are then not reported.
+    ``throttle_limit`` is how many files to hash at the same time (1-64).
     """
     # Stage 1: name + saved date.
-    name_date_groups = _groups_of_many(files, lambda f: (_ordinal_ignore_case(f.name), _saved_date_key(f)))
+    name_date_groups = _groups_of_many(files, lambda f: (ordinal_ignore_case(f.name), _saved_date_key(f)))
 
     # Stage 2: size. A cheap check that avoids hashing files that cannot match.
     candidate_groups = [
@@ -108,20 +164,11 @@ def find_duplicate_files(
             )
 
     # Stage 3: MD5, only for files that already match on name, date and size.
-    to_hash = sum(len(group) for group in candidate_groups)
-    hashed = 0
+    md5_by_path = md5_map([r.path for group in candidate_groups for r in group], throttle_limit, on_hash)
+
     results: List[DuplicateSet] = []
     for group in candidate_groups:
-        hashed_files = []
-        for record in group:
-            hashed += 1
-            if on_hash is not None:
-                on_hash(record.path, hashed, to_hash)
-            try:
-                hashed_files.append((record, md5_file(record.path)))
-            except OSError as exc:
-                log.warning("Could not hash '%s': %s", record.path, exc.strerror or exc)
-
+        hashed_files = [(r, md5_by_path[r.path]) for r in group if r.path in md5_by_path]
         for same in _groups_of_many(hashed_files, lambda pair: pair[1]):
             first, md5 = same[0]
             results.append(
@@ -131,15 +178,15 @@ def find_duplicate_files(
                     size_bytes=first.size,
                     md5=md5,
                     count=len(same),
-                    folders=sorted((record.folder for record, _ in same), key=_ordinal_ignore_case),
+                    folders=sorted((record.folder for record, _ in same), key=ordinal_ignore_case),
                 )
             )
 
-    results.sort(key=lambda s: (_ordinal_ignore_case(s.file_name), s.last_write_time, s.md5))
+    results.sort(key=lambda s: (ordinal_ignore_case(s.file_name), s.last_write_time, s.md5))
     return results
 
 
-def _ordinal_ignore_case(text: str) -> str:
+def ordinal_ignore_case(text: str) -> str:
     """Key matching .NET StringComparer.OrdinalIgnoreCase, used by the PowerShell tool.
 
     Upper-cases one character at a time and leaves characters whose upper case

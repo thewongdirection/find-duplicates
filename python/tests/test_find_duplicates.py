@@ -17,10 +17,13 @@ from xml.etree import ElementTree
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from find_duplicates import cli, matcher, scanner  # noqa: E402
+from find_duplicates import cli, matcher, scanner, validate  # noqa: E402
 from find_duplicates.matcher import DuplicateSet, find_duplicate_files, md5_file  # noqa: E402
 from find_duplicates.scanner import FileRecord, iter_files  # noqa: E402
-from find_duplicates.xlsx import column_name, export_duplicate_report  # noqa: E402
+from find_duplicates.validate import validate_report  # noqa: E402
+from find_duplicates.xlsx import (  # noqa: E402
+    column_name, excel_serial, export_duplicate_report, from_excel_serial, read_duplicate_report,
+)
 from tests.helpers import SAVED, add_file, read_worksheet  # noqa: E402
 
 
@@ -314,6 +317,205 @@ class ExportDuplicateReportTests(TempDirTestCase):
         self.assertTrue(os.path.exists(os.path.join(self.root, "relative.xlsx")))
 
 
+class ThrottleLimitTests(TempDirTestCase):
+    """Hashing several files at a time (-ThrottleLimit / --throttle-limit)."""
+
+    def setUp(self):
+        super().setUp()
+        for folder in ("a", "b", "c", "d"):
+            add_file(self.root, f"{folder}/same.txt", "same")
+            add_file(self.root, f"{folder}/split.txt", f"half {int(folder in ('a', 'b'))}")
+        self.files = list(iter_files(self.root))
+        self.sequential = find_duplicate_files(self.files)
+
+    def test_finds_the_same_duplicates_hashing_several_at_a_time(self):
+        for limit in (2, 8):
+            with self.subTest(limit=limit):
+                parallel = find_duplicate_files(self.files, throttle_limit=limit)
+                self.assertEqual(len(parallel), 3)
+                self.assertEqual(parallel, self.sequential)
+
+    def test_reports_a_file_it_cannot_read_and_keeps_the_rest(self):
+        for limit in (1, 4):
+            with self.subTest(limit=limit), tempfile.TemporaryDirectory() as root:
+                for folder in ("a", "b", "c"):
+                    add_file(root, f"{folder}/x.txt")
+                files = list(iter_files(root))
+                os.remove(files[0].path)  # gone before it could be hashed
+                with self.assertLogs("find_duplicates", "WARNING") as logs:
+                    result = find_duplicate_files(files, throttle_limit=limit)
+                self.assertEqual(len(logs.output), 1)
+                self.assertIn(files[0].path, logs.output[0])
+                self.assertEqual(result[0].folders, [f.folder for f in files[1:]])
+
+    def test_rejects_a_throttle_limit_outside_1_to_64(self):
+        for limit in (0, 65):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                find_duplicate_files([], throttle_limit=limit)
+
+
+class ExcelDateTests(unittest.TestCase):
+    def test_truncates_to_the_millisecond_like_dotnet(self):
+        value = datetime(2024, 1, 2, 3, 4, 5, 678_999)
+        self.assertEqual(from_excel_serial(excel_serial(value)), datetime(2024, 1, 2, 3, 4, 5, 678_000))
+
+
+def write_excel_saved_workbook(path, rows):
+    """A workbook shaped like one Excel has re-saved: shared strings, a renamed
+    worksheet part, and cells without explicit types."""
+    strings, sheet_rows = [], []
+    for r, row in enumerate(rows, start=1):
+        cells = []
+        for c, value in enumerate(row, start=1):
+            ref = f"{column_name(c)}{r}"
+            if isinstance(value, str):
+                strings.append(value)
+                cells.append(f'<c r="{ref}" t="s"><v>{len(strings) - 1}</v></c>')
+            else:
+                cells.append(f'<c r="{ref}"><v>{value!r}</v></c>')
+        sheet_rows.append(f'<row r="{r}">{"".join(cells)}</row>')
+    main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    parts = {
+        "[Content_Types].xml": '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
+        "xl/workbook.xml": f'<workbook xmlns="{main}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                           '<sheets><sheet name="Duplicates" sheetId="1" r:id="rId7"/></sheets></workbook>',
+        "xl/_rels/workbook.xml.rels": '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                                      '<Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/data.xml"/>'
+                                      "</Relationships>",
+        "xl/sharedStrings.xml": f'<sst xmlns="{main}">' + "".join(f"<si><t>{s}</t></si>" for s in strings) + "</sst>",
+        "xl/worksheets/data.xml": f'<worksheet xmlns="{main}"><sheetData>{"".join(sheet_rows)}</sheetData></worksheet>',
+    }
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+
+
+class ReadDuplicateReportTests(TempDirTestCase):
+    ROUND_TRIP = [
+        DuplicateSet("a & b.txt", datetime(2024, 1, 2, 3, 4, 5, 678_000), 1234, "AAAA", 3,
+                     ["C:\\one", "C:\\two", "D:\\three"]),
+        DuplicateSet("z.txt", datetime(2023, 6, 7, 8, 9, 10), 5, "BBBB", 2, ["C:\\x", "C:\\y"]),
+    ]
+
+    def test_reads_back_what_export_wrote(self):
+        path = os.path.join(self.root, "report.xlsx")
+        export_duplicate_report(self.ROUND_TRIP, path)
+        self.assertEqual(read_duplicate_report(path), self.ROUND_TRIP)
+
+    def test_reads_a_report_after_excel_has_saved_it(self):
+        path = os.path.join(self.root, "excel.xlsx")
+        write_excel_saved_workbook(path, [
+            ["File Name", "Last Modified", "Size (bytes)", "MD5", "Copies", "Location 1", "Location 2"],
+            ["x.txt", 45292.5, 10, "CCCC", 2, "C:\\a", "C:\\b"],
+        ])
+        (dup,) = read_duplicate_report(path)
+        self.assertEqual(dup.file_name, "x.txt")
+        self.assertEqual(dup.last_write_time, datetime(2024, 1, 1, 12, 0, 0))
+        self.assertEqual(dup.size_bytes, 10)
+        self.assertEqual(dup.folders, ["C:\\a", "C:\\b"])
+
+    def test_rejects_a_workbook_that_is_not_a_duplicates_report(self):
+        path = os.path.join(self.root, "other.xlsx")
+        write_excel_saved_workbook(path, [["Name", "Amount"]])
+        with self.assertRaisesRegex(ValueError, "is not a duplicates report"):
+            read_duplicate_report(path)
+
+    def test_rejects_a_file_that_is_not_a_workbook(self):
+        path = add_file(self.root, "notes.xlsx", "not a zip")
+        with self.assertRaisesRegex(ValueError, "is not an Excel workbook"):
+            read_duplicate_report(path)
+
+    def test_reports_a_missing_report(self):
+        with self.assertRaisesRegex(FileNotFoundError, "was not found"):
+            read_duplicate_report(os.path.join(self.root, "missing.xlsx"))
+
+
+class ValidateReportTests(TempDirTestCase):
+    def scanned_report(self, root):
+        """Scan root into a report next to it and return the report path."""
+        path = root + ".xlsx"
+        export_duplicate_report(find_duplicate_files(list(iter_files(root))), path)
+        return path
+
+    def tree(self, *relative, content="same content"):
+        root = self.new_dir("tree")
+        for rel in relative:
+            add_file(root, rel, content)
+        return root
+
+    def test_leaves_the_report_untouched_when_every_copy_exists(self):
+        root = self.tree("a/x.txt", "b/x.txt")
+        report = self.scanned_report(root)
+        before = os.stat(report).st_mtime_ns
+        result = validate_report(report)
+        self.assertFalse(result.saved)
+        self.assertEqual((result.copies_checked, result.rows_remaining), (2, 1))
+        self.assertEqual(os.stat(report).st_mtime_ns, before)
+
+    def test_removes_a_copy_that_no_longer_exists(self):
+        root = self.tree("a/x.txt", "b/x.txt", "c/x.txt")
+        report = self.scanned_report(root)
+        os.remove(os.path.join(root, "b", "x.txt"))
+        result = validate_report(report)
+        self.assertEqual(result.copies_removed, 1)
+        self.assertTrue(result.saved)
+        (dup,) = read_duplicate_report(report)
+        self.assertEqual(dup.count, 2)
+        self.assertEqual(dup.folders, [os.path.join(root, "a"), os.path.join(root, "c")])
+
+    def test_removes_a_row_left_with_fewer_than_two_copies(self):
+        root = self.new_dir("tree")
+        for folder in ("a", "b"):
+            add_file(root, f"{folder}/gone.txt", "gone")
+            add_file(root, f"{folder}/kept.txt", "kept")
+        report = self.scanned_report(root)
+        os.remove(os.path.join(root, "a", "gone.txt"))
+        result = validate_report(report)
+        self.assertEqual(result.rows_removed, 1)
+        self.assertEqual([d.file_name for d in read_duplicate_report(report)], ["kept.txt"])
+
+    def test_removes_a_copy_that_was_changed_since_the_scan(self):
+        root = self.tree("a/x.txt", "b/x.txt", "c/x.txt")
+        report = self.scanned_report(root)
+        add_file(root, "c/x.txt", "edited", SAVED + timedelta(hours=1))
+        result = validate_report(report)
+        self.assertEqual(result.copies_removed, 1)
+        self.assertEqual(read_duplicate_report(report)[0].folders, [os.path.join(root, "a"), os.path.join(root, "b")])
+
+    def test_finds_a_copy_whose_name_differs_only_by_case(self):
+        root = self.tree("a/Photo.JPG", "b/photo.jpg")
+        result = validate_report(self.scanned_report(root))
+        self.assertEqual((result.copies_removed, result.rows_remaining), (0, 1))
+
+    def test_keeps_copies_on_a_drive_or_share_that_cannot_be_reached(self):
+        root = self.tree("a/x.txt", "b/x.txt")
+        report = self.scanned_report(root)
+        with mock.patch.object(validate, "check_copy", return_value=validate.UNAVAILABLE), \
+                self.assertLogs("find_duplicates", "WARNING") as logs:
+            result = validate_report(report)
+        self.assertEqual(result.copies_unavailable, 2)
+        self.assertFalse(result.saved)
+        self.assertEqual(len(logs.output), 2)
+        self.assertEqual(result.rows_remaining, 1)
+
+    @unittest.skipUnless(sys.platform == "win32", "drive letters are Windows-only")
+    def test_treats_a_copy_on_a_missing_drive_letter_as_unreachable(self):
+        free = next((d for d in "QRSTUVWXYZ" if not os.path.exists(f"{d}:\\")), None)
+        if free is None:
+            self.skipTest("no free drive letter")
+        state = validate.check_copy(f"{free}:\\photos", "x.txt", 1, datetime.now())
+        self.assertEqual(state, validate.UNAVAILABLE)
+
+    def test_changes_nothing_with_dry_run(self):
+        root = self.tree("a/x.txt", "b/x.txt", "c/x.txt")
+        report = self.scanned_report(root)
+        os.remove(os.path.join(root, "a", "x.txt"))
+        result = validate_report(report, dry_run=True)
+        self.assertEqual(result.copies_removed, 1)
+        self.assertFalse(result.saved)
+        self.assertEqual(read_duplicate_report(report)[0].count, 3)
+
+
 @contextlib.contextmanager
 def _chdir(path):
     previous = os.getcwd()
@@ -359,6 +561,42 @@ class CliTests(TempDirTestCase):
         self.assertTrue(os.path.exists(os.path.join(work, "my-report.xlsx")))
         self.run_cli(self.data, "-o", os.path.join(work, "named"))
         self.assertTrue(os.path.exists(os.path.join(work, "named.xlsx")))
+
+    def test_hashes_several_files_at_a_time_with_throttle_limit(self):
+        report = os.path.join(self.new_dir("work"), "parallel.xlsx")
+        code, _ = self.run_cli(self.data, report, "--throttle-limit", "4")
+        self.assertEqual(code, 0)
+        self.assertEqual(read_duplicate_report(report)[0].count, 3)
+
+    def test_saves_no_report_with_dry_run(self):
+        report = os.path.join(self.new_dir("work"), "dry.xlsx")
+        code, out = self.run_cli(self.data, report, "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("Found 1 duplicated files", out)
+        self.assertFalse(os.path.exists(report))
+
+    def test_validates_duplicates_xlsx_in_the_current_folder(self):
+        work = self.new_dir("work")
+        with _chdir(work):
+            self.run_cli(self.data)
+            os.remove(os.path.join(self.data, "backup", "invoice.pdf"))
+            code, out = self.run_cli("--validate")
+        self.assertEqual(code, 0)
+        self.assertIn("1 missing or changed", out)
+        (dup,) = read_duplicate_report(os.path.join(work, "duplicates.xlsx"))
+        self.assertEqual(dup.count, 2)
+
+    def test_takes_the_report_to_validate_as_its_first_argument(self):
+        report = os.path.join(self.new_dir("work"), "named")
+        self.run_cli(self.data, report)
+        os.remove(os.path.join(self.data, "2023", "invoice.pdf"))
+        os.remove(os.path.join(self.data, "backup", "invoice.pdf"))
+        self.run_cli("--validate", report)
+        self.assertEqual(read_duplicate_report(report + ".xlsx"), [])
+
+    def test_rejects_scan_options_with_validate(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            cli.main(["--validate", "-j", "4"])
 
     def test_does_not_scan_its_own_report(self):
         report = os.path.join(self.data, "duplicates.xlsx")

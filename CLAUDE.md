@@ -8,8 +8,9 @@ that must behave identically:
 |---------------------|--------------------------------------|----------------------------------------|
 | Command line        | `Find-Duplicates.ps1`                | `python/find_duplicates/cli.py`        |
 | Folder scanning     | `Get-FileInventory`, `Test-FolderLink`, `Test-CloudOnlyFile`, `Get-SortedByName` | `python/find_duplicates/scanner.py` |
-| Duplicate matching  | `Find-DuplicateFile`, `Get-SortedFolder` | `python/find_duplicates/matcher.py` |
-| Excel output        | `Export-DuplicateReport` and helpers | `python/find_duplicates/xlsx.py`       |
+| Duplicate matching  | `Find-DuplicateFile`, `Get-FileMd5`, `Get-FileMd5Map`, `Get-SortedFolder` | `python/find_duplicates/matcher.py` |
+| Excel output/input  | `Export-DuplicateReport`, `Import-DuplicateReport` and helpers | `python/find_duplicates/xlsx.py` |
+| Validation          | `Update-DuplicateReport`, `Test-DuplicateCopy` | `python/find_duplicates/validate.py` |
 | Tests               | `tests/DuplicateFinder.Tests.ps1`    | `python/tests/test_find_duplicates.py` |
 | Cross-language test | —                                    | `python/tests/test_parity.py`          |
 
@@ -29,13 +30,16 @@ Every new feature, behaviour change or bug fix is done in this order:
 4. Update both `README.md` and `python/README.md`.
 
 Command-line options map one to one: `-Path` ↔ `path`,
-`-OutputFile` ↔ `output` / `-o`, `-SkipCloudOnly` ↔ `--skip-cloud-only`,
-`-Verbose` ↔ `--verbose`. `-PassThru` corresponds to calling
-`find_duplicate_files()` from Python.
+`-OutputFile` ↔ `output` / `-o`, `-ThrottleLimit` ↔ `-j` / `--throttle-limit`,
+`-SkipCloudOnly` ↔ `--skip-cloud-only`, `-Validate` ↔ `--validate`,
+`-WhatIf` ↔ `--dry-run`, `-Verbose` ↔ `--verbose`. `-PassThru` corresponds to
+calling `find_duplicate_files()` / `validate_report()` from Python. Console
+messages are worded identically apart from the option names they mention.
 
 Keep orderings identical: folders and files are visited in ordinal name order,
 locations are sorted ordinal-ignore-case, rows by file name
-(ordinal-ignore-case), saved date, then MD5.
+(ordinal-ignore-case), saved date, then MD5. Excel dates are truncated to the
+millisecond when written and rounded to it when read, as .NET does.
 
 ## Constraints
 

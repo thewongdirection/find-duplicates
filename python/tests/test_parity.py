@@ -48,45 +48,79 @@ TREE = [
     ("b/late.txt", "same", 60),
     ("a/size.txt", "short", 0),             # different sizes
     ("b/size.txt", "much longer", 0),
-    ("[set]/amp & <lt>.txt", "esc", 0),     # wildcard and XML characters
-    ("other/amp & <lt>.txt", "esc", 0),
+    ("[set]/amp & semi;.txt", "esc", 0),    # wildcard and XML characters
+    ("other/amp & semi;.txt", "esc", 0),
 ]
+if os.name != "nt":  # characters Windows does not allow in file names
+    TREE += [("a/less <than>.txt", "lt", 0), ("b/less <than>.txt", "lt", 0)]
+
+# Removed before validating: one copy of a three-copy set, and one of a two-copy set.
+REMOVED_BEFORE_VALIDATE = ["b/report.doc", "b/photo.jpg"]
 
 
 @unittest.skipUnless(PWSH or REQUIRED, "PowerShell 7 (pwsh) is not installed")
 class ParityTests(unittest.TestCase):
-    def test_python_and_powershell_reports_match(self):
+    def setUp(self):
         self.assertTrue(PWSH, "pwsh is required for the parity test but was not found")
-        with tempfile.TemporaryDirectory() as root:
-            data = os.path.join(root, "data")
-            for path, content, offset in TREE:
-                add_file(data, path, content, SAVED + timedelta(seconds=offset))
-            ps_report = os.path.join(root, "ps.xlsx")
-            py_report = os.path.join(root, "py.xlsx")
+        self._temp = tempfile.TemporaryDirectory()
+        self.root = self._temp.name
+        self.data = os.path.join(self.root, "data")
+        for path, content, offset in TREE:
+            add_file(self.data, path, content, SAVED + timedelta(seconds=offset))
 
-            ps = subprocess.run(
-                [PWSH, "-NoProfile", "-NonInteractive", "-File", PS_SCRIPT,
-                 "-Path", data, "-OutputFile", ps_report],
-                capture_output=True, text=True,
-            )
-            self.assertEqual(ps.returncode, 0, f"PowerShell failed:\n{ps.stdout}\n{ps.stderr}")
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(cli.main([data, py_report]), 0)
+    def tearDown(self):
+        self._temp.cleanup()
 
-            ps_rows, py_rows = read_worksheet(ps_report), read_worksheet(py_report)
-            self.assertEqual(len(py_rows), len(ps_rows))
-            self.assertGreater(len(ps_rows), 1, "the fixture should produce duplicates")
-            for number, (ps_row, py_row) in enumerate(zip(ps_rows, py_rows), start=1):
-                with self.subTest(row=number):
-                    if number > 1:
-                        # Both are the same instant; allow float rounding (well under 1 ms).
-                        self.assertTrue(math.isclose(float(ps_row[DATE_COLUMN]), float(py_row[DATE_COLUMN]),
-                                                     abs_tol=1e-8))
-                        ps_row, py_row = _without(ps_row, DATE_COLUMN), _without(py_row, DATE_COLUMN)
-                    self.assertEqual(py_row, ps_row)
+    def report(self, name):
+        return os.path.join(self.root, name)
 
-            self.assertEqual(_parts(py_report, skip="xl/worksheets/sheet1.xml"),
-                             _parts(ps_report, skip="xl/worksheets/sheet1.xml"))
+    def run_powershell(self, *args):
+        ps = subprocess.run(
+            [PWSH, "-NoProfile", "-NonInteractive", "-File", PS_SCRIPT, *args],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(ps.returncode, 0, f"PowerShell failed:\n{ps.stdout}\n{ps.stderr}")
+
+    def run_python(self, *args):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(list(args)), 0)
+
+    def assert_same_report(self, ps_report, py_report):
+        ps_rows, py_rows = read_worksheet(ps_report), read_worksheet(py_report)
+        self.assertEqual(len(py_rows), len(ps_rows))
+        for number, (ps_row, py_row) in enumerate(zip(ps_rows, py_rows), start=1):
+            with self.subTest(row=number):
+                if number > 1:
+                    # Both are the same instant; allow float formatting differences.
+                    self.assertTrue(math.isclose(float(ps_row[DATE_COLUMN]), float(py_row[DATE_COLUMN]), abs_tol=1e-8))
+                    ps_row, py_row = _without(ps_row, DATE_COLUMN), _without(py_row, DATE_COLUMN)
+                self.assertEqual(py_row, ps_row)
+        self.assertEqual(_parts(py_report, skip="xl/worksheets/sheet1.xml"),
+                         _parts(ps_report, skip="xl/worksheets/sheet1.xml"))
+
+    def test_scan_reports_match(self):
+        self.run_powershell("-Path", self.data, "-OutputFile", self.report("ps.xlsx"))
+        self.run_python(self.data, self.report("py.xlsx"))
+        self.assertGreater(len(read_worksheet(self.report("ps.xlsx"))), 1, "the fixture should produce duplicates")
+        self.assert_same_report(self.report("ps.xlsx"), self.report("py.xlsx"))
+
+    def test_parallel_hashing_reports_match(self):
+        self.run_powershell("-Path", self.data, "-OutputFile", self.report("ps.xlsx"), "-ThrottleLimit", "4")
+        self.run_python(self.data, self.report("py.xlsx"), "--throttle-limit", "4")
+        self.assert_same_report(self.report("ps.xlsx"), self.report("py.xlsx"))
+
+    def test_validated_reports_match(self):
+        self.run_powershell("-Path", self.data, "-OutputFile", self.report("ps.xlsx"))
+        self.run_python(self.data, self.report("py.xlsx"))
+        for relative in REMOVED_BEFORE_VALIDATE:
+            os.remove(os.path.join(self.data, *relative.split("/")))
+
+        self.run_powershell("-Validate", "-OutputFile", self.report("ps.xlsx"))
+        self.run_python("--validate", self.report("py.xlsx"))
+
+        self.assert_same_report(self.report("ps.xlsx"), self.report("py.xlsx"))
+        names = [row[0] for row in read_worksheet(self.report("py.xlsx"))[1:]]
+        self.assertNotIn("Photo.JPG", names, "a row left with one copy is removed")
 
 
 def _without(row, index):
