@@ -1,7 +1,7 @@
 """Excel (.xlsx) report writer and reader. Needs neither Excel nor third-party packages.
 
 Mirrors Export-DuplicateReport, Import-DuplicateReport and Import-DuplicateFolderReport
-in src/DuplicateFinder.psm1 and writes the same workbook:
+in DuplicateFinder.psm1 and writes the same workbook:
 
 * sheet "Duplicates": one row per duplicated file with the columns File Name, Last
   Modified, UTC Offset, Size (bytes), MD5, Copies, then "Location 1..N" holding the

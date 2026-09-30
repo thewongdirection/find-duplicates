@@ -1,7 +1,7 @@
 """Recursive folder scanning.
 
 Mirrors Get-FileInventory, Test-FolderLink and Test-CloudOnlyFile in
-src/DuplicateFinder.psm1.
+DuplicateFinder.psm1.
 """
 
 from __future__ import annotations

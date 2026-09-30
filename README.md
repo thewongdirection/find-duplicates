@@ -57,15 +57,15 @@ or, on GitHub, *Code* > *Download ZIP*.
 **Needs:** Windows PowerShell 5.1 (part of Windows 10 and 11) or PowerShell 7+
 on Windows, Linux or macOS. No Excel, no modules, no internet access.
 
-**Copy these three files, keeping the folder layout:**
+**Copy these three files into one folder** (any folder):
 
 ```text
 Find-Duplicates.ps1
-src/DuplicateFinder.psm1
-src/DuplicateFinder.cs
+DuplicateFinder.psm1
+DuplicateFinder.cs
 ```
 
-The script loads the module from its `src` folder, and the module compiles
+The script loads the module from its own folder, and the module compiles
 `DuplicateFinder.cs` (its fast per-file code) the first time it is loaded in a
 PowerShell session, which takes about half a second.
 
@@ -75,13 +75,13 @@ PowerShell session, which takes about half a second.
   Windows may refuse to run them. Unblock them once:
 
   ```powershell
-  Get-ChildItem -Recurse -File .\find-duplicates | Unblock-File
+  Get-ChildItem -File .\find-duplicates | Unblock-File
   ```
 
   or start the script with the policy relaxed for that run only:
   `powershell -ExecutionPolicy Bypass -File .\Find-Duplicates.ps1 D:\Photos`.
 - **`AllSigned` policy.** Where only signed scripts may run, sign
-  `Find-Duplicates.ps1` and `src/DuplicateFinder.psm1` with your organisation's
+  `Find-Duplicates.ps1` and `DuplicateFinder.psm1` with your organisation's
   code-signing certificate (`Set-AuthenticodeSignature`).
 - **Locked-down computers.** Where AppLocker or Windows Defender Application
   Control puts PowerShell in Constrained Language Mode, the module cannot
@@ -446,7 +446,7 @@ and validated in a few seconds.
 
 The PowerShell module's per-file loops (grouping names, listing folders, hashing,
 reading the report, checking copies) run as compiled .NET code, which the module
-builds from `src/DuplicateFinder.cs` when it is imported (about half a second, once
+builds from `DuplicateFinder.cs` when it is imported (about half a second, once
 per PowerShell session); no separate download or install is involved.
 
 GPU/CUDA acceleration would not help: MD5 cannot be split across GPU cores
@@ -455,10 +455,10 @@ the GPU adds overhead.
 
 ## Using the functions directly
 
-`src/DuplicateFinder.psm1` exports the building blocks:
+`DuplicateFinder.psm1` exports the building blocks:
 
 ```powershell
-Import-Module .\src\DuplicateFinder.psm1
+Import-Module .\DuplicateFinder.psm1
 
 $files = Get-FileInventory -Path D:\Photos                       # every file, recursively
 $dupes = Find-DuplicateFile -File $files -ThrottleLimit 4        # name + date + MD5 sets

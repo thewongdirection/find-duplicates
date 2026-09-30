@@ -1,6 +1,6 @@
 """Duplicate matching.
 
-Mirrors Find-DuplicateFile in src/DuplicateFinder.psm1. A file is a duplicate
+Mirrors Find-DuplicateFile in DuplicateFinder.psm1. A file is a duplicate
 of another when ALL of the following match:
 
 1. File name (case-insensitive)

@@ -16,8 +16,8 @@ that must behave identically:
 | Tests               | `tests/DuplicateFinder.Tests.ps1`    | `python/tests/test_find_duplicates.py`, `test_folders.py`, `test_unicode.py`, `test_edge_cases.py` |
 | Cross-language test | —                                    | `python/tests/test_parity.py`          |
 
-All PowerShell functions live in `src/DuplicateFinder.psm1`. The loops that run once
-per file, cell or copy call compiled helpers in `src/DuplicateFinder.cs`
+All PowerShell functions live in `DuplicateFinder.psm1`. The loops that run once
+per file, cell or copy call compiled helpers in `DuplicateFinder.cs`
 (`FindDuplicates.Native`: name keys, grouping, folder listing, MD5, the worksheet
 reader, copy checks), which the module compiles with `Add-Type` when it is imported.
 
@@ -99,7 +99,7 @@ Code that runs per file, per cell or per row (scanning, hashing, the Excel
 writer and reader) avoids pipelines, script block comparers and advanced
 function calls in the inner loop, and throttles `Write-Progress`: PowerShell's
 per-call overhead dominates on large trees and reports. Such loops belong in
-`src/DuplicateFinder.cs`, which must stay C# 5, ASCII, and limited to assemblies both
+`DuplicateFinder.cs`, which must stay C# 5, ASCII, and limited to assemblies both
 editions reference (the module adds `System.Xml` for Windows PowerShell 5.1). Keep
 thin PowerShell functions around what tests mock (`Get-FileMd5`, `Test-PathRootReachable`,
 `Find-FileByNameKey`, `Test-CloudOnlyFile`). A compiled type lives for the whole process:
