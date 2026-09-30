@@ -19,16 +19,30 @@ Set-StrictMode -Version Latest
 
 Add-Type -AssemblyName System.IO.Compression
 
+# Compiled helpers for the loops that run once per file (DuplicateFinder.cs). A type lives for
+# the whole process, so a module imported again, or by a worker runspace, reuses it.
+if (-not ('FindDuplicates.Native' -as [type])) {
+    $helper = @{ Path = Join-Path $PSScriptRoot 'DuplicateFinder.cs' }
+    # Windows PowerShell 5.1 references fewer assemblies by default than PowerShell 7.
+    if ($PSVersionTable.PSEdition -ne 'Core') { $helper.ReferencedAssemblies = 'System.Xml' }
+    Add-Type @helper
+}
+
 $script:ProgressIntervalMs = 250
 $script:ExcelMaxRows       = 1048576
 $script:ExcelMaxColumns    = 16384
+$script:ExcelMaxCellText   = 32767
+$script:SpreadsheetMain    = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'  # the SpreadsheetML namespace
 $script:FixedColumns       = @(
     @{ Header = 'File Name';     Width = 40 }
     @{ Header = 'Last Modified'; Width = 20 }
+    @{ Header = 'UTC Offset';    Width = 11 }
     @{ Header = 'Size (bytes)';  Width = 14 }
     @{ Header = 'MD5';           Width = 34 }
     @{ Header = 'Copies';        Width = 8  }
 )
+# Reports written before the UTC Offset column; still read, and validated by local time.
+$script:LegacyFixedColumns = @($script:FixedColumns | Where-Object { $_.Header -ne 'UTC Offset' })
 $script:LocationColumnWidth = 60
 $script:FolderColumns      = @(
     @{ Header = 'Folder Name';  Width = 40 }
@@ -50,7 +64,8 @@ $script:RulesIntro = @(
 $script:FileRulesTitle = "Sheet '$script:FileSheetName': duplicate files"
 $script:FileRules = @(
     'A file is listed when another file has ALL of: the same name (ignoring upper/lower case), the same saved date (last modified, to the whole second) and the same contents (MD5 hash).'
-    'Each row is one duplicated file. Each Location column is the full path of a folder that holds a copy.'
+    'Each row is one duplicated file. Each Location column is the full path of a folder that holds a copy: Location 1 is the least nested (fewest folders deep), the last Location the most nested; folders equally deep are in alphabetical order.'
+    'Last Modified is local time on the computer that ran the scan, and UTC Offset its difference from UTC then, so the report can be checked in any time zone.'
     'Files of 0 bytes are included unless the scan used -IgnoreEmptyFiles (Python: --ignore-empty-files).'
 )
 $script:FolderRulesTitle = "Sheet '$script:FolderSheetName': duplicate folders"
@@ -59,6 +74,15 @@ $script:FolderRules = @(
     'Only the top-most duplicates are listed: a sub folder is listed on its own only when one of its copies is outside a duplicate folder. Folders that contain no files are not listed.'
     'Each row is one duplicated folder. Each Location column is the full path of one copy.'
 )
+# Written only when the scan left names or small files out. The label rows are read back, so
+# validating leaves the same names out and rewriting the report keeps the settings.
+$script:SettingsTitle = 'Scan settings'
+$script:SettingsRules = @(
+    'Files and folders whose names match a pattern below (* stands for any characters, ? for any one character, ignoring upper/lower case) were not scanned: folders were compared, and are validated, as if they were not there.'
+    'Files smaller than the size below are not listed on the Duplicates sheet; folders are compared with all their files.'
+)
+$script:ExcludeNameLabel = 'Names left out (-Exclude; Python: --exclude)'
+$script:MinimumSizeLabel = 'Smallest file listed, in bytes (-MinimumSize or -IgnoreEmptyFiles; Python: --minimum-size or --ignore-empty-files)'
 
 # Attributes Windows sets on cloud placeholders (OneDrive "Files On-Demand" and other
 # Cloud Files providers) whose contents are not stored locally. Reading them downloads them.
@@ -81,13 +105,102 @@ $script:ByPathIgnoringCase = [System.Comparison[string]] {
     $order
 }
 
-$script:ByDuplicateSet = [System.Comparison[object]] {
-    param($x, $y)
-    $order = Compare-IgnoringCase $x.FileName $y.FileName
-    if ($order -eq 0) { $order = $x.LastWriteTime.CompareTo($y.LastWriteTime) }
-    if ($order -eq 0) { $order = [string]::CompareOrdinal($x.MD5, $y.MD5) }
-    $order
+function Get-SortedDuplicateSet {
+    # Duplicate sets ordered by file name (ignoring case, as Compare-IgnoringCase does), then
+    # saved date, then MD5. Sorted on precomputed keys compared ordinally: a script block
+    # comparer would run far too often for large results. The separator cannot occur in file
+    # names and sorts before every other character, so a name sorts before its extensions.
+    param([Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $DuplicateSet)
+    if ($DuplicateSet.Count -gt 1) {
+        $separator = [string] [char] 0
+        $keys = [string[]] @(foreach ($set in $DuplicateSet) {
+                $set.FileName.ToUpperInvariant() + $separator + $set.LastWriteTime.Ticks.ToString('D19') + $separator + $set.MD5
+            })
+        # The casts pick the non-generic overload: with the generic one, PowerShell passes a
+        # copy of the items array and only the keys end up sorted.
+        [System.Array]::Sort([System.Array] $keys, [System.Array] $DuplicateSet, [System.Collections.IComparer] [System.StringComparer]::Ordinal)
+    }
+    , $DuplicateSet
 }
+
+#region Parallel work
+
+$script:ModulePath = $PSCommandPath
+
+# Runs in each worker runspace: takes items from the pool's queue until it is completed and
+# runs the work script block on each, in this module's scope, passing back the value or the
+# failure. One runspace per worker, not per item, keeps the cost per item low.
+$script:WorkerLoop = {
+    param($Queue, $Results, [string] $Work, [string] $ModulePath)
+    $module = Get-Module | Where-Object { $_.Path -eq $ModulePath } | Select-Object -First 1
+    if (-not $module) { throw "The module '$ModulePath' did not load in a worker runspace." }
+    $run = $module.NewBoundScriptBlock([scriptblock]::Create($Work))
+    foreach ($item in $Queue.GetConsumingEnumerable()) {
+        try { $Results.Add([pscustomobject] @{ Item = $item; Value = (& $run $item); Error = $null }) }
+        catch { $Results.Add([pscustomobject] @{ Item = $item; Value = $null; Error = $_.Exception }) }
+    }
+}
+
+function Open-WorkerPool {
+    <#
+        Starts $ThrottleLimit worker runspaces, each with this module loaded, that run $Work
+        (a script block taking one item) on every item added to the pool's Queue. Take the
+        results with Receive-WorkerResult; always finish with Close-WorkerPool.
+    #>
+    param(
+        [Parameter(Mandatory)] [scriptblock] $Work,
+        [Parameter(Mandatory)] [ValidateRange(2, 64)] [int] $ThrottleLimit
+    )
+
+    $state = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault2()
+    $state.ImportPSModule([string[]] @($script:ModulePath))
+    $runspaces = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ThrottleLimit, $state, $Host)
+    $runspaces.Open()
+    $pool = [pscustomobject] @{
+        Queue     = [System.Collections.Concurrent.BlockingCollection[object]]::new()
+        Results   = [System.Collections.Concurrent.BlockingCollection[object]]::new()
+        Workers   = [System.Collections.Generic.List[object]]::new()
+        Runspaces = $runspaces
+    }
+    for ($w = 0; $w -lt $ThrottleLimit; $w++) {
+        $shell = [System.Management.Automation.PowerShell]::Create()
+        $shell.RunspacePool = $runspaces
+        $null = $shell.AddScript($script:WorkerLoop.ToString()).AddArgument($pool.Queue).AddArgument($pool.Results).AddArgument($Work.ToString()).AddArgument($script:ModulePath)
+        $pool.Workers.Add([pscustomobject] @{ Shell = $shell; Handle = $shell.BeginInvoke() })
+    }
+    $pool
+}
+
+function Receive-WorkerResult {
+    # The pool's next result: Item, Value, and Error (the exception when the work failed on
+    # that item). Throws when every worker has stopped without finishing its items.
+    param([Parameter(Mandatory)] [object] $Pool)
+    $result = $null
+    while (-not $Pool.Results.TryTake([ref] $result, 50)) {
+        $running = $false
+        foreach ($worker in $Pool.Workers) { if (-not $worker.Handle.IsCompleted) { $running = $true } }
+        if (-not $running -and $Pool.Results.Count -eq 0) {
+            foreach ($worker in $Pool.Workers) { $null = $worker.Shell.EndInvoke($worker.Handle) }  # rethrows why
+            throw 'The parallel workers stopped before finishing their work.'
+        }
+    }
+    $result
+}
+
+function Close-WorkerPool {
+    # Drops any items still queued (after an error or Ctrl+C), lets each worker finish its
+    # current item, and frees the runspaces.
+    param([Parameter(Mandatory)] [object] $Pool)
+    $Pool.Queue.CompleteAdding()
+    $unused = $null
+    while ($Pool.Queue.TryTake([ref] $unused)) { $unused = $null }
+    foreach ($worker in $Pool.Workers) { $worker.Shell.Dispose() }
+    $Pool.Runspaces.Dispose()
+    $Pool.Queue.Dispose()
+    $Pool.Results.Dispose()
+}
+
+#endregion
 
 #region Scanning
 
@@ -100,7 +213,9 @@ function Get-FileInventory {
         Folders that cannot be read (permissions, dropped network connection) are
         reported as warnings and skipped. Symbolic links and junctions are not
         followed, which prevents infinite loops; cloud-synced folders are followed.
-        Listing folders never downloads cloud files.
+        Listing folders never downloads cloud files, and each folder is listed once.
+        With -ThrottleLimit above 1, that many folders are listed at the same time
+        (much faster on network shares); the files come out in the same order.
     #>
     [CmdletBinding()]
     [OutputType([System.IO.FileInfo])]
@@ -116,7 +231,16 @@ function Get-FileInventory {
         # folder that holds an excluded file, and each folder link that is not followed,
         # is recorded as not readable: its contents are not fully known, so it can never
         # be proven identical to another folder.
-        [System.Collections.Generic.List[object]] $FolderInfo
+        [System.Collections.Generic.List[object]] $FolderInfo,
+
+        # How many folders to list at the same time.
+        [ValidateRange(1, 64)]
+        [int] $ThrottleLimit = 1,
+
+        # Wildcard patterns (* and ?) of file and folder names to leave out, ignoring case.
+        # Left-out folders are not scanned; a folder is recorded (-FolderInfo) as if the
+        # left-out files and folders were not there.
+        [string[]] $ExcludeName = @()
     )
 
     $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
@@ -126,9 +250,19 @@ function Get-FileInventory {
 
     $excluded = [System.Collections.Generic.HashSet[string]]::new(
         [string[]] $ExcludeFile, [System.StringComparer]::OrdinalIgnoreCase)
+    # Folders holding an excluded file: only their files are checked one by one.
+    $excludedIn = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $ExcludeFile) { $null = $excludedIn.Add([System.IO.Path]::GetDirectoryName($path)) }
 
-    $pending = [System.Collections.Generic.Stack[System.IO.DirectoryInfo]]::new()
-    $pending.Push([System.IO.DirectoryInfo] $root.FullName)
+    # Listing several folders at a time lists the whole tree first; it is then walked below
+    # exactly as when listing one folder at a time, so the output is the same.
+    $nameFilter = ConvertTo-NameFilter -Pattern $ExcludeName
+
+    $listings = $null
+    if ($ThrottleLimit -gt 1) { $listings = Get-TreeListing -Path $root.FullName -ThrottleLimit $ThrottleLimit -NameFilter $nameFilter }
+
+    $pending = [System.Collections.Generic.Stack[string]]::new()
+    $pending.Push($root.FullName)
 
     $folderCount = 0
     $fileCount   = 0
@@ -139,33 +273,47 @@ function Get-FileInventory {
         $folder = $pending.Pop()
         $folderCount++
 
-        Write-Verbose "Scanning $($folder.FullName)"
-        if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
-            $lastShownMs = $timer.ElapsedMilliseconds
-            Write-Progress -Id 1 -Activity 'Scanning folders' `
-                -Status "Folders: $folderCount   Files: $fileCount" `
-                -CurrentOperation $folder.FullName
+        Write-Verbose "Scanning $folder"
+        if ($null -ne $listings) { $listing = $listings[$folder] }
+        else {
+            if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
+                $lastShownMs = $timer.ElapsedMilliseconds
+                Write-Progress -Id 1 -Activity 'Scanning folders' `
+                    -Status "Folders: $folderCount   Files: $fileCount" -CurrentOperation $folder
+            }
+            $listing = Get-FolderListing -Path $folder
         }
 
-        try {
-            # File systems list entries in different orders (alphabetical on NTFS, arbitrary on ext4).
-            $files      = Get-SortedByName -Item $folder.GetFiles()
-            $subFolders = Get-SortedByName -Item $folder.GetDirectories()
-        }
-        catch [System.UnauthorizedAccessException], [System.IO.IOException], [System.Security.SecurityException] {
-            Write-Warning "Skipping '$($folder.FullName)': $($_.Exception.Message)"
-            if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder.FullName; Readable = $false }) }
+        if ($null -ne $listing.Error) {
+            Write-Warning "Skipping '$folder': $($listing.Error)"
+            if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder; Readable = $false }) }
             continue
         }
-        if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder.FullName; Readable = $true }) }
+        if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder; Readable = $true }) }
 
-        foreach ($file in $files) {
-            if ($excluded.Contains($file.FullName)) {
-                if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder.FullName; Readable = $false }) }
-                continue
+        $keptFiles = $listing.Files
+        $subFolders = $listing.Folders
+        if ($null -ne $nameFilter) {
+            $keptFiles = [FindDuplicates.Native]::WithoutMatchingNames($keptFiles, $nameFilter)
+            $subFolders = [FindDuplicates.Native]::WithoutMatchingNames($subFolders, $nameFilter)
+        }
+
+        # (By a file's own folder, not $folder: a scan root given with a trailing separator
+        # keeps it in $folder.)
+        if ($keptFiles.Count -and $excludedIn.Contains([System.IO.Path]::GetDirectoryName($keptFiles[0].FullName))) {
+            foreach ($file in $keptFiles) {
+                if ($excluded.Contains($file.FullName)) {
+                    if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $folder; Readable = $false }) }
+                    continue
+                }
+                $fileCount++
+                $file
             }
-            $fileCount++
-            $file
+        }
+        else {
+            # The whole listing at once: a statement per file costs more than the listing itself.
+            $fileCount += $keptFiles.Count
+            $keptFiles
         }
 
         # Push in reverse so folders are visited in alphabetical order.
@@ -176,21 +324,142 @@ function Get-FileInventory {
                 if ($null -ne $FolderInfo) { $FolderInfo.Add([pscustomobject] @{ Path = $sub.FullName; Readable = $false }) }
                 continue
             }
-            $pending.Push($sub)
+            $pending.Push($sub.FullName)
         }
     }
 
     Write-Progress -Id 1 -Activity 'Scanning folders' -Completed
 }
 
-function Get-SortedByName {
-    # Files or folders in ordinal name order, as a new array.
-    param([Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Item)
-    if ($Item.Count -gt 1) {
-        $names = [string[]] $Item.Name
-        [System.Array]::Sort($names, $Item, [System.StringComparer]::Ordinal)
+function Get-FolderListing {
+    <#
+        One folder's files and sub folders, each in ordinal name order, from a single listing
+        of the folder (over a network every listing is a round trip). Error holds the reason
+        when the folder cannot be read.
+    #>
+    # A simple function (no parameter validation): it runs once per folder.
+    param([string] $Path)
+    [FindDuplicates.Native]::ListFolder($Path)
+}
+
+function Get-TreeListing {
+    <#
+        Lists every folder below $Path (folder links are not followed), $ThrottleLimit folders
+        at a time, showing progress, leaving out folders whose names match $NameFilter (see
+        ConvertTo-NameFilter). Returns a map of folder path -> Get-FolderListing result.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [ValidateRange(2, 64)] [int] $ThrottleLimit,
+        [regex] $NameFilter
+    )
+
+    $listings = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
+    $fileCount = 0
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastShownMs = - $script:ProgressIntervalMs
+    $pool = $null
+    try {
+        $pool = Open-WorkerPool -Work { param($Folder) Get-FolderListing -Path $Folder } -ThrottleLimit $ThrottleLimit
+        $pool.Queue.Add($Path)
+        $outstanding = 1
+        while ($outstanding -gt 0) {
+            $result = Receive-WorkerResult -Pool $pool
+            $outstanding--
+            if ($null -ne $result.Error) { throw $result.Error }  # Get-FolderListing reports the expected failures itself
+            $listing = $result.Value
+            $listings[$listing.Path] = $listing
+            $fileCount += $listing.Files.Count
+            if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
+                $lastShownMs = $timer.ElapsedMilliseconds
+                Write-Progress -Id 1 -Activity 'Scanning folders' `
+                    -Status "Folders: $($listings.Count)   Files: $fileCount ($ThrottleLimit at a time)" -CurrentOperation $listing.Path
+            }
+            $subFolders = $listing.Folders
+            if ($null -ne $NameFilter) { $subFolders = [FindDuplicates.Native]::WithoutMatchingNames($subFolders, $NameFilter) }
+            foreach ($sub in $subFolders) {
+                if (Test-FolderLink -Folder $sub) { continue }
+                $pool.Queue.Add($sub.FullName)
+                $outstanding++
+            }
+        }
     }
-    , $Item
+    finally {
+        if ($null -ne $pool) { Close-WorkerPool -Pool $pool }
+    }
+    , $listings
+}
+
+# File systems reached over a network, as Linux names them in /proc/self/mounts. Shared with
+# the Python port (scanner.NETWORK_FILE_SYSTEMS).
+$script:NetworkFileSystems = [System.Collections.Generic.HashSet[string]]::new([string[]] @(
+        '9p', 'afs', 'ceph', 'cifs', 'davfs', 'fuse.davfs2', 'fuse.gcsfuse', 'fuse.glusterfs', 'fuse.rclone',
+        'fuse.s3fs', 'fuse.sshfs', 'glusterfs', 'gpfs', 'lustre', 'ncpfs', 'nfs', 'nfs4', 'smb3', 'smbfs'),
+    [System.StringComparer]::Ordinal)
+
+# How many folders and files to list and hash at a time on a network drive when the
+# command line does not say (-ThrottleLimit): each request waits on the server.
+$script:NetworkThrottleLimit = 4
+
+function Test-NetworkDrive {
+    <#
+    .SYNOPSIS
+        Whether a path is on a network share: a UNC path or network drive on Windows, a
+        network file system (NFS, SMB ...) on Linux. False when unknown (macOS).
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)] [string] $Path)
+
+    $Path = [System.IO.Path]::GetFullPath($Path)
+    if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+        # Long-path forms: \\?\UNC\server\share is a share, \\?\C:\... a drive.
+        foreach ($prefix in '\\?\', '\\.\') {
+            if ($Path.StartsWith($prefix + 'UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+            if ($Path.StartsWith($prefix)) { $Path = $Path.Substring($prefix.Length) }
+        }
+        if ($Path.StartsWith('\\') -or $Path.StartsWith('//')) { return $true }
+        try { return ([System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($Path))).DriveType -eq [System.IO.DriveType]::Network }
+        catch { return $false }
+    }
+    $mountsFile = '/proc/self/mounts'
+    if (-not [System.IO.File]::Exists($mountsFile)) { return $false }
+    # (mount point, file system) pairs; mount points write spaces and some other characters
+    # as octal (\040).
+    $mounts = @(foreach ($line in [System.IO.File]::ReadAllLines($mountsFile)) {
+            $fields = $line.Split(' ')
+            if ($fields.Count -ge 3) {
+                $point = [regex]::Replace($fields[1], '\\([0-7]{3})', { param($m) [string] [char] [Convert]::ToInt32($m.Groups[1].Value, 8) })
+                , @($point, $fields[2])
+            }
+        })
+    $script:NetworkFileSystems.Contains((Get-MountType -Path $Path -Mount $mounts))
+}
+
+function Get-MountType {
+    # The file system of the mount holding $Path, given (mount point, file system) pairs:
+    # the longest mount point that is the path or one of its parent folders.
+    param([Parameter(Mandatory)] [string] $Path, [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Mount)
+    $best = ''; $kind = ''
+    foreach ($pair in $Mount) {
+        $point = $pair[0]
+        $inside = $Path -ceq $point -or $Path.StartsWith($point.TrimEnd('/') + '/', [System.StringComparison]::Ordinal)
+        if ($inside -and $point.Length -gt $best.Length) { $best = $point; $kind = $pair[1] }
+    }
+    $kind
+}
+
+function Get-DefaultThrottleLimit {
+    <#
+    .SYNOPSIS
+        The -ThrottleLimit to use for a scan of $Path when none was given: several at a time
+        on a network drive, one otherwise.
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([Parameter(Mandatory)] [string] $Path)
+    if (Test-NetworkDrive -Path $Path) { return $script:NetworkThrottleLimit }
+    1
 }
 
 function Test-FolderLink {
@@ -214,33 +483,98 @@ function Test-CloudOnlyFile {
 
 #region Matching
 
-# Computes the MD5 of one file as upper-case hex. Kept as a script block so the very
-# same code runs in the current session and in the parallel runspaces. The large
-# buffer and the sequential-scan hint make reads from disks and shares much faster.
-$script:ComputeMd5 = {
-    param([string] $Path)
-    $ErrorActionPreference = 'Stop'
-    $md5 = [System.Security.Cryptography.MD5]::Create()
-    try {
-        $stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
-            [System.IO.FileShare] 'ReadWrite, Delete', 1MB, [System.IO.FileOptions]::SequentialScan)
-        try { [System.BitConverter]::ToString($md5.ComputeHash($stream)).Replace('-', '') }
-        finally { $stream.Dispose() }
-    }
-    finally { $md5.Dispose() }
-}
-
 function ConvertTo-NameKey {
     <#
         The form in which names are compared: Unicode-normalised (NFC, so "e + accent"
         as macOS often stores it equals the single character Windows stores) and upper
         case (so the comparison ignores case). Names that are not valid UTF-16 cannot
-        be normalised and are compared as they are.
+        be normalised and are compared as they are. (FindDuplicates.Native.NameKey, which
+        per-file loops call directly.)
     #>
-    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Name)
-    try { if (-not $Name.IsNormalized()) { $Name = $Name.Normalize() } }
-    catch [System.ArgumentException] { Write-Debug "Cannot normalise '$Name'; comparing it as it is." }
-    $Name.ToUpperInvariant()
+    # A simple function (no parameter validation): it runs for every file in some loops.
+    param([string] $Name)
+    [FindDuplicates.Native]::NameKey($Name)
+}
+
+# One character for a ? wildcard: a surrogate pair (a character beyond U+FFFF, such as an
+# emoji) or a single UTF-16 unit, as Python's regular expressions match one code point.
+# Atomic, so that it never falls back to half of a pair.
+$script:AnyCharacterPattern = '(?>[\uD800-\uDBFF][\uDC00-\uDFFF]|.)'
+
+function Get-NamePatternProblem {
+    # Why an exclusion pattern can never match a name, or $null when it can.
+    param([AllowEmptyString()] [string] $Pattern)
+    if (-not $Pattern) { return 'Exclusion patterns cannot be empty.' }
+    if ($Pattern.IndexOfAny([char[]] '/\') -ge 0) {
+        return "Exclusion pattern '$Pattern' contains / or \: patterns match file and folder names, not paths."
+    }
+    $null
+}
+
+function ConvertFrom-SizeText {
+    <#
+    .SYNOPSIS
+        A size in bytes from text such as 1500, 2KB or 1.5MB: a number, optionally followed by
+        KB, MB, GB, TB or PB (1024-based, any case), rounded to a whole number of bytes. Read
+        the same way as the Python port's --minimum-size.
+    #>
+    [CmdletBinding()]
+    [OutputType([long])]
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Text, [string] $Name = 'The size')
+    $match = [regex]::Match($Text, '\A([0-9]+(?:\.[0-9]+)?)([KMGTP]B)?\z', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) { throw "$Name must be a number of bytes, optionally followed by KB, MB, GB, TB or PB." }
+    $power = 0
+    if ($match.Groups[2].Success) { $power = 'KMGTP'.IndexOf([char]::ToUpperInvariant($match.Groups[2].Value[0])) + 1 }
+    $bytes = [Math]::Round([double]::Parse($match.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture) * [Math]::Pow(1024, $power))
+    if ($bytes -ge [Math]::Pow(2, 63)) { throw "$Name must be at most $([long]::MaxValue) bytes." }
+    [long] $bytes
+}
+
+function Assert-NamePattern {
+    <#
+    .SYNOPSIS
+        Throws when an exclusion pattern could never match a file or folder name (it is
+        empty or holds a path separator), so a scan stops before it starts.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [AllowEmptyCollection()] [AllowEmptyString()] [string[]] $Pattern)
+    foreach ($p in $Pattern) {
+        $problem = Get-NamePatternProblem -Pattern $p
+        if ($problem) { throw $problem }
+    }
+}
+
+function ConvertTo-NameFilter {
+    <#
+        One regular expression that matches the name key (see ConvertTo-NameKey) of any name
+        matching one of the wildcard patterns, so names match whatever their case or Unicode
+        form. * stands for any run of characters and ? for any one character; everything
+        else is literal. $null when there are no patterns.
+        Each pattern is split at its stars: the first part must start the name and the last
+        end it; each part between is taken at its first place after the one before, in an
+        atomic group. That is always right for wildcards and never backtracks, so a pattern
+        such as *a*a*a*a*b cannot take exponential time (as name_filter in Python).
+    #>
+    param([AllowEmptyCollection()] [string[]] $Pattern)
+    if (-not $Pattern) { return $null }
+    $alternatives = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in $Pattern) {
+        $problem = Get-NamePatternProblem -Pattern $p
+        if ($problem) { throw $problem }
+        $parts = [System.Collections.Generic.List[string]]::new()
+        foreach ($part in (ConvertTo-NameKey $p).Split('*')) {
+            $parts.Add((-join @(foreach ($piece in [regex]::Split($part, '(\?)')) {
+                            if ($piece -eq '?') { $script:AnyCharacterPattern } else { [regex]::Escape($piece) }
+                        })))
+        }
+        $expression = '\A' + $parts[0]
+        if ($parts.Count -gt 1) {
+            for ($i = 1; $i -lt $parts.Count - 1; $i++) { if ($parts[$i]) { $expression += "(?>.*?$($parts[$i]))" } }
+            $expression += '.*' + $parts[$parts.Count - 1]
+        }
+        $alternatives.Add($expression + '\z')
+    }
+    [regex]::new('(?:' + ($alternatives -join '|') + ')', [System.Text.RegularExpressions.RegexOptions]::Singleline)
 }
 
 function Get-InnermostMessage {
@@ -250,73 +584,116 @@ function Get-InnermostMessage {
     $Exception.Message
 }
 
-function Get-FileMd5 {
-    # MD5 of one file's contents as upper-case hex (the Get-FileHash format).
-    param([Parameter(Mandatory)] [string] $Path)
-    & $script:ComputeMd5 $Path
+function ConvertTo-UtcOffsetText {
+    # A UTC offset as text: +10:00, -04:30, or with seconds (+00:19:32) for historic local times.
+    param([Parameter(Mandatory)] [TimeSpan] $Offset)
+    $sign = if ($Offset -lt [TimeSpan]::Zero) { '-' } else { '+' }
+    $size = $Offset.Duration()
+    $text = $sign + ([int] [Math]::Floor($size.TotalHours)).ToString('00') + ':' + $size.Minutes.ToString('00')
+    if ($size.Seconds) { $text += ':' + $size.Seconds.ToString('00') }
+    $text
 }
+
+function ConvertFrom-UtcOffsetText {
+    # The reverse of ConvertTo-UtcOffsetText, or a clear error naming the report.
+    param([AllowNull()] [AllowEmptyString()] [string] $Text, [Parameter(Mandatory)] [string] $Path)
+    $parts = [regex]::Match([string] $Text, '^([+-])(\d{2}):(\d{2})(?::(\d{2}))?$')
+    if (-not $parts.Success) { throw "'$Path' could not be read as a duplicates report: '$Text' is not a UTC offset." }
+    $seconds = [int] $parts.Groups[2].Value * 3600 + [int] $parts.Groups[3].Value * 60
+    if ($parts.Groups[4].Success) { $seconds += [int] $parts.Groups[4].Value }
+    if ($parts.Groups[1].Value -eq '-') { $seconds = - $seconds }
+    [TimeSpan]::FromSeconds($seconds)
+}
+
+function Get-DuplicateSetUtcOffset {
+    # A duplicate set's UTC offset; for sets without one (read from a report made before the
+    # UTC Offset column, or built by hand), this computer's offset at its saved date.
+    param([Parameter(Mandatory)] [object] $Set)
+    $offset = $Set.PSObject.Properties['UtcOffset']
+    if ($offset -and $null -ne $offset.Value) { return [TimeSpan] $offset.Value }
+    [System.TimeZoneInfo]::Local.GetUtcOffset([datetime]::SpecifyKind($Set.LastWriteTime, [System.DateTimeKind]::Unspecified))
+}
+
+function Get-FileMd5 {
+    # MD5 of one file's contents as upper-case hex (the Get-FileHash format); with $Limit,
+    # of its first $Limit bytes only.
+    # A simple function (no parameter validation): it runs for every file hashed.
+    param([string] $Path, [long] $Limit = 0)
+    [FindDuplicates.Native]::Md5($Path, $Limit)
+}
+
+# Large candidates are first compared by the MD5 of their start (see Split-ByStartHash):
+# files that share a name, saved date and size but not their contents are then rarely read
+# in full. Only for files this large, so that true duplicates cost at most 1/16 more reading.
+$script:FirstBytesToHash = 1MB
+$script:FirstBytesMinSize = 16MB
 
 function Get-FileMd5Map {
     <#
         Hashes files, up to $ThrottleLimit at a time, returning a map of full path -> MD5.
         Files that cannot be read are reported as warnings and left out of the map.
         With $Cache, files already in it are not read again and new hashes are added to it.
+        With -FirstBytes, only the first $script:FirstBytesToHash bytes of each file are
+        hashed (and $Cache, which holds whole-file hashes, must not be given).
     #>
     param(
         [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $Path,
         [ValidateRange(1, 64)] [int] $ThrottleLimit = 1,
-        [System.Collections.Generic.Dictionary[string, string]] $Cache
+        [System.Collections.Generic.Dictionary[string, string]] $Cache,
+        [switch] $FirstBytes
     )
 
     $requested = $Path
     if ($null -ne $Cache) { $Path = [string[]] @($Path | Where-Object { -not $Cache.ContainsKey($_) }) }
+    $limit = [long] 0
+    if ($FirstBytes) { $limit = $script:FirstBytesToHash }
 
     $map = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
     $activity = 'Comparing MD5 hashes'
+    if ($FirstBytes) { $activity = 'Comparing the start of large files' }
+    $status = if ($ThrottleLimit -eq 1) { '' } else { " ($ThrottleLimit at a time)" }
     $done = 0
+    # Progress is shown a few times a second, not per file: drawing it costs more than
+    # hashing a small file.
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastShownMs = - $script:ProgressIntervalMs
 
-    if ($ThrottleLimit -eq 1) {
+    if ($ThrottleLimit -eq 1 -or $Path.Count -lt 2) {
         foreach ($p in $Path) {
             $done++
-            Write-Progress -Id 2 -Activity $activity -Status "File $done of $($Path.Count)" -CurrentOperation $p `
-                -PercentComplete ([int] (100 * $done / $Path.Count))
-            try { $map[$p] = Get-FileMd5 -Path $p }
+            if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
+                $lastShownMs = $timer.ElapsedMilliseconds
+                Write-Progress -Id 2 -Activity $activity -Status "File $done of $($Path.Count)$status" -CurrentOperation $p `
+                    -PercentComplete ([int] (100 * $done / $Path.Count))
+            }
+            try { $map[$p] = Get-FileMd5 -Path $p -Limit $limit }
             catch { Write-Warning "Could not hash '$p': $(Get-InnermostMessage $_.Exception)" }
         }
     }
     else {
-        # A bounded window of jobs keeps memory flat however many files there are.
-        $window = $ThrottleLimit * 4
-        $inFlight = [System.Collections.Generic.Queue[object]]::new()
-        $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ThrottleLimit)
-        $pool.Open()
+        $pool = $null
         try {
-            $next = 0
-            while ($next -lt $Path.Count -or $inFlight.Count -gt 0) {
-                while ($next -lt $Path.Count -and $inFlight.Count -lt $window) {
-                    $shell = [System.Management.Automation.PowerShell]::Create()
-                    $shell.RunspacePool = $pool
-                    $null = $shell.AddScript($script:ComputeMd5.ToString()).AddArgument($Path[$next])
-                    $inFlight.Enqueue([pscustomobject] @{ Path = $Path[$next]; Shell = $shell; Handle = $shell.BeginInvoke() })
-                    $next++
-                }
-
-                $job = $inFlight.Dequeue()
+            $work = { param($File) [FindDuplicates.Native]::Md5($File, 0) }
+            if ($FirstBytes) { $work = { param($File) [FindDuplicates.Native]::Md5($File, $script:FirstBytesToHash) } }
+            $pool = Open-WorkerPool -Work $work -ThrottleLimit ([Math]::Min($ThrottleLimit, $Path.Count))
+            foreach ($p in $Path) { $pool.Queue.Add($p) }
+            $result = $null
+            while ($done -lt $Path.Count) {
+                # A result that is already waiting is taken directly: a function call per file
+                # would cost more than hashing a small one.
+                if (-not $pool.Results.TryTake([ref] $result)) { $result = Receive-WorkerResult -Pool $pool }
                 $done++
-                Write-Progress -Id 2 -Activity $activity -Status "File $done of $($Path.Count) ($ThrottleLimit at a time)" `
-                    -CurrentOperation $job.Path -PercentComplete ([int] (100 * $done / $Path.Count))
-                try {
-                    $output = $job.Shell.EndInvoke($job.Handle)
-                    if ($job.Shell.Streams.Error.Count -gt 0) { throw $job.Shell.Streams.Error[0].Exception }
-                    $map[$job.Path] = [string] $output[0]
+                if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
+                    $lastShownMs = $timer.ElapsedMilliseconds
+                    Write-Progress -Id 2 -Activity $activity -Status "File $done of $($Path.Count)$status" -CurrentOperation $result.Item `
+                        -PercentComplete ([int] (100 * $done / $Path.Count))
                 }
-                catch { Write-Warning "Could not hash '$($job.Path)': $(Get-InnermostMessage $_.Exception)" }
-                finally { $job.Shell.Dispose() }
+                if ($null -eq $result.Error) { $map[$result.Item] = [string] $result.Value }
+                else { Write-Warning "Could not hash '$($result.Item)': $(Get-InnermostMessage $result.Error)" }
             }
         }
         finally {
-            foreach ($job in $inFlight) { $job.Shell.Dispose() }
-            $pool.Dispose()
+            if ($null -ne $pool) { Close-WorkerPool -Pool $pool }
         }
     }
 
@@ -329,29 +706,14 @@ function Get-FileMd5Map {
 }
 
 function Group-ByKey {
-    # Groups items by the matching entry in $Key, returning only the groups that hold
-    # more than one item. Keys are computed by the caller in plain loops, which is far
-    # faster than invoking a script block per item on large trees.
+    # Groups items by the matching entry in $Key (ignoring case), returning only the groups
+    # that hold more than one item, in the order their keys first appear. Keys are computed
+    # by the caller in plain loops, which is far faster than a script block per item.
     param(
         [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $InputItems,
         [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $Key
     )
-
-    $groups = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[object]]]::new(
-        [System.StringComparer]::OrdinalIgnoreCase)
-
-    for ($i = 0; $i -lt $InputItems.Count; $i++) {
-        $list = $null
-        if (-not $groups.TryGetValue($Key[$i], [ref] $list)) {
-            $list = [System.Collections.Generic.List[object]]::new()
-            $groups.Add($Key[$i], $list)
-        }
-        $list.Add($InputItems[$i])
-    }
-
-    foreach ($list in $groups.Values) {
-        if ($list.Count -gt 1) { , $list.ToArray() }
-    }
+    foreach ($group in [FindDuplicates.Native]::GroupByKey($InputItems, $Key)) { , $group }
 }
 
 function Find-DuplicateFile {
@@ -359,8 +721,9 @@ function Find-DuplicateFile {
     .SYNOPSIS
         Finds sets of files whose name, saved date and MD5 hash all match.
     .OUTPUTS
-        One object per duplicate set: FileName, LastWriteTime, SizeBytes, MD5,
-        Count and Folders (full folder path of every copy, sorted).
+        One object per duplicate set: FileName, LastWriteTime (local), UtcOffset (local
+        time minus UTC at that date), SizeBytes, MD5, Count and Folders (full folder path
+        of every copy, sorted).
     #>
     [CmdletBinding()]
     param(
@@ -380,32 +743,39 @@ function Find-DuplicateFile {
         [System.Collections.Generic.Dictionary[string, string]] $Md5Cache,
 
         # Leave files of 0 bytes out (they all share one MD5).
-        [switch] $IgnoreEmptyFiles
+        [switch] $IgnoreEmptyFiles,
+
+        # Leave files smaller than this many bytes out.
+        [ValidateRange(0, [long]::MaxValue)]
+        [long] $MinimumSize = 0
     )
 
-    if ($IgnoreEmptyFiles) { $File = [System.IO.FileInfo[]] @($File | Where-Object { $_.Length -gt 0 }) }
+    # Stage 1: name. Grouped first, so the size and saved date of a file whose name no other
+    # file has are never read: on Linux, macOS and network drives each is a request per file.
+    # Group-ByKey ignores case; only Unicode normalisation is needed here.
+    $nameGroups = @(Group-ByKey -InputItems $File -Key ([FindDuplicates.Native]::NormalizedNames($File)))
 
-    # Stage 1: name + saved date (UTC, whole second: copies made to network shares or
-    # other file systems often lose sub-second precision). The date key is all digits,
-    # so '|' is a safe separator.
+    # Stage 2: saved date (UTC, whole second: copies made to network shares or other file
+    # systems often lose sub-second precision) and size, a cheap check that avoids hashing
+    # files that cannot match. Both keys are digits, so '|' is a safe separator.
+    $minimumSize = $MinimumSize
+    if ($IgnoreEmptyFiles -and $minimumSize -lt 1) { $minimumSize = 1 }
     $ticksPerSecond = [System.TimeSpan]::TicksPerSecond
-    $keys = [System.Collections.Generic.List[string]]::new($File.Count)
-    foreach ($f in $File) {
-        $ticks = $f.LastWriteTimeUtc.Ticks
-        # Inline rather than ConvertTo-NameKey: this loop runs once per file. The dictionary
-        # in Group-ByKey ignores case; only Unicode normalisation is needed here.
-        $name = $f.Name
-        try { if (-not $name.IsNormalized()) { $name = $name.Normalize() } }
-        catch [System.ArgumentException] { Write-Debug "Cannot normalise '$name'; comparing it as it is." }
-        $keys.Add([string] ($ticks - ($ticks % $ticksPerSecond)) + '|' + $name)
-    }
-    $nameDateGroups = @(Group-ByKey -InputItems $File -Key $keys.ToArray())
-
-    # Stage 2: size. A cheap check that avoids hashing files that cannot match.
-    # (Not $group.Length: on an array that is the array's own length.)
-    $candidateGroups = @(foreach ($group in $nameDateGroups) {
-            $sizes = [string[]] @(foreach ($f in $group) { $f.Length })
-            Group-ByKey -InputItems $group -Key $sizes
+    $candidateGroups = @(foreach ($group in $nameGroups) {
+            $kept = [System.Collections.Generic.List[object]]::new()
+            $keys = [System.Collections.Generic.List[string]]::new()
+            foreach ($f in $group) {
+                # Getter methods, not properties: PowerShell turns a failing property into $null.
+                try { $size = $f.get_Length(); $ticks = $f.get_LastWriteTimeUtc().Ticks }
+                catch {
+                    Write-Warning "Skipping '$($f.FullName)': $(Get-InnermostMessage $_.Exception)"  # gone or unreadable since the scan
+                    continue
+                }
+                if ($size -lt $minimumSize) { continue }
+                $kept.Add($f)
+                $keys.Add([string] ($ticks - ($ticks % $ticksPerSecond)) + '|' + $size)
+            }
+            Group-ByKey -InputItems $kept.ToArray() -Key $keys.ToArray()
         })
 
     if ($SkipCloudOnly) {
@@ -425,39 +795,98 @@ function Find-DuplicateFile {
         }
     }
 
-    # Stage 3: MD5, only for files that already match on name, date and size.
+    # Stage 3: for large files, the MD5 of their start.
+    $candidateGroups = @(Split-ByStartHash -Group $candidateGroups -ThrottleLimit $ThrottleLimit -Md5Cache $Md5Cache)
+
+    # Stage 4: MD5, only for files that already match on name, date and size.
     $candidates = [System.Collections.Generic.List[string]]::new()
     foreach ($group in $candidateGroups) { foreach ($f in $group) { $candidates.Add($f.FullName) } }
     $md5ByPath = Get-FileMd5Map -Path $candidates.ToArray() -ThrottleLimit $ThrottleLimit -Cache $Md5Cache
 
     $results = [System.Collections.Generic.List[object]]::new()
     foreach ($group in $candidateGroups) {
-        $hashed = @($group | Where-Object { $md5ByPath.ContainsKey($_.FullName) })
-        $md5s = [string[]] @($hashed | ForEach-Object { $md5ByPath[$_.FullName] })
+        # Loops rather than pipelines: large trees have thousands of groups.
+        $hashed = @(foreach ($f in $group) { if ($md5ByPath.ContainsKey($f.FullName)) { $f } })
+        $md5s = [string[]] @(foreach ($f in $hashed) { $md5ByPath[$f.FullName] })
 
         foreach ($set in @(Group-ByKey -InputItems $hashed -Key $md5s)) {
             $first = $set[0]
             $results.Add([pscustomobject] @{
                 FileName      = $first.Name
                 LastWriteTime = $first.LastWriteTime
+                UtcOffset     = $first.LastWriteTime - $first.LastWriteTimeUtc
                 SizeBytes     = $first.Length
                 MD5           = $md5ByPath[$first.FullName]
                 Count         = $set.Count
-                Folders       = Get-SortedFolder -Path @($set | ForEach-Object { $_.DirectoryName })
+                Folders       = Get-SortedFolder -Path @(foreach ($f in $set) { $f.DirectoryName }) -ByDepth
             })
         }
     }
 
-    $results.Sort($script:ByDuplicateSet)
-    $results
+    $sorted = Get-SortedDuplicateSet -DuplicateSet $results.ToArray()
+    $sorted
+}
+
+function Split-ByStartHash {
+    <#
+        Splits each group of files of $script:FirstBytesMinSize or more by the MD5 of their
+        first $script:FirstBytesToHash bytes, keeping the groups that still hold more than one
+        file. Other groups, and groups a file of which already has its whole-file MD5 in
+        $Md5Cache (from a previous report), are kept as they are.
+    #>
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Group,
+        [ValidateRange(1, 64)] [int] $ThrottleLimit = 1,
+        [System.Collections.Generic.Dictionary[string, string]] $Md5Cache
+    )
+    $large = [System.Collections.Generic.List[object]]::new()
+    foreach ($files in $Group) {
+        # The files share their size (stage 2); a file gone since then is left to stage 4.
+        $isLarge = $false
+        try { $isLarge = $files[0].get_Length() -ge $script:FirstBytesMinSize } catch { $isLarge = $false }
+        if ($isLarge -and $null -ne $Md5Cache) { foreach ($f in $files) { if ($Md5Cache.ContainsKey($f.FullName)) { $isLarge = $false } } }
+        if ($isLarge) { $large.Add($files) } else { , $files }
+    }
+    if ($large.Count -eq 0) { return }
+
+    $paths = [string[]] @(foreach ($files in $large) { foreach ($f in $files) { $f.FullName } })
+    $starts = Get-FileMd5Map -Path $paths -ThrottleLimit $ThrottleLimit -FirstBytes
+    foreach ($files in $large) {
+        $read = @(foreach ($f in $files) { if ($starts.ContainsKey($f.FullName)) { $f } })
+        $keys = [string[]] @(foreach ($f in $read) { $starts[$f.FullName] })
+        Group-ByKey -InputItems $read -Key $keys
+    }
+}
+
+function Get-PathDepth {
+    # How many folders deep a path is: its parts between separators (\ or /), so C:\a\b and
+    # /home/a are 3 and 2 deep, and \\server\share\a 3.
+    # A simple function (no parameter validation): it runs for every copy of a file.
+    param([string] $Path)
+    $Path.Split([char[]] '\/', [System.StringSplitOptions]::RemoveEmptyEntries).Count
 }
 
 function Get-SortedFolder {
-    # Folder paths in case-insensitive order (see Compare-IgnoringCase).
-    param([Parameter(Mandatory)] [string[]] $Path)
-    $sorted = [System.Collections.Generic.List[string]]::new($Path)
-    $sorted.Sort($script:ByPathIgnoringCase)
-    , $sorted.ToArray()
+    <#
+        Folder paths in case-insensitive order (see Compare-IgnoringCase), paths differing only
+        in case in a fixed order: $script:ByPathIgnoringCase's order. With -ByDepth, the least
+        nested first (fewest folders deep, see Get-PathDepth) and paths equally deep in that
+        order. Sorted on precomputed keys compared ordinally (the depth as fixed-width digits,
+        upper case, a separator that sorts first, then the path as it is): a script block
+        comparer would be slow for files with thousands of copies.
+    #>
+    param([Parameter(Mandatory)] [string[]] $Path, [switch] $ByDepth)
+    $sorted = [string[]] $Path.Clone()
+    if ($sorted.Count -gt 1) {
+        $separator = [string] [char] 0
+        $keys = [string[]] @(foreach ($p in $sorted) {
+                $depth = ''
+                if ($ByDepth) { $depth = (Get-PathDepth -Path $p).ToString('D5', [System.Globalization.CultureInfo]::InvariantCulture) }
+                $depth + $p.ToUpperInvariant() + $separator + $p
+            })
+        [System.Array]::Sort([System.Array] $keys, [System.Array] $sorted, [System.Collections.IComparer] [System.StringComparer]::Ordinal)
+    }
+    , $sorted
 }
 
 #endregion
@@ -474,7 +903,11 @@ $script:ByFolderSet = [System.Comparison[object]] {
 }
 
 function Get-FolderTree {
-    # Indexes a scan: the sub folders and files of every folder, and which folders were readable.
+    <#
+        Indexes a scan: the sub folders and files of every folder, and which folders were
+        readable. File details are not read here (see Confirm-TreeFile): only the folders
+        that could be duplicates need them.
+    #>
     param(
         [Parameter(Mandatory)] [AllowEmptyCollection()] [System.IO.FileInfo[]] $File,
         [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Folder
@@ -492,19 +925,19 @@ function Get-FolderTree {
         $filesIn[$record.Path]  = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
         if (-not $record.Readable) { $null = $unreadable.Add($record.Path) }
     }
+    foreach ($f in $File) {
+        if ($filesIn.ContainsKey($f.DirectoryName)) { $filesIn[$f.DirectoryName].Add($f) }
+    }
     foreach ($path in @($children.Keys)) {
         if (-not $unreadable.Contains($path)) { $null = $readable.Add($path) }
         $parent = [System.IO.Path]::GetDirectoryName($path)
         if ($parent -and $children.ContainsKey($parent)) { $children[$parent].Add($path) }
     }
-    foreach ($f in $File) {
-        if ($filesIn.ContainsKey($f.DirectoryName)) { $filesIn[$f.DirectoryName].Add($f) }
-    }
 
     # Deepest first: a sub folder's path is always longer than its parent's.
     $order = [string[]] @($children.Keys)
     $lengths = [int[]] @($order | ForEach-Object { - $_.Length })
-    [System.Array]::Sort($lengths, $order, [System.Collections.Comparer]::DefaultInvariant)
+    [System.Array]::Sort([System.Array] $lengths, [System.Array] $order, [System.Collections.IComparer] [System.Collections.Comparer]::DefaultInvariant)
 
     [pscustomobject] @{ Children = $children; Files = $filesIn; Readable = $readable; DeepestFirst = $order }
 }
@@ -557,13 +990,59 @@ function Get-FolderSignature {
             if (-not $complete) { continue }
 
             $sorted = $lines.ToArray()
-            [System.Array]::Sort($sorted, [System.StringComparer]::Ordinal)
+            [System.Array]::Sort([System.Array] $sorted, [System.Collections.IComparer] [System.StringComparer]::Ordinal)
             $bytes = [System.Text.Encoding]::UTF8.GetBytes(($sorted -join "`n"))
             $info.Signature = [System.BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '')
         }
     }
     finally { $sha.Dispose() }
     $result
+}
+
+function Confirm-TreeFile {
+    <#
+        Reads the size and saved date of every file in the $Scope folders of $Tree (in scan
+        order). A file gone or unreadable since the scan is dropped with a warning, and
+        leaves its folder's contents unknown: the folder is no longer readable.
+    #>
+    param(
+        [Parameter(Mandatory)] [object] $Tree,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [System.IO.FileInfo[]] $File,
+        [Parameter(Mandatory)] [System.Collections.Generic.HashSet[string]] $Scope
+    )
+    foreach ($f in $File) {
+        $folder = $f.DirectoryName
+        if (-not $Scope.Contains($folder) -or -not $Tree.Files.ContainsKey($folder)) { continue }
+        # (A getter method, not the property: PowerShell turns a failing property into $null.
+        # Reading the size fails for a missing file and loads the saved date with it.)
+        try { $null = $f.get_Length() }
+        catch {
+            Write-Warning "Skipping '$($f.FullName)': $(Get-InnermostMessage $_.Exception)"
+            $null = $Tree.Files[$folder].Remove($f)
+            $null = $Tree.Readable.Remove($folder)
+        }
+    }
+}
+
+function Get-FolderScope {
+    # The given folders and every folder below them.
+    param([Parameter(Mandatory)] [object] $Tree, [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $Folder)
+    $scope = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $pending = [System.Collections.Generic.Stack[string]]::new([string[]] $Folder)
+    while ($pending.Count -gt 0) {
+        $path = $pending.Pop()
+        if ($scope.Add($path)) { foreach ($sub in $Tree.Children[$path]) { $pending.Push($sub) } }
+    }
+    , $scope
+}
+
+function Get-RepeatedNameScope {
+    # The folders whose name (ignoring case) another folder has, and every folder below them.
+    param([Parameter(Mandatory)] [object] $Tree)
+    $paths = [string[]] $Tree.DeepestFirst
+    $keys = [string[]] @(foreach ($path in $paths) { ConvertTo-NameKey ([System.IO.Path]::GetFileName($path)) })
+    $repeated = @(foreach ($group in (Group-ByKey -InputItems $paths -Key $keys)) { $group })
+    Get-FolderScope -Tree $Tree -Folder $repeated
 }
 
 function Find-DuplicateFolder {
@@ -599,11 +1078,17 @@ function Find-DuplicateFolder {
 
     $tree = Get-FolderTree -File $File -Folder $Folder
 
-    # Pass 1: names, sizes and saved dates only; nothing is read.
-    $cheap = Get-FolderSignature -Tree $tree
+    # Pass 1: names, sizes and saved dates only; nothing is read. Only folders whose name
+    # another folder has can be duplicates, so only they (and the folders below them, part
+    # of their fingerprint) are fingerprinted.
+    $named = Get-RepeatedNameScope -Tree $tree
+    if ($named.Count -eq 0) { return }
+    Confirm-TreeFile -Tree $tree -File $File -Scope $named
+    $cheap = Get-FolderSignature -Tree $tree -Scope $named
     $candidates = [System.Collections.Generic.List[string]]::new()
     $keys = [System.Collections.Generic.List[string]]::new()
     foreach ($path in $tree.DeepestFirst) {
+        if (-not $named.Contains($path)) { continue }
         $info = $cheap[$path]
         if ($info.Signature -and $info.FileCount -gt 0) {
             $candidates.Add($path)
@@ -614,13 +1099,7 @@ function Find-DuplicateFolder {
     if ($candidateGroups.Count -eq 0) { return }
 
     # Pass 2: hash every file below the candidates (hashes from the file scan are reused).
-    $scope = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-    $pending = [System.Collections.Generic.Stack[string]]::new()
-    foreach ($group in $candidateGroups) { foreach ($path in $group) { $pending.Push($path) } }
-    while ($pending.Count -gt 0) {
-        $path = $pending.Pop()
-        if ($scope.Add($path)) { foreach ($sub in $tree.Children[$path]) { $pending.Push($sub) } }
-    }
+    $scope = Get-FolderScope -Tree $tree -Folder @(foreach ($group in $candidateGroups) { $group })
 
     $toHash = [System.Collections.Generic.List[string]]::new()
     $skipped = 0
@@ -699,13 +1178,10 @@ function ConvertTo-ColumnName {
     $name
 }
 
-function ConvertTo-XmlSafeText {
-    # File names may contain control characters (Linux) or unpaired surrogates (NTFS)
-    # that XML 1.0 cannot represent; replace them with U+FFFD.
-    param([AllowEmptyString()] [string] $Text)
-    $invalid = '[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]'
-    [regex]::Replace($Text, $invalid, [string] [char] 0xFFFD)
-}
+# File names may contain control characters (Linux) or unpaired surrogates (NTFS) that
+# XML 1.0 cannot represent; Write-RowXml replaces them with U+FFFD. Built once: it runs per cell.
+$script:InvalidXmlChars = [regex]::new(
+    '[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]')
 
 function Write-ZipXmlEntry {
     # Creates a zip entry and passes an XmlWriter for it to $Body.
@@ -751,34 +1227,47 @@ function Write-ZipTextEntry {
     finally { $stream.Dispose() }
 }
 
-function Write-Cell {
-    # Writes one <c> element. Strings are inline, numbers/dates are numeric.
-    param(
-        [Parameter(Mandatory)] [System.Xml.XmlWriter] $Writer,
-        [Parameter(Mandatory)] [string] $Reference,
-        [Parameter(Mandatory)] [AllowNull()] [AllowEmptyString()] [object] $Value,
-        [int] $Style = 0
-    )
+# Cell styles, as defined in xl/styles.xml.
+$script:StyleBold = 1
+$script:StyleDate = 2
 
-    $ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-    $Writer.WriteStartElement('c', $ns)
-    $Writer.WriteAttributeString('r', $Reference)
-    if ($Style) { $Writer.WriteAttributeString('s', [string] $Style) }
+function Write-RowXml {
+    # Writes one <row> element and its cells: strings inline, numbers and dates numeric.
+    # Called once per row and writing the cells itself, with no parameter validation:
+    # it runs for every row of reports that can hold millions of cells.
+    param([System.Xml.XmlWriter] $Writer, [int] $Number, [object[]] $Values, [string[]] $Letters, [switch] $Bold)
 
+    $ns = $script:SpreadsheetMain
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
-    if ($Value -is [datetime]) {
-        $Writer.WriteElementString('v', $ns, $Value.ToOADate().ToString('R', $invariant))
-    }
-    elseif ($Value -is [int] -or $Value -is [long] -or $Value -is [double]) {
-        $Writer.WriteElementString('v', $ns, $Value.ToString($invariant))
-    }
-    else {
-        $Writer.WriteAttributeString('t', 'inlineStr')
-        $Writer.WriteStartElement('is', $ns)
-        $Writer.WriteStartElement('t', $ns)
-        $Writer.WriteAttributeString('xml', 'space', 'http://www.w3.org/XML/1998/namespace', 'preserve')
-        $Writer.WriteString((ConvertTo-XmlSafeText ([string] $Value)))
-        $Writer.WriteEndElement()
+    $Writer.WriteStartElement('row', $ns)
+    $Writer.WriteAttributeString('r', [string] $Number)
+    for ($c = 0; $c -lt $Values.Count; $c++) {
+        $value = $Values[$c]
+        $Writer.WriteStartElement('c', $ns)
+        $Writer.WriteAttributeString('r', $Letters[$c] + $Number)
+        if ($value -is [datetime]) {
+            $Writer.WriteAttributeString('s', [string] $script:StyleDate)
+            $Writer.WriteElementString('v', $ns, $value.ToOADate().ToString('R', $invariant))
+        }
+        else {
+            if ($Bold) { $Writer.WriteAttributeString('s', [string] $script:StyleBold) }
+            if ($value -is [int] -or $value -is [long] -or $value -is [double]) {
+                $Writer.WriteElementString('v', $ns, $value.ToString($invariant))
+            }
+            else {
+                $text = [string] $value
+                if ($text.Length -gt $script:ExcelMaxCellText) {
+                    throw "Cell $($Letters[$c])$Number would hold $($text.Length) characters; Excel allows at most $($script:ExcelMaxCellText)."
+                }
+                $Writer.WriteAttributeString('t', 'inlineStr')
+                $Writer.WriteStartElement('is', $ns)
+                $Writer.WriteStartElement('t', $ns)
+                $Writer.WriteAttributeString('xml', 'space', 'http://www.w3.org/XML/1998/namespace', 'preserve')
+                $Writer.WriteString($script:InvalidXmlChars.Replace($text, [string] [char] 0xFFFD))
+                $Writer.WriteEndElement()
+                $Writer.WriteEndElement()
+            }
+        }
         $Writer.WriteEndElement()
     }
     $Writer.WriteEndElement()
@@ -825,9 +1314,7 @@ function Write-WorksheetXml {
         [Parameter(Mandatory)] [object] $Sheet
     )
 
-    $ns        = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-    $styleBold = 1
-    $styleDate = 2
+    $ns = $script:SpreadsheetMain
 
     $Writer.WriteStartElement('worksheet', $ns)
 
@@ -858,25 +1345,15 @@ function Write-WorksheetXml {
 
     $Writer.WriteStartElement('sheetData', $ns)
 
-    # Header row.
-    $Writer.WriteStartElement('row', $ns)
-    $Writer.WriteAttributeString('r', [string] $Sheet.HeaderRow)
-    for ($c = 0; $c -lt $Sheet.Headers.Count; $c++) {
-        Write-Cell -Writer $Writer -Reference "$(ConvertTo-ColumnName ($c + 1))$($Sheet.HeaderRow)" -Value $Sheet.Headers[$c] -Style $styleBold
-    }
-    $Writer.WriteEndElement()
+    # Column letters, worked out once rather than per cell (large reports have millions of cells).
+    $letters = [string[]] @(for ($c = 1; $c -le $Sheet.Headers.Count; $c++) { ConvertTo-ColumnName $c })
+    Write-RowXml -Writer $Writer -Number $Sheet.HeaderRow -Values $Sheet.Headers -Letters $letters -Bold
 
     # One row per duplicated item; one column per copy.
     $rowNumber = $Sheet.HeaderRow
     foreach ($values in $Sheet.Rows) {
         $rowNumber++
-        $Writer.WriteStartElement('row', $ns)
-        $Writer.WriteAttributeString('r', [string] $rowNumber)
-        for ($c = 0; $c -lt $values.Count; $c++) {
-            $style = if ($values[$c] -is [datetime]) { $styleDate } else { 0 }
-            Write-Cell -Writer $Writer -Reference "$(ConvertTo-ColumnName ($c + 1))$rowNumber" -Value $values[$c] -Style $style
-        }
-        $Writer.WriteEndElement()
+        Write-RowXml -Writer $Writer -Number $rowNumber -Values $values -Letters $letters
     }
 
     $Writer.WriteEndElement()  # sheetData
@@ -889,18 +1366,28 @@ function Write-WorksheetXml {
 }
 
 function Get-RulesSheetData {
-    # The Rules sheet: a title, a section per data sheet, and blank rows ($null) between.
-    param([switch] $IncludeFolders)
+    <#
+        The Rules sheet: a title, a section per data sheet, the scan settings when the scan
+        left anything out, and blank rows ($null) between. Each line is a row of cells.
+    #>
+    param([switch] $IncludeFolders, [string[]] $ExcludeName = @(), [long] $MinimumSize = 0)
 
     $lines = [System.Collections.Generic.List[object]]::new()
-    $lines.Add([pscustomobject] @{ Text = $script:RulesIntro[0]; Bold = $true })
-    foreach ($text in $script:RulesIntro[1..($script:RulesIntro.Count - 1)]) { $lines.Add([pscustomobject] @{ Text = $text; Bold = $false }) }
-    $sections = @(@{ Title = $script:FileRulesTitle; Rules = $script:FileRules })
-    if ($IncludeFolders) { $sections += @{ Title = $script:FolderRulesTitle; Rules = $script:FolderRules } }
+    $lines.Add([pscustomobject] @{ Cells = @($script:RulesIntro[0]); Bold = $true })
+    foreach ($text in $script:RulesIntro[1..($script:RulesIntro.Count - 1)]) { $lines.Add([pscustomobject] @{ Cells = @($text); Bold = $false }) }
+    $sections = @(@{ Title = $script:FileRulesTitle; Rules = $script:FileRules; Values = @() })
+    if ($IncludeFolders) { $sections += @{ Title = $script:FolderRulesTitle; Rules = $script:FolderRules; Values = @() } }
+    if ($ExcludeName.Count -or $MinimumSize -gt 0) {
+        $values = @()
+        if ($ExcludeName.Count) { $values += , (@($script:ExcludeNameLabel) + $ExcludeName) }
+        if ($MinimumSize -gt 0) { $values += , @($script:MinimumSizeLabel, $MinimumSize) }
+        $sections += @{ Title = $script:SettingsTitle; Rules = $script:SettingsRules; Values = $values }
+    }
     foreach ($section in $sections) {
         $lines.Add($null)
-        $lines.Add([pscustomobject] @{ Text = $section.Title; Bold = $true })
-        foreach ($text in $section.Rules) { $lines.Add([pscustomobject] @{ Text = $text; Bold = $false }) }
+        $lines.Add([pscustomobject] @{ Cells = @($section.Title); Bold = $true })
+        foreach ($text in $section.Rules) { $lines.Add([pscustomobject] @{ Cells = @($text); Bold = $false }) }
+        foreach ($cells in $section.Values) { $lines.Add([pscustomobject] @{ Cells = $cells; Bold = $false }) }
     }
     [pscustomobject] @{ Kind = 'Rules'; Name = $script:RulesSheetName; Lines = $lines.ToArray() }
 }
@@ -911,7 +1398,7 @@ function Write-RulesSheetXml {
         [Parameter(Mandatory)] [object] $Sheet
     )
 
-    $ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    $ns = $script:SpreadsheetMain
     $Writer.WriteStartElement('worksheet', $ns)
     $Writer.WriteStartElement('cols', $ns)
     $Writer.WriteStartElement('col', $ns)
@@ -926,11 +1413,8 @@ function Write-RulesSheetXml {
     for ($r = 0; $r -lt $Sheet.Lines.Count; $r++) {
         $line = $Sheet.Lines[$r]
         if ($null -eq $line) { continue }  # a blank row
-        $Writer.WriteStartElement('row', $ns)
-        $Writer.WriteAttributeString('r', [string] ($r + 1))
-        $style = if ($line.Bold) { 1 } else { 0 }
-        Write-Cell -Writer $Writer -Reference "A$($r + 1)" -Value $line.Text -Style $style
-        $Writer.WriteEndElement()
+        $letters = [string[]] @(for ($c = 1; $c -le $line.Cells.Count; $c++) { ConvertTo-ColumnName $c })
+        Write-RowXml -Writer $Writer -Number ($r + 1) -Values $line.Cells -Letters $letters -Bold:$line.Bold
     }
     $Writer.WriteEndElement()  # sheetData
     $Writer.WriteEndElement()  # worksheet
@@ -942,12 +1426,13 @@ function Export-DuplicateReport {
         Saves duplicate sets to an .xlsx workbook. Needs neither Excel nor extra modules.
     .DESCRIPTION
         Sheet "Duplicates": one row per duplicated file. Columns: File Name, Last Modified,
-        Size (bytes), MD5, Copies, then "Location 1..N" holding the full folder path of
-        every copy.
+        UTC Offset, Size (bytes), MD5, Copies, then "Location 1..N" holding the full folder
+        path of every copy.
         Sheet "Duplicate Folders" (only when -FolderSet is given): one row per duplicated
         folder. Columns: Folder Name, Files, Sub Folders, Size (bytes), Copies, then
         "Location 1..N" holding the full path of every copy.
-        Sheet "Rules": the matching rules behind the other sheets, in plain words.
+        Sheet "Rules": the matching rules behind the other sheets, in plain words, and the
+        scan settings (-ExcludeName, -MinimumSize) when the scan left anything out.
     #>
     [CmdletBinding()]
     param(
@@ -960,13 +1445,19 @@ function Export-DuplicateReport {
 
         # Duplicate folder sets (from Find-DuplicateFolder); adds the "Duplicate Folders" sheet.
         [AllowEmptyCollection()]
-        [object[]] $FolderSet
+        [object[]] $FolderSet,
+
+        # The name patterns and smallest file size the scan used, recorded on the Rules sheet.
+        [string[]] $ExcludeName = @(),
+        [ValidateRange(0, [long]::MaxValue)]
+        [long] $MinimumSize = 0
     )
 
     $Path = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($Path)
 
     $fileRows = @(foreach ($set in $DuplicateSet) {
-            , (@($set.FileName, $set.LastWriteTime, [long] $set.SizeBytes, $set.MD5, [int] $set.Count) + @($set.Folders))
+            $offset = ConvertTo-UtcOffsetText (Get-DuplicateSetUtcOffset $set)
+            , (@($set.FileName, $set.LastWriteTime, $offset, [long] $set.SizeBytes, $set.MD5, [int] $set.Count) + @($set.Folders))
         })
     $sheets = [System.Collections.Generic.List[object]]::new()
     $sheets.Add((ConvertTo-WorksheetData -Name $script:FileSheetName -Column $script:FixedColumns -Row $fileRows -Noun 'file'))
@@ -977,7 +1468,7 @@ function Export-DuplicateReport {
             })
         $sheets.Add((ConvertTo-WorksheetData -Name $script:FolderSheetName -Column $script:FolderColumns -Row $folderRows -Noun 'folder'))
     }
-    $sheets.Add((Get-RulesSheetData -IncludeFolders:($sheets.Count -gt 1)))
+    $sheets.Add((Get-RulesSheetData -IncludeFolders:($sheets.Count -gt 1) -ExcludeName $ExcludeName -MinimumSize $MinimumSize))
 
     $sheetEntries = ''; $overrides = ''; $sheetRels = ''; $filters = ''
     for ($i = 1; $i -le $sheets.Count; $i++) {
@@ -1023,7 +1514,7 @@ function Export-DuplicateReport {
                     "<Relationship Id=`"$stylesId`" Type=`"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles`" Target=`"styles.xml`"/>" +
                     '</Relationships>')
 
-                # Style 0 = default, 1 = bold header, 2 = date/time.
+                # Style 0 = default, 1 = bold ($script:StyleBold), 2 = date/time ($script:StyleDate).
                 Write-ZipTextEntry -Archive $zip -EntryName 'xl/styles.xml' -Content (
                     '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
                     '<numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/></numFmts>' +
@@ -1098,15 +1589,9 @@ function Get-SpreadsheetNamespace {
     # A namespace manager for one parsed part (s: SpreadsheetML, p: package relationships).
     param([Parameter(Mandatory)] [System.Xml.XmlDocument] $Xml)
     $ns = [System.Xml.XmlNamespaceManager]::new($Xml.NameTable)
-    $ns.AddNamespace('s', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main')
+    $ns.AddNamespace('s', $script:SpreadsheetMain)
     $ns.AddNamespace('p', 'http://schemas.openxmlformats.org/package/2006/relationships')
     , $ns  # a namespace manager would otherwise be enumerated into its prefixes
-}
-
-function Get-CellText {
-    # Text of an inline or shared string, including rich-text runs (phonetic runs excluded).
-    param([Parameter(Mandatory)] [System.Xml.XmlNode] $Node, [Parameter(Mandatory)] [System.Xml.XmlNamespaceManager] $Ns)
-    -join @($Node.SelectNodes('s:t | s:r/s:t', $Ns) | ForEach-Object { $_.InnerText })
 }
 
 function Get-WorkbookSheet {
@@ -1140,7 +1625,7 @@ function Get-SharedString {
     $sharedXml = Read-ZipXml -Archive $Archive -EntryName 'xl/sharedStrings.xml'
     if ($sharedXml) {
         $ns = Get-SpreadsheetNamespace -Xml $sharedXml
-        foreach ($item in $sharedXml.SelectNodes('/s:sst/s:si', $ns)) { $shared.Add((Get-CellText -Node $item -Ns $ns)) }
+        foreach ($item in $sharedXml.SelectNodes('/s:sst/s:si', $ns)) { $shared.Add([FindDuplicates.Native]::CellText($item, $script:SpreadsheetMain)) }
     }
     , $shared
 }
@@ -1153,67 +1638,58 @@ function Get-WorksheetRow {
         [Parameter(Mandatory)] [string] $SheetPath,
         [Parameter(Mandatory)] [AllowEmptyCollection()] [System.Collections.Generic.List[string]] $SharedString
     )
-
     $sheet = Read-ZipXml -Archive $Archive -EntryName $SheetPath
-    $sheetNs = Get-SpreadsheetNamespace -Xml $sheet
+    if ($null -eq $sheet) { throw "The workbook has no part '$SheetPath'." }
+    foreach ($row in [FindDuplicates.Native]::SheetRows($sheet, $SharedString, $script:SpreadsheetMain)) { , $row }
+}
 
-    foreach ($row in $sheet.SelectNodes('/s:worksheet/s:sheetData/s:row', $sheetNs)) {
-        $cells = [System.Collections.Generic.Dictionary[int, string]]::new()
-        $column = 0
-        foreach ($cell in $row.SelectNodes('s:c', $sheetNs)) {
-            $reference = $cell.GetAttribute('r')
-            # Excel may leave out empty cells, so place each by its reference when present.
-            $column = if ($reference) { ConvertFrom-ColumnName ($reference -replace '\d', '') } else { $column + 1 }
-            $value = $cell.SelectSingleNode('s:v', $sheetNs)
-            $cells[$column] = switch ($cell.GetAttribute('t')) {
-                's'         { $SharedString[[int] $value.InnerText] }
-                'inlineStr' { Get-CellText -Node $cell.SelectSingleNode('s:is', $sheetNs) -Ns $sheetNs }
-                default     { if ($value) { $value.InnerText } else { '' } }
-            }
-        }
-
-        $width = 0
-        foreach ($c in $cells.Keys) { $width = [Math]::Max($width, $c) }
-        $values = [string[]]::new($width)
-        foreach ($c in $cells.Keys) { $values[$c - 1] = $cells[$c] }
-        , $values
+function Test-ReportHeader {
+    # True when a row starts with the given column headers (ignoring case).
+    param([object[]] $Values, [string[]] $Header)
+    if ($null -eq $Values -or $Values.Count -lt $Header.Count) { return $false }
+    for ($c = 0; $c -lt $Header.Count; $c++) {
+        if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals([string] $Values[$c], $Header[$c])) { return $false }
     }
+    $true
 }
 
 function Select-ReportRow {
-    # Finds a sheet's table header row (below the rules; row 1 in older reports) and returns
-    # the data rows under it as (fixed values, folders) pairs.
+    # Finds a sheet's table header row (row 1; lower in reports that had the rules above the
+    # table) and returns the data rows under it: fixed values, folders, and whether the
+    # header was $LegacyColumn's (a report made before a column was added).
     param(
         [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Row,
         [Parameter(Mandatory)] [object[]] $Column,
+        [object[]] $LegacyColumn = @(),
         [Parameter(Mandatory)] [string] $ErrorMessage
     )
 
-    $expected = @($Column | ForEach-Object { $_.Header })
+    $expected = [string[]] @($Column | ForEach-Object { $_.Header })
+    $legacy = [string[]] @($LegacyColumn | ForEach-Object { $_.Header })
     $headerAt = -1
+    $isLegacy = $false
     for ($r = 0; $headerAt -lt 0 -and $r -lt $Row.Count; $r++) {
-        $headerOk = $Row[$r].Count -ge $expected.Count
-        for ($c = 0; $headerOk -and $c -lt $expected.Count; $c++) {
-            $headerOk = [System.StringComparer]::OrdinalIgnoreCase.Equals([string] $Row[$r][$c], $expected[$c])
-        }
-        if ($headerOk) { $headerAt = $r }
+        if (Test-ReportHeader -Values $Row[$r] -Header $expected) { $headerAt = $r }
+        elseif ($legacy.Count -and (Test-ReportHeader -Values $Row[$r] -Header $legacy)) { $headerAt = $r; $isLegacy = $true }
     }
     if ($headerAt -lt 0) { throw "$ErrorMessage '$($expected -join ', ')'." }
 
     $firstLocation = $expected.Count
+    if ($isLegacy) { $firstLocation = $legacy.Count }
     for ($r = $headerAt + 1; $r -lt $Row.Count; $r++) {
         $values = $Row[$r]
         if ($values.Count -lt $firstLocation -or -not $values[0]) { continue }
         # (Not "$x = if ...": that would unroll an empty or one-item array.)
         $folders = [System.Collections.Generic.List[string]]::new()
         for ($c = $firstLocation; $c -lt $values.Count; $c++) { if ($values[$c]) { $folders.Add($values[$c]) } }
-        [pscustomobject] @{ Values = $values; Folders = $folders.ToArray() }
+        [pscustomobject] @{ Values = $values; Folders = $folders.ToArray(); Legacy = $isLegacy }
     }
 }
 
 function ConvertFrom-CellNumber {
-    # A numeric cell's text as a number, or a clear error naming the report.
-    param([AllowNull()] [AllowEmptyString()] [string] $Text, [Parameter(Mandatory)] [string] $Path)
+    # A numeric cell's text as a number, or a clear error naming the report. A simple
+    # function (no parameter validation): it runs for several cells of every row.
+    param([string] $Text, [string] $Path)
     $number = 0.0
     if (-not [double]::TryParse($Text, [System.Globalization.NumberStyles]::Float,
             [System.Globalization.CultureInfo]::InvariantCulture, [ref] $number)) {
@@ -1223,7 +1699,10 @@ function ConvertFrom-CellNumber {
 }
 
 function Read-DuplicateWorkbook {
-    # Reads both sheets of a report. Folders is $null when the report has no folder sheet.
+    <#
+        Reads a report: Files, Folders ($null when the report has no folder sheet) and the
+        scan settings recorded on the Rules sheet (ExcludeName, MinimumSize).
+    #>
     param([Parameter(Mandatory)] [string] $Path)
 
     if (-not [System.IO.File]::Exists($Path)) { throw "Report '$Path' was not found." }
@@ -1239,6 +1718,9 @@ function Read-DuplicateWorkbook {
             $folderSheet = @($sheets | Where-Object { $_.Name -eq $script:FolderSheetName })
             $folderRows = $null
             if ($folderSheet) { $folderRows = @(Get-WorksheetRow -Archive $zip -SheetPath $folderSheet[0].Path -SharedString $shared) }
+            $rulesSheet = @($sheets | Where-Object { $_.Name -eq $script:RulesSheetName })
+            $rulesRows = @()
+            if ($rulesSheet) { $rulesRows = @(Get-WorksheetRow -Archive $zip -SheetPath $rulesSheet[0].Path -SharedString $shared) }
         }
         finally { $zip.Dispose() }
     }
@@ -1246,13 +1728,18 @@ function Read-DuplicateWorkbook {
     finally { $stream.Dispose() }
 
     # Numbers go through [double] then [long]/[int], which rounds half to even like Python's round().
-    $files = @(foreach ($row in (Select-ReportRow -Row $fileRows -Column $script:FixedColumns `
+    $files = @(foreach ($row in (Select-ReportRow -Row $fileRows -Column $script:FixedColumns -LegacyColumn $script:LegacyFixedColumns `
                     -ErrorMessage "'$Path' is not a duplicates report: it has no header row")) {
+            # Reports made before the UTC Offset column have no offset: they are checked by local time.
+            $offset = $null
+            $at = 2
+            if (-not $row.Legacy) { $offset = ConvertFrom-UtcOffsetText $row.Values[2] -Path $Path; $at = 3 }
             [pscustomobject] @{
                 FileName      = $row.Values[0]
                 LastWriteTime = [datetime]::FromOADate((ConvertFrom-CellNumber $row.Values[1] -Path $Path))
-                SizeBytes     = [long] (ConvertFrom-CellNumber $row.Values[2] -Path $Path)
-                MD5           = $row.Values[3]
+                UtcOffset     = $offset
+                SizeBytes     = [long] (ConvertFrom-CellNumber $row.Values[$at] -Path $Path)
+                MD5           = $row.Values[$at + 1]
                 Count         = $row.Folders.Count
                 Folders       = $row.Folders
             }
@@ -1273,7 +1760,40 @@ function Read-DuplicateWorkbook {
             })
     }
 
-    [pscustomobject] @{ Files = $files; Folders = $folders }
+    $settings = Get-ScanSetting -Row $rulesRows -Path $Path
+    [pscustomobject] @{ Files = $files; Folders = $folders; ExcludeName = $settings.ExcludeName; MinimumSize = $settings.MinimumSize }
+}
+
+function Get-ScanSetting {
+    <#
+        The scan settings from the Rules sheet's rows (see Get-RulesSheetData); none when absent.
+        A smallest size that is not a whole number of bytes (the report was edited) is ignored
+        with a warning: it only ever narrowed the scan, so the rest of the report still holds.
+    #>
+    param([Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Row, [Parameter(Mandatory)] [string] $Path)
+    $excludeName = [System.Collections.Generic.List[string]]::new()
+    $minimumSize = [long] 0
+    foreach ($values in $Row) {
+        if ($null -eq $values -or $values.Count -lt 2) { continue }
+        $cells = [string[]] @(for ($c = 1; $c -lt $values.Count; $c++) { if ($values[$c]) { $values[$c] } })
+        if ($values[0] -ceq $script:ExcludeNameLabel) {
+            foreach ($pattern in $cells) {
+                $problem = Get-NamePatternProblem -Pattern $pattern
+                if ($problem) { Write-Warning "Ignoring an exclusion pattern in '$Path': $problem" }
+                else { $excludeName.Add($pattern) }
+            }
+        }
+        elseif ($values[0] -ceq $script:MinimumSizeLabel -and $cells.Count) {
+            $number = 0.0
+            if ([double]::TryParse($cells[0], [System.Globalization.NumberStyles]::Float,
+                    [System.Globalization.CultureInfo]::InvariantCulture, [ref] $number) -and
+                $number -ge 0 -and $number -lt [long]::MaxValue -and $number -eq [Math]::Floor($number)) {
+                $minimumSize = [long] $number
+            }
+            else { Write-Warning "Ignoring the smallest file size in '$Path': '$($cells[0])' is not a whole number of bytes." }
+        }
+    }
+    [pscustomobject] @{ ExcludeName = $excludeName.ToArray(); MinimumSize = $minimumSize }
 }
 
 function Import-DuplicateReport {
@@ -1309,10 +1829,8 @@ function Test-PathRootReachable {
         checked once per $Cache: an offline share can take many seconds to time out, and a
         report may list thousands of copies on it.
     #>
-    param(
-        [Parameter(Mandatory)] [string] $Folder,
-        [System.Collections.Generic.Dictionary[string, bool]] $Cache
-    )
+    # A simple function (no parameter validation): it runs for every copy in a report.
+    param([string] $Folder, [System.Collections.Generic.Dictionary[string, bool]] $Cache)
     $root = [System.IO.Path]::GetPathRoot($Folder)
     if (-not $root) { return $true }
     if ($null -ne $Cache -and $Cache.ContainsKey($root)) { return $Cache[$root] }
@@ -1342,35 +1860,265 @@ function Test-DuplicateCopy {
           Present     - still there with the same size and saved date
           Missing     - no longer there
           Changed     - still there but its size or saved date changed
-          Unavailable - its drive or network share cannot be reached (kept as is)
+          Unavailable - its drive or network share cannot be reached, or its size and saved
+                        date cannot be read, as for names Windows reserves for devices (kept as is)
     #>
     param(
         [Parameter(Mandatory)] [string] $Folder,
         [Parameter(Mandatory)] [string] $FileName,
         [Parameter(Mandatory)] [long] $SizeBytes,
         [Parameter(Mandatory)] [datetime] $LastWriteTime,
+        # The report's UTC offset for $LastWriteTime; without one (older reports) the saved
+        # date is compared as local time on this computer.
+        [AllowNull()] [object] $UtcOffset,
         [System.Collections.Generic.Dictionary[string, bool]] $RootCache
     )
 
     try {
         if (-not (Test-PathRootReachable -Folder $Folder -Cache $RootCache)) { return 'Unavailable' }
-        $path = [System.IO.Path]::Combine($Folder, $FileName)
-        $file = if ([System.IO.File]::Exists($path)) { [System.IO.FileInfo] $path } else { Find-FileByNameKey -Folder $Folder -FileName $FileName }
-        if (-not $file) { return 'Missing' }
-        $size  = $file.Length
-        $ticks = $file.LastWriteTime.Ticks
+        $file = Find-CopyFile -Folder $Folder -FileName $FileName
     }
-    catch [System.IO.FileNotFoundException] { return 'Missing' }  # deleted while being checked
-    catch [System.UnauthorizedAccessException], [System.IO.IOException], [System.Security.SecurityException] {
-        return 'Unavailable'
+    catch { return 'Unavailable' }  # something that cannot be checked is kept, never removed
+    if (-not $file) { return 'Missing' }
+    Get-CopyState -File $file -SizeBytes $SizeBytes -LastWriteTime $LastWriteTime -UtcOffset $UtcOffset
+}
+
+function Find-CopyFile {
+    # A recorded copy's file: by its exact name, else ignoring case and Unicode form; $null
+    # when there is none.
+    param([Parameter(Mandatory)] [string] $Folder, [Parameter(Mandatory)] [string] $FileName)
+    $path = [System.IO.Path]::Combine($Folder, $FileName)
+    if ([System.IO.File]::Exists($path)) { return [System.IO.FileInfo] $path }
+    Find-FileByNameKey -Folder $Folder -FileName $FileName
+}
+
+function Get-CopyState {
+    # Present or Changed for a copy's file, by its size and saved date (see Test-DuplicateCopy);
+    # Missing when it was deleted while being checked; Unavailable when its details cannot be read.
+    # A simple function (no parameter validation): it runs for every copy in a report.
+    param([object] $File, [long] $SizeBytes, [datetime] $LastWriteTime, [object] $UtcOffset)
+    try { [FindDuplicates.Native]::CopyState($File, $SizeBytes, $LastWriteTime, $UtcOffset) }
+    catch { 'Unavailable' }  # not a file at all
+}
+
+function Test-CopyInFolder {
+    <#
+        Checks the recorded copies in one folder (see Test-DuplicateCopy), whose drive or
+        share is reachable. Several copies are checked from a single listing of the folder
+        rather than a lookup each: on a network share every lookup is a round trip.
+        $Check holds Key, FileName, SizeBytes, LastWriteTime and UtcOffset; returns Key and
+        State for each.
+    #>
+    param([Parameter(Mandatory)] [string] $Folder, [Parameter(Mandatory)] [object[]] $Check)
+
+    if ($Check.Count -eq 1) {
+        $c = $Check[0]
+        $state = 'Missing'
+        try { $file = Find-CopyFile -Folder $Folder -FileName $c.FileName }
+        catch { $file = $null; $state = 'Unavailable' }
+        if ($file) { $state = Get-CopyState -File $file -SizeBytes $c.SizeBytes -LastWriteTime $c.LastWriteTime -UtcOffset $c.UtcOffset }
+        return [pscustomobject] @{ Key = $c.Key; State = $state }
     }
 
-    # Whole seconds, in exact integer arithmetic (as when scanning).
-    $ticksPerSecond = [System.TimeSpan]::TicksPerSecond
-    $savedTicks = $LastWriteTime.Ticks
-    if ($size -ne $SizeBytes -or
-        ($ticks - ($ticks % $ticksPerSecond)) -ne ($savedTicks - ($savedTicks % $ticksPerSecond))) { return 'Changed' }
-    'Present'
+    # Checked by .NET from one listing (FindDuplicates.Native.CheckCopiesInFolder): folders
+    # can hold thousands of files and a report thousands of copies.
+    $names   = [string[]]::new($Check.Count)
+    $sizes   = [long[]]::new($Check.Count)
+    $saved   = [datetime[]]::new($Check.Count)
+    $offsets = [System.Nullable[TimeSpan][]]::new($Check.Count)
+    for ($i = 0; $i -lt $Check.Count; $i++) {
+        $c = $Check[$i]
+        $names[$i] = $c.FileName; $sizes[$i] = $c.SizeBytes; $saved[$i] = $c.LastWriteTime
+        if ($null -ne $c.UtcOffset) { $offsets[$i] = [TimeSpan] $c.UtcOffset }
+    }
+    $states = [FindDuplicates.Native]::CheckCopiesInFolder($Folder, $names, $sizes, $saved, $offsets)
+    for ($i = 0; $i -lt $Check.Count; $i++) { [pscustomobject] @{ Key = $Check[$i].Key; State = $states[$i] } }
+}
+
+function Invoke-WorkItem {
+    # Runs $Work (taking one item) on each item, $ThrottleLimit at a time, showing progress,
+    # and returns everything the work outputs. A failure on any item is rethrown.
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Item,
+        [Parameter(Mandatory)] [scriptblock] $Work,
+        [ValidateRange(1, 64)] [int] $ThrottleLimit = 1,
+        [Parameter(Mandatory)] [string] $Activity
+    )
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastShownMs = - $script:ProgressIntervalMs
+    if ($ThrottleLimit -eq 1 -or $Item.Count -lt 2) {
+        for ($i = 0; $i -lt $Item.Count; $i++) {
+            if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
+                $lastShownMs = $timer.ElapsedMilliseconds
+                Write-Progress -Id 3 -Activity $Activity -Status "$($i + 1) of $($Item.Count)" -PercentComplete ([int] (100 * $i / $Item.Count))
+            }
+            & $Work $Item[$i]
+        }
+    }
+    else {
+        $pool = $null
+        try {
+            $pool = Open-WorkerPool -Work $Work -ThrottleLimit ([Math]::Min($ThrottleLimit, $Item.Count))
+            foreach ($one in $Item) { $pool.Queue.Add($one) }
+            for ($done = 1; $done -le $Item.Count; $done++) {
+                $result = Receive-WorkerResult -Pool $pool
+                if ($null -ne $result.Error) { throw $result.Error }
+                if ($timer.ElapsedMilliseconds - $lastShownMs -ge $script:ProgressIntervalMs) {
+                    $lastShownMs = $timer.ElapsedMilliseconds
+                    Write-Progress -Id 3 -Activity $Activity -Status "$done of $($Item.Count) ($ThrottleLimit at a time)" `
+                        -PercentComplete ([int] (100 * $done / $Item.Count))
+                }
+                $result.Value
+            }
+        }
+        finally {
+            if ($null -ne $pool) { Close-WorkerPool -Pool $pool }
+        }
+    }
+    Write-Progress -Id 3 -Activity $Activity -Completed
+}
+
+function Get-FileCopyState {
+    <#
+        Checks every copy of every file row; returns "row number|folder" -> state (see
+        Test-DuplicateCopy). Copies on a drive or share that cannot be reached are
+        Unavailable without further checks (each drive or share is tried once). The others
+        are grouped by folder and each folder checked with Test-CopyInFolder, $ThrottleLimit
+        folders at a time.
+    #>
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Row,
+        [ValidateRange(1, 64)] [int] $ThrottleLimit = 1,
+        [System.Collections.Generic.Dictionary[string, bool]] $RootCache
+    )
+    if ($null -eq $RootCache) { $RootCache = [System.Collections.Generic.Dictionary[string, bool]]::new([System.StringComparer]::OrdinalIgnoreCase) }
+    $states = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+    $byFolder = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[object]]]::new([System.StringComparer]::Ordinal)
+    for ($i = 0; $i -lt $Row.Count; $i++) {
+        foreach ($folder in $Row[$i].Folders) {
+            $key = "$i|$folder"
+            # The cache first: a function call per copy costs more than the rest of the check.
+            $reachable = $false
+            if (-not $RootCache.TryGetValue([string] [System.IO.Path]::GetPathRoot($folder), [ref] $reachable)) {
+                $reachable = Test-PathRootReachable -Folder $folder -Cache $RootCache
+            }
+            if (-not $reachable) { $states[$key] = 'Unavailable'; continue }
+            $checks = $null
+            if (-not $byFolder.TryGetValue($folder, [ref] $checks)) {
+                $checks = [System.Collections.Generic.List[object]]::new()
+                $byFolder[$folder] = $checks
+            }
+            $checks.Add([pscustomobject] @{
+                    Key = $key; FileName = $Row[$i].FileName; SizeBytes = $Row[$i].SizeBytes
+                    LastWriteTime = $Row[$i].LastWriteTime; UtcOffset = $Row[$i].UtcOffset
+                })
+        }
+    }
+    $jobs = @(foreach ($entry in $byFolder.GetEnumerator()) { [pscustomobject] @{ Folder = $entry.Key; Check = $entry.Value.ToArray() } })
+    $work = { param($Job) Test-CopyInFolder -Folder $Job.Folder -Check $Job.Check }
+    foreach ($result in (Invoke-WorkItem -Item $jobs -Work $work -ThrottleLimit $ThrottleLimit -Activity 'Validating file copies')) {
+        $states[$result.Key] = $result.State
+    }
+    , $states
+}
+
+function Get-FolderCopyState {
+    <#
+        Checks every copy of every folder row with Test-DuplicateFolderCopy, $ThrottleLimit
+        at a time; returns "row number|folder" -> state. Copies on a drive or share that
+        cannot be reached are Unavailable without further checks.
+    #>
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Row,
+        [ValidateRange(1, 64)] [int] $ThrottleLimit = 1,
+        [System.Collections.Generic.Dictionary[string, bool]] $RootCache,
+        [string[]] $ExcludeName = @()
+    )
+    if ($null -eq $RootCache) { $RootCache = [System.Collections.Generic.Dictionary[string, bool]]::new([System.StringComparer]::OrdinalIgnoreCase) }
+    $states = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+    $jobs = [System.Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt $Row.Count; $i++) {
+        foreach ($folder in $Row[$i].Folders) {
+            $key = "$i|$folder"
+            # The cache first: a function call per copy costs more than the rest of the check.
+            $reachable = $false
+            if (-not $RootCache.TryGetValue([string] [System.IO.Path]::GetPathRoot($folder), [ref] $reachable)) {
+                $reachable = Test-PathRootReachable -Folder $folder -Cache $RootCache
+            }
+            if (-not $reachable) { $states[$key] = 'Unavailable'; continue }
+            $jobs.Add([pscustomobject] @{
+                    Key = $key; Path = $folder; FileCount = $Row[$i].FileCount; FolderCount = $Row[$i].FolderCount; SizeBytes = $Row[$i].SizeBytes
+                    ExcludeName = $ExcludeName
+                })
+        }
+    }
+    $work = {
+        param($Job)
+        $state = Test-DuplicateFolderCopy -Path $Job.Path -FileCount $Job.FileCount -FolderCount $Job.FolderCount -SizeBytes $Job.SizeBytes `
+            -ExcludeName $Job.ExcludeName
+        [pscustomobject] @{ Key = $Job.Key; State = $state }
+    }
+    foreach ($result in (Invoke-WorkItem -Item $jobs.ToArray() -Work $work -ThrottleLimit $ThrottleLimit -Activity 'Validating folder copies')) {
+        $states[$result.Key] = $result.State
+    }
+    , $states
+}
+
+function Test-SameSavedDate {
+    <#
+        True when a file's saved date (as $Local and $Utc) is a report's, to the whole second,
+        in exact integer arithmetic as when scanning: compared as instants when the report has
+        the UTC offset, as local times otherwise (reports made before the UTC Offset column).
+    #>
+    # A simple function (no parameter validation): it runs for every copy in a report.
+    param([datetime] $Local, [datetime] $Utc, [datetime] $LastWriteTime, [object] $UtcOffset)
+    [FindDuplicates.Native]::SameSavedDate($Local, $Utc, $LastWriteTime, $UtcOffset)
+}
+
+function Get-PreviousMd5 {
+    <#
+    .SYNOPSIS
+        MD5 hashes to take from an earlier report instead of reading the files again.
+    .DESCRIPTION
+        Returns full path -> MD5 for each scanned file that the report lists (same folder
+        and name, ignoring case) whose size and saved date are still the report's. Only
+        those files' details are looked up. MD5s that are not 32 hexadecimal digits (an
+        edited report) are ignored.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [System.IO.FileInfo[]] $File
+    )
+
+    $rows = @((Read-DuplicateWorkbook -Path $Path).Files)
+    $names = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($row in $rows) { $null = $names.Add($row.FileName) }
+
+    # Folder + separator + name key -> scanned file, for the names the report lists.
+    $separator = [string] [char] 0
+    $scanned = [System.Collections.Generic.Dictionary[string, System.IO.FileInfo]]::new([System.StringComparer]::Ordinal)
+    foreach ($f in $File) {
+        if (-not $names.Contains($f.Name)) { continue }
+        $key = $f.DirectoryName + $separator + (ConvertTo-NameKey $f.Name)
+        if (-not $scanned.ContainsKey($key)) { $scanned[$key] = $f }
+    }
+
+    $previous = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+    foreach ($row in $rows) {
+        if ([string] $row.MD5 -notmatch '^[0-9A-Fa-f]{32}$') { continue }
+        $name = $separator + (ConvertTo-NameKey $row.FileName)
+        foreach ($folder in $row.Folders) {
+            $f = $null
+            if (-not $scanned.TryGetValue($folder + $name, [ref] $f)) { continue }
+            # A file whose details cannot be read is simply hashed (and reported on) as usual.
+            try { $size = $f.get_Length(); $local = $f.get_LastWriteTime(); $utc = $f.get_LastWriteTimeUtc() }
+            catch { continue }
+            if ($size -eq $row.SizeBytes -and [FindDuplicates.Native]::SameSavedDate($local, $utc, $row.LastWriteTime, $row.UtcOffset)) {
+                $previous[$f.FullName] = ([string] $row.MD5).ToUpperInvariant()
+            }
+        }
+    }
+    , $previous
 }
 
 function Test-DuplicateFolderCopy {
@@ -1380,33 +2128,35 @@ function Test-DuplicateFolderCopy {
           Missing     - no longer there
           Changed     - still there but its files, sub folders or total size changed
           Unavailable - its drive or share cannot be reached, or part of it cannot be read (kept)
+        Files and folders whose names match $ExcludeName (the scan's -Exclude) are left out.
     #>
     param(
         [Parameter(Mandatory)] [string] $Path,
         [Parameter(Mandatory)] [int] $FileCount,
         [Parameter(Mandatory)] [int] $FolderCount,
         [Parameter(Mandatory)] [long] $SizeBytes,
-        [System.Collections.Generic.Dictionary[string, bool]] $RootCache
+        [System.Collections.Generic.Dictionary[string, bool]] $RootCache,
+        [string[]] $ExcludeName = @()
     )
 
     try {
         if (-not (Test-PathRootReachable -Folder $Path -Cache $RootCache)) { return 'Unavailable' }
         if (-not [System.IO.Directory]::Exists($Path)) { return 'Missing' }
         $folders = [System.Collections.Generic.List[object]]::new()
-        $files = @(Get-FileInventory -Path $Path -FolderInfo $folders -Verbose:$false -WarningAction SilentlyContinue)
+        $files = @(Get-FileInventory -Path $Path -FolderInfo $folders -ExcludeName $ExcludeName -Verbose:$false -WarningAction SilentlyContinue)
+        if (@($folders | Where-Object { -not $_.Readable }).Count -gt 0) { return 'Unavailable' }
+        $size = [long] 0
+        foreach ($f in $files) { $size += $f.get_Length() }  # a file gone since the listing throws here
     }
     catch { return 'Unavailable' }
 
-    if (@($folders | Where-Object { -not $_.Readable }).Count -gt 0) { return 'Unavailable' }
-    $size = [long] 0
-    foreach ($f in $files) { $size += $f.Length }
     if ($files.Count -ne $FileCount -or $folders.Count - 1 -ne $FolderCount -or $size -ne $SizeBytes) { return 'Changed' }
     'Present'
 }
 
 function Invoke-CopyCheck {
     <#
-        Runs $TestCopy on every copy of every row. Keeps copies that are Present or
+        Runs $TestCopy (location, row number) on every copy of every row. Keeps copies that are Present or
         Unavailable, drops Missing and Changed ones, and drops rows left with fewer than
         two copies. Returns the rows kept and the counts.
     #>
@@ -1435,7 +2185,7 @@ function Invoke-CopyCheck {
         $present = [System.Collections.Generic.List[string]]::new()
         foreach ($location in $row.Folders) {
             $checked++
-            $state = & $TestCopy $row $location
+            $state = & $TestCopy $location $i
             if ($state -eq 'Present') { $present.Add($location); continue }
             if ($state -eq 'Unavailable') {
                 $unavailable++
@@ -1469,8 +2219,9 @@ function Update-DuplicateReport {
         Re-checks every copy listed in an existing report and removes the ones that
         no longer exist, without rescanning the folders.
     .DESCRIPTION
-        Each file copy is checked with a single file lookup, and each folder copy by
-        listing its tree again; no contents are read or downloaded. Copies that are
+        Each file copy is checked with a file lookup (copies in the same folder from one
+        listing of it), and each folder copy by listing its tree again; no contents are
+        read or downloaded. -ThrottleLimit checks that many folders at the same time. Copies that are
         missing or changed are removed; rows left with fewer than two copies are
         removed. Copies on a drive or network share that cannot be reached are kept.
         The report is rewritten in place only when something changed. Supports -WhatIf.
@@ -1479,22 +2230,31 @@ function Update-DuplicateReport {
         DuplicateFolderSet the folder rows ($null when the report has no folder sheet).
     #>
     [CmdletBinding(SupportsShouldProcess)]
-    param([Parameter(Mandatory)] [string] $Path)
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+
+        # How many folders to check at the same time.
+        [ValidateRange(1, 64)]
+        [int] $ThrottleLimit = 1
+    )
 
     $Path = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($Path)
     $workbook = Read-DuplicateWorkbook -Path $Path
     $rootCache = [System.Collections.Generic.Dictionary[string, bool]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
+    $fileStates = Get-FileCopyState -Row $workbook.Files -ThrottleLimit $ThrottleLimit -RootCache $rootCache
     $files = Invoke-CopyCheck -Set $workbook.Files -NameProperty FileName -Noun '' -TestCopy {
-        param($row, $location)
-        Test-DuplicateCopy -Folder $location -FileName $row.FileName -SizeBytes $row.SizeBytes -LastWriteTime $row.LastWriteTime -RootCache $rootCache
+        param($location, $number)
+        $fileStates["$number|$location"]
     }
 
     $folders = $null
     if ($null -ne $workbook.Folders) {
+        $folderStates = Get-FolderCopyState -Row $workbook.Folders -ThrottleLimit $ThrottleLimit -RootCache $rootCache `
+            -ExcludeName $workbook.ExcludeName
         $folders = Invoke-CopyCheck -Set $workbook.Folders -NameProperty FolderName -Noun 'folder ' -LocationIsItem -TestCopy {
-            param($row, $location)
-            Test-DuplicateFolderCopy -Path $location -FileCount $row.FileCount -FolderCount $row.FolderCount -SizeBytes $row.SizeBytes -RootCache $rootCache
+            param($location, $number)
+            $folderStates["$number|$location"]
         }
     }
 
@@ -1503,7 +2263,7 @@ function Update-DuplicateReport {
 
     $saved = $false
     if ($removed -gt 0 -and $PSCmdlet.ShouldProcess($Path, 'Remove missing or changed copies')) {
-        $export = @{ DuplicateSet = $files.Kept; Path = $Path }
+        $export = @{ DuplicateSet = $files.Kept; Path = $Path; ExcludeName = $workbook.ExcludeName; MinimumSize = $workbook.MinimumSize }
         if ($folders) { $export.FolderSet = $folders.Kept }
         Export-DuplicateReport @export
         $saved = $true
@@ -1535,4 +2295,5 @@ function Update-DuplicateReport {
 #endregion
 
 Export-ModuleMember -Function Get-FileInventory, Find-DuplicateFile, Find-DuplicateFolder, Export-DuplicateReport,
-    ConvertTo-ColumnName, Import-DuplicateReport, Import-DuplicateFolderReport, Update-DuplicateReport
+    ConvertTo-ColumnName, Import-DuplicateReport, Import-DuplicateFolderReport, Update-DuplicateReport, Get-PreviousMd5,
+    Test-NetworkDrive, Get-DefaultThrottleLimit, Assert-NamePattern, ConvertFrom-SizeText

@@ -27,11 +27,12 @@ The tool comes in two versions with the same features and the same output: a
 | Recursive scan | Scans a folder and every sub folder; shows the folder currently being scanned. |
 | Strict duplicate rule | Name **and** saved date **and** MD5 must all match. |
 | Fast by design | MD5 is only calculated for files whose name, saved date and size already match another file. Everything else is never read. |
-| Parallel hashing | `-ThrottleLimit N` hashes up to N files at the same time (1-64). |
+| Parallel scanning and hashing | `-ThrottleLimit N` lists up to N folders and hashes up to N files at the same time (1-64). |
 | Every copy recorded | One row per duplicated file, one column per copy, with the full folder path of each. |
 | Duplicate folders | `-IncludeFolders` also finds whole folders with the same name and identical contents (every file and sub folder), on a second sheet. |
 | Excel output without Excel | Writes a real `.xlsx`: data sheets with a frozen, filterable header and real dates, plus a *Rules* sheet stating in plain words what counts as a match. Excel does not need to be installed. |
 | Empty files optional | `-IgnoreEmptyFiles` leaves files of 0 bytes out of the file duplicates. |
+| Leave things out | `-Exclude` skips files and folders by name (`Thumbs.db`, `.git`, `*.tmp`); `-MinimumSize` leaves small files out. Both are recorded in the report. |
 | Any language | File and folder names in any script (Chinese, Arabic, Cyrillic, emoji ...) are matched and stored correctly; a name typed on a Mac matches the same name saved on Windows. |
 | Validate without rescanning | `-Validate` re-checks every copy listed in an existing report (files with a quick lookup, folders by re-listing them, never reading contents) and removes those that are gone or changed. |
 | Network shares | UNC paths (`\\server\share`) and mapped drives. Unreachable folders are skipped with a warning; an unreachable share never wipes report entries. |
@@ -57,8 +58,19 @@ can have any number of duplicates, in any folders.
 
 Files of 0 bytes all have the same contents, so every same-named empty file
 with the same saved date is a duplicate. They are included by default; add
-`-IgnoreEmptyFiles` to leave them out. (Duplicate folders always compare every
-file, empty ones included.)
+`-IgnoreEmptyFiles` to leave them out, or `-MinimumSize` to leave out every file
+smaller than a given size. (Duplicate folders always compare every file, empty
+and small ones included.)
+
+`-Exclude` leaves files and folders out by name, as if they were not there:
+left-out folders are not scanned at all, and folders are compared without the
+left-out names, so two photo folders still match when only their `Thumbs.db`
+differs. Patterns use `*` for any characters and `?` for any one character, and
+ignore upper/lower case, like names do. They match whole names, not paths: a
+pattern holding `/` or `\` is refused, and the folder being scanned is never left
+out itself. Everything else in a pattern is literal. `-Validate` leaves out the
+same names, read from the report. The smallest file size (`-MinimumSize`, or 1
+byte with `-IgnoreEmptyFiles`) is recorded in the report too.
 
 Names are compared the way people read them: ignoring upper/lower case, and
 ignoring how accented letters are encoded. macOS often stores "é" as "e" plus a
@@ -106,9 +118,10 @@ Here each `Location` is the full path of the duplicate folder itself.
 
 ```text
 Find-Duplicates.ps1 [[-Path] <folder>] [[-OutputFile] <report>] [-ThrottleLimit <1-64>]
-                    [-IncludeFolders] [-IgnoreEmptyFiles] [-SkipCloudOnly] [-PassThru] [-WhatIf] [-Verbose]
+                    [-IncludeFolders] [-IgnoreEmptyFiles] [-Exclude <pattern[]>] [-MinimumSize <bytes>]
+                    [-SkipCloudOnly] [-Rehash] [-PassThru] [-WhatIf] [-Verbose]
 
-Find-Duplicates.ps1 -Validate [[-OutputFile] <report>] [-PassThru] [-WhatIf] [-Verbose]
+Find-Duplicates.ps1 -Validate [[-OutputFile] <report>] [-ThrottleLimit <1-64>] [-PassThru] [-WhatIf] [-Verbose]
 ```
 
 Built-in help: `Get-Help .\Find-Duplicates.ps1 -Full`.
@@ -121,11 +134,14 @@ If Windows blocks the script, run it as
 | Parameter | Default | What it does |
 |---|---|---|
 | `-Path <folder>` | current folder | Folder to scan, including all sub folders. Also the first positional argument. |
-| `-OutputFile <report>` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced. Also the second positional argument. |
-| `-ThrottleLimit <1-64>` | `1` | How many files to hash at the same time. See [Performance](#performance). |
+| `-OutputFile <report>` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced, after its MD5 hashes are reused (see `-Rehash`). Also the second positional argument. |
+| `-ThrottleLimit <1-64>` | `4` on a network share or drive, `1` otherwise | How many files to hash, and folders to list, at the same time. See [Performance](#performance). |
 | `-IncludeFolders` | off | Also find [duplicate folders](#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
 | `-IgnoreEmptyFiles` | off | Leave files of 0 bytes out of the duplicate files. |
+| `-Exclude <pattern[]>` | none | Leave files and folders with these names out: see [What counts as a duplicate](#what-counts-as-a-duplicate). Recorded on the *Rules* sheet. |
+| `-MinimumSize <bytes>` | `0` | Leave files smaller than this out of the duplicate files. Takes PowerShell sizes such as `100KB` or `1.5MB`. Recorded on the *Rules* sheet. |
 | `-SkipCloudOnly` | off | Never download online-only cloud files to hash them. Duplicates among such files are then not reported. |
+| `-Rehash` | off | Read every candidate file again. Without it, when the report already exists (from an earlier scan), files it lists whose size and saved date have not changed keep the MD5 recorded there instead of being read again. |
 | `-PassThru` | off | Also return the duplicates as PowerShell objects (for piping or scripting): file sets, then folder sets (which have a `FolderName` property). |
 | `-WhatIf` | off | Scan and report the totals, but do not save the report. |
 | `-Verbose` | off | Print every folder as it is scanned, and every link or online-only file skipped. |
@@ -151,6 +167,9 @@ If Windows blocks the script, run it as
 # Leave out empty (0-byte) files
 .\Find-Duplicates.ps1 -Path D:\Photos -IgnoreEmptyFiles
 
+# Leave out thumbnail caches, Git folders, temporary files and files under 100 KB
+.\Find-Duplicates.ps1 -Path D:\Photos -Exclude Thumbs.db, .git, *.tmp -MinimumSize 100KB
+
 # OneDrive without downloading online-only files
 .\Find-Duplicates.ps1 -Path "$env:OneDrive" -SkipCloudOnly
 
@@ -174,6 +193,7 @@ duplicates and want the report to catch up.
 |---|---|---|
 | `-Validate` | — | Switches to validation. Required for this mode. |
 | `-OutputFile <report>` | `duplicates.xlsx` in the current folder | Report to check and update. Also the first positional argument in this mode. |
+| `-ThrottleLimit <1-64>` | `1` | How many folders to check at the same time. Try 4-8 for network shares. |
 | `-PassThru` | off | Also return the rows that remain. |
 | `-WhatIf` | off | Report what would be removed, but do not change the report. |
 | `-Verbose` | off | Print every copy that is removed and why (`Missing` or `Changed`). |
@@ -181,8 +201,10 @@ duplicates and want the report to catch up.
 The report can be open in Excel while it is validated with `-WhatIf`; to save
 changes, close it first.
 
-For every file copy listed, one file lookup decides; for every folder copy,
-the folder is listed again (no file contents are read):
+For every file copy listed, a file lookup decides (copies in the same folder
+are all checked from one listing of it, one round trip on a network share); for
+every folder copy, the folder is listed again. No file contents are read. Each
+drive or share that cannot be reached is tried once:
 
 | Result | File copy | Folder copy | Action |
 |---|---|---|---|
@@ -201,8 +223,10 @@ downloaded from the cloud); a file edited without changing its size or saved
 date is not detected. Run a full scan for that, and to find new duplicates.
 File names containing control characters (possible on Linux) are stored with
 a replacement character, so validation cannot find those copies and removes them.
-Validate on a computer set to the same time zone as the scan, since saved
-dates are stored as local time.
+Saved dates are compared as moments in time (using the report's *UTC Offset*
+column), so a report can be validated on a computer in another time zone.
+Reports made before that column existed are compared by local time: validate
+those in the time zone of the scan. Rewriting such a report adds the column.
 
 ```powershell
 # Check .\duplicates.xlsx
@@ -227,20 +251,26 @@ The workbook has these sheets:
 |---|---|
 | **Duplicates** | One row per duplicated file (below). |
 | **Duplicate Folders** | Only with `-IncludeFolders`: one row per duplicated folder (see [Duplicate folders](#duplicate-folders)). |
-| **Rules** | The matching rules behind the other sheets, in plain words, so anyone reviewing the data can check what a match means. Rewritten with the data, so it always matches the sheets present. |
+| **Rules** | The matching rules behind the other sheets, in plain words, so anyone reviewing the data can check what a match means. Rewritten with the data, so it always matches the sheets present. When the scan used `-Exclude` or `-MinimumSize`, a *Scan settings* section records them; `-Validate` reads it back and keeps it. |
 
 On the *Duplicates* sheet: one row per duplicated file, one column per copy:
 
-| File Name  | Last Modified       | Size (bytes) | MD5     | Copies | Location 1     | Location 2        | Location 3 |
-|------------|---------------------|--------------|---------|--------|----------------|-------------------|------------|
-| report.doc | 2024-05-17 10:30:00 | 48128        | 9A0F... | 3      | D:\Docs\2024   | D:\Backup\Docs    | E:\Old     |
+| File Name  | Last Modified       | UTC Offset | Size (bytes) | MD5     | Copies | Location 1     | Location 2        | Location 3 |
+|------------|---------------------|------------|--------------|---------|--------|----------------|-------------------|------------|
+| report.doc | 2024-05-17 10:30:00 | +10:00     | 48128        | 9A0F... | 3      | E:\Old         | D:\Backup\Docs    | D:\Docs\2024 |
 
 - Each `Location` column holds the full folder path of one copy; there are as
-  many columns as the file with the most copies needs.
+  many columns as the file with the most copies needs. *Location 1* is the least
+  nested copy (fewest folders deep) and the last one the most nested, so the
+  copy furthest right is usually the one to delete; copies equally deep are in
+  alphabetical order.
 - The header row is frozen and has filters; *Last Modified* is a real Excel
   date; *Size* and *Copies* are numbers.
-- Rows are sorted by file name, then saved date, then MD5; locations are sorted
-  by path. Where copies' names differ only in case, the row shows the name of
+- *Last Modified* is local time on the computer that ran the scan, and *UTC
+  Offset* its difference from UTC at that date (daylight saving included), so
+  the moment each file was saved is known in any time zone.
+- Rows are sorted by file name, then saved date, then MD5; locations from the
+  least to the most nested, as above. Where copies' names differ only in case, the row shows the name of
   the copy in the alphabetically first folder.
 - A report saved inside the scanned folder is not counted as a file.
 
@@ -262,6 +292,31 @@ folders you point it at, wherever they live.
 - Folder links (symlinks and junctions) are not followed, to avoid loops.
   Cloud-synced folders are followed.
 
+## Limits and edge cases
+
+Each of these is covered by an automated test on Windows, Linux and macOS
+(see [Running the tests](#running-the-tests)).
+
+| Situation | What happens |
+|---|---|
+| Paths longer than 260 characters | Scanned and validated normally by PowerShell 7 and Python. Windows PowerShell 5.1 may be unable to reach them; it then says so in a warning and carries on. Python on Windows needs the system's *long paths* setting (`LongPathsEnabled`), which current Windows versions usually have on. |
+| Files larger than 4 GB | Fully supported, including their sizes in the report. |
+| Hidden and system files and folders | Included, like any other file. |
+| Saved dates before 1970 or after 2038 | Fully supported. |
+| Copies on FAT/exFAT drives (USB sticks, memory cards) | These store saved times in 2-second steps, so a copy of a file saved at 10:30:01 shows 10:30:02 there. Such copies are **not** matched: the saved date must agree to the second. |
+| Daylight saving time | Makes no difference: dates are compared as instants. |
+| Changing the computer's time zone between the scan and `-Validate` | Makes no difference: the *UTC Offset* column lets validation compare instants. (Reports made before that column are compared by local time; validate those in the time zone of the scan.) |
+| A folder that is deleted, or cannot be read, during the scan | Reported as a warning and skipped; the scan carries on. |
+| A file that cannot be read (permissions, locked by another program) | Reported as a warning and left out; its other copies are still matched. |
+| The scanned folder is itself a symbolic link | Scanned through the link; locations show the link's path. |
+| Two files in one folder whose names differ only in case (Linux, or case-sensitive folders on Windows) | Reported as duplicates; the row lists that folder twice. |
+| Names Windows reserves or trims (`NUL`, `PRN.txt`, names ending in a dot or space) | Ordinary names on Linux and macOS. On Windows such files can only be made by special tools; the scan never fails on them, but may skip them with a warning, and `-Validate` keeps such copies rather than guess. |
+| Excel limits | A file with more than 16,378 copies, more than 1,048,575 duplicated files, or a cell longer than 32,767 characters stops the tool with an error, rather than writing a report Excel would reject or cut short. |
+| Reports opened and saved in Excel or LibreOffice | Still read and validated (shared strings and re-numbered sheet parts are handled). |
+
+Some situations need real equipment and are checked by hand before a release:
+see [tests/MANUAL-TESTS.md](tests/MANUAL-TESTS.md).
+
 ## Performance
 
 Reading files is what takes the time, not the MD5 calculation: one CPU core
@@ -270,16 +325,31 @@ around reading as little as possible, and these options help further:
 
 | What | Effect | When to use it |
 |---|---|---|
-| Built-in pre-filter | Files that differ in name, saved date or size are never read. | Always on. |
-| `-ThrottleLimit 4` to `8` | Hashes several files at once, hiding per-file latency. Often 2-4x faster. | SSDs, network shares, cloud folders. Keep `1` for a single spinning hard disk, where parallel reads cause seeking. |
+| Built-in pre-filter | Files that differ in name, saved date or size are never read. The size and saved date of a file whose name no other file has are never even looked up (on Linux, macOS and network drives each lookup is a request). | Always on. |
+| Large files compared by their start | Files of 16 MB or more that share a name, saved date and size are first compared by the MD5 of their first 1 MB; only those that still match are read in full. True duplicates cost at most 1/16 more reading. | Always on. |
+| Duplicate folders narrowed by name | Only folders whose name another folder has (and the folders below them) are fingerprinted and have their files looked up. | Always on with `-IncludeFolders`. |
+| `-ThrottleLimit 4` to `8` | Lists several folders and hashes several files at once, hiding per-request latency. Often 2-4x faster, more on slow networks. Scans of a network share or drive use 4 unless told otherwise. | SSDs, network shares, cloud folders. Keep `1` for a single spinning hard disk, where parallel reads cause seeking. |
+| `-Exclude` / `-MinimumSize` | Left-out folders are never listed, and small files are never compared. | Caches, version-control folders, thumbnails, tiny files. |
+| Rescanning to the same report | Files the report lists whose size and saved date have not changed keep their recorded MD5 instead of being read again (`-Rehash` to read them all). | Repeated scans of large libraries or shares. |
 | `-Validate` instead of a rescan | Checks only the files already in the report, without reading them. | After deleting or moving duplicates. |
 | `-SkipCloudOnly` | Avoids downloading online-only files. | Large cloud libraries on a slow connection. |
 | Run it on the file server | Local disk reads instead of network transfers. | Very large network shares. |
 | Scan the narrowest folder | Fewer files to list. | Always worthwhile. |
 
-Also built in: large read buffers with sequential-read hints, and plain loops
-instead of per-file script blocks when grouping (this matters on trees with
-millions of files).
+Also built in: each folder is listed once, and its files and sub folders are
+sorted and split by .NET in one step; large reads with sequential-read
+hints, into a buffer no larger than the file; plain loops
+instead of per-file script blocks when grouping and sorting; a progress display
+redrawn a few times a second rather than per file; parallel hashing through a
+fixed set of workers rather than a new job per file (which matters when there
+are many small files); and a report writer and reader that handle hundreds of
+thousands of rows. A tree of 10,000 files, all duplicated, is scanned, saved
+and validated in a few seconds.
+
+The PowerShell module's per-file loops (grouping names, listing folders, hashing,
+reading the report, checking copies) run as compiled .NET code, which the module
+builds from `src/DuplicateFinder.cs` when it is imported (about half a second, once
+per PowerShell session); no separate download or install is involved.
 
 GPU/CUDA acceleration would not help: MD5 cannot be split across GPU cores
 within a single file, the bottleneck is reading the data, and copying it to
@@ -318,3 +388,12 @@ The tests also run on every push via GitHub Actions (Windows, Linux, macOS,
 and Windows PowerShell 5.1), together with the Python tests and a parity test
 that runs both versions on the same folders, with and without parallel
 hashing and validation, and requires identical reports.
+
+The *Edge cases* tests cover the situations under
+[Limits and edge cases](#limits-and-edge-cases). Some need particular
+conditions and are skipped without them: a file system that keeps case
+(Linux), symbolic links, a non-administrator account for unreadable files,
+Linux or macOS for 4 GB sparse files and time zone changes, and LibreOffice
+Calc (`soffice`) for the round trip through another spreadsheet program. CI
+installs LibreOffice on Linux and sets `FIND_DUPLICATES_REQUIRE_LIBREOFFICE=1`
+so that test cannot be skipped there.

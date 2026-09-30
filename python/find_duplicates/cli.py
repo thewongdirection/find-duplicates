@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -12,9 +13,12 @@ from typing import Dict, List, Optional, TextIO
 
 from .folders import find_duplicate_folders
 from .matcher import MAX_THROTTLE_LIMIT, MIN_THROTTLE_LIMIT, find_duplicate_files
-from .scanner import FolderRecord, full_path, iter_files
-from .validate import validate_report
-from .xlsx import export_duplicate_report
+from .names import check_name_pattern
+from .scanner import FolderRecord, default_throttle_limit, full_path, iter_files
+from .validate import previous_md5, validate_report
+from .xlsx import ScanSettings, export_duplicate_report
+
+log = logging.getLogger("find_duplicates")
 
 DEFAULT_OUTPUT = "duplicates.xlsx"
 PROGRESS_INTERVAL_SECONDS = 0.25
@@ -27,8 +31,10 @@ SCAN (default): two files are duplicates only when ALL three of these match:
 file name (case-insensitive), saved date (last modified time, to the whole
 second) and MD5 hash of the contents. MD5 is only calculated for files whose
 name and saved date already match another file (and whose size matches too),
-so most files are never read. Files of 0 bytes are included unless
---ignore-empty-files is used. A "Rules" sheet in the report states the
+so most files are never read. When the report already exists, unchanged files
+keep the MD5 recorded there. Files of 0 bytes are included unless
+--ignore-empty-files is used. --exclude leaves files and folders out by name,
+and --minimum-size leaves small files out. A "Rules" sheet in the report states the
 matching rules in plain words.
 
 DUPLICATE FOLDERS (--folders): also finds folders with the same name and
@@ -56,6 +62,7 @@ examples:
   python -m find_duplicates \\\\server\\share C:\\Reports\\share-dupes.xlsx -j 8
   python -m find_duplicates "%OneDrive%" --skip-cloud-only
   python -m find_duplicates D:\\Backups --folders
+  python -m find_duplicates D:\\Photos --exclude Thumbs.db --exclude "*.tmp" --minimum-size 100KB
   python -m find_duplicates --validate C:\\Reports\\share-dupes.xlsx --dry-run
 """
 
@@ -98,6 +105,33 @@ def _throttle_limit(text: str) -> int:
     return value
 
 
+_SIZE = re.compile(r"([0-9]+(?:\.[0-9]+)?)([KMGTP]B)?", re.IGNORECASE)
+MAX_SIZE = 2**63 - 1  # the largest -MinimumSize PowerShell takes ([long])
+_SIZE_UNITS = {"": 1, "KB": 1 << 10, "MB": 1 << 20, "GB": 1 << 30, "TB": 1 << 40, "PB": 1 << 50}
+
+
+def _size(text: str) -> int:
+    """A size in bytes: a number, optionally followed by KB, MB, GB, TB or PB (1024-based),
+    rounded to a whole number of bytes (as ConvertFrom-SizeText in PowerShell)."""
+    match = _SIZE.fullmatch(text)
+    if not match:
+        raise argparse.ArgumentTypeError("must be a number of bytes, optionally followed by KB, MB, GB, TB or PB")
+    size = round(float(match.group(1)) * _SIZE_UNITS[(match.group(2) or "").upper()])
+    if size > MAX_SIZE:
+        raise argparse.ArgumentTypeError(f"must be at most {MAX_SIZE} bytes")
+    return size
+
+
+def _pattern(text: str) -> str:
+    if not text:
+        raise argparse.ArgumentTypeError("cannot be empty")
+    try:
+        check_name_pattern(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return text
+
+
 def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="find-duplicates",
@@ -127,10 +161,11 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         "-j",
         "--throttle-limit",
         type=_throttle_limit,
-        default=1,
+        default=None,
         metavar="N",
-        help="How many files to hash at the same time (1-64, default 1). Try 4-8 for SSDs, "
-        "network shares and cloud folders; keep 1 for a single spinning hard disk.",
+        help="How many files to hash, and folders to list or check, at the same time (1-64). Default: 4 when "
+        "scanning a network share or network drive, 1 otherwise. Try 4-8 for SSDs, network shares and cloud "
+        "folders; keep 1 for a single spinning hard disk. Also speeds up --validate (default 1).",
     )
     parser.add_argument(
         "--ignore-empty-files",
@@ -139,7 +174,32 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         "Duplicate folders still compare every file.",
     )
     parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        type=_pattern,
+        metavar="PATTERN",
+        help="Leave files and folders with this name out (repeat for more names). * stands for any characters "
+        "and ? for any one character; upper/lower case is ignored. Patterns match names, not paths. Left-out "
+        "folders are not scanned, and duplicate folders are compared as if left-out files and folders were not "
+        "there. Recorded in the report, so --validate leaves the same names out.",
+    )
+    parser.add_argument(
+        "--minimum-size",
+        type=_size,
+        default=None,
+        metavar="SIZE",
+        help="Leave files smaller than this many bytes out of the duplicate files, for example 1MB. "
+        "Duplicate folders still compare every file. Recorded in the report.",
+    )
+    parser.add_argument(
         "--folders", action="store_true", help='Also find duplicate folders and save them on the "Duplicate Folders" sheet.'
+    )
+    parser.add_argument(
+        "--rehash",
+        action="store_true",
+        help="Read every candidate file again. Without it, when the report already exists (from an earlier "
+        "scan), files it lists whose size and saved date have not changed keep the MD5 hash recorded there.",
     )
     parser.add_argument("--validate", action="store_true", help="Re-check an existing report instead of scanning.")
     parser.add_argument(
@@ -149,10 +209,12 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     args = parser.parse_args(argv)
 
     if args.validate:
-        if args.skip_cloud_only or args.throttle_limit != 1 or args.folders or args.ignore_empty_files:
+        scan_only = (args.skip_cloud_only, args.folders, args.ignore_empty_files, args.rehash, args.exclude,
+                     args.minimum_size is not None)
+        if any(scan_only):
             parser.error(
-                "--skip-cloud-only, --throttle-limit, --folders and --ignore-empty-files only apply to a scan, "
-                "not to --validate"
+                "--skip-cloud-only, --folders, --ignore-empty-files, --rehash, --exclude and --minimum-size only apply "
+                "to a scan, not to --validate"
             )
         if len([value for value in (args.path, args.output, args.output_option) if value]) > 1:
             parser.error("--validate takes a single report")
@@ -167,13 +229,13 @@ def report_path(output: Optional[str]) -> str:
     return os.path.abspath(output)
 
 
-def _validate(report: str, dry_run: bool) -> int:
+def _validate(report: str, dry_run: bool, throttle_limit: int = 1) -> int:
     progress = ProgressLine()
     print(f"Validating '{report}' ...")
     try:
         result = validate_report(
-            report, dry_run=dry_run,
-            on_row=lambda name, done, total: progress.show(f"Row {done} of {total}  {name}"),
+            report, dry_run=dry_run, throttle_limit=throttle_limit,
+            on_progress=lambda name, done, total: progress.show(f"Checked {done} of {total}  {name}"),
         )
     except (OSError, ValueError) as exc:
         progress.clear()
@@ -202,11 +264,14 @@ def _scan(
     folder: str,
     report: str,
     skip_cloud_only: bool,
-    throttle_limit: int,
+    throttle_limit: Optional[int],
     include_folders: bool,
     ignore_empty_files: bool,
     dry_run: bool,
+    rehash: bool = False,
+    settings: Optional[ScanSettings] = None,
 ) -> int:
+    settings = settings or ScanSettings()
     scan_root = full_path(folder)
     if not os.path.isdir(scan_root):
         print(f"error: '{folder}' is not a folder.", file=sys.stderr)
@@ -214,6 +279,12 @@ def _scan(
 
     progress = ProgressLine()
     print(f"Scanning '{scan_root}' ...")
+    if throttle_limit is None:
+        throttle_limit = default_throttle_limit(scan_root)
+        if throttle_limit > 1:
+            print(f"On a network drive: working on {throttle_limit} folders and files at a time (-j to change).")
+    if settings.exclude_names:
+        print(f"Leaving out files and folders named: {', '.join(settings.exclude_names)}")
     folder_records: Optional[List[FolderRecord]] = [] if include_folders else None
     files = list(
         iter_files(
@@ -221,6 +292,8 @@ def _scan(
             exclude=[report],
             on_folder=lambda path, folders, found: progress.show(f"Folders: {folders}  Files: {found}  {path}"),
             folders=folder_records,
+            throttle_limit=throttle_limit,
+            exclude_names=settings.exclude_names,
         )
     )
     progress.clear()
@@ -228,13 +301,26 @@ def _scan(
 
     # Hashes are shared so that folder matching never reads a file twice.
     md5_cache: Dict[str, str] = {}
+
+    # An earlier report's hashes are reused for files that have not changed since.
+    if not rehash and os.path.isfile(report):
+        try:
+            previous = previous_md5(report, files)
+        except (OSError, ValueError) as exc:
+            log.warning("Not reusing MD5 hashes from '%s': %s", report, exc)
+        else:
+            md5_cache.update(previous)
+            if previous:
+                print(f"Reusing {len(previous)} MD5 hashes from the previous report (--rehash to read every file again).")
     options = dict(
         skip_cloud_only=skip_cloud_only,
         throttle_limit=throttle_limit,
         md5_cache=md5_cache,
         on_hash=lambda path, done, total: progress.show(f"Comparing MD5 {done}/{total}  {path}"),
     )
-    duplicates = find_duplicate_files(files, ignore_empty_files=ignore_empty_files, **options)
+    duplicates = find_duplicate_files(
+        files, ignore_empty_files=ignore_empty_files, minimum_size=settings.minimum_size, **options
+    )
     progress.clear()
     copies = sum(dup.count for dup in duplicates)
     print(f"Found {len(duplicates)} duplicated files ({copies} copies in total).")
@@ -250,7 +336,9 @@ def _scan(
     if dry_run:
         print(f"Report not saved (--dry-run): '{report}'.")
     else:
-        export_duplicate_report(duplicates, report, duplicate_folders)
+        # The smallest file listed, recorded in the report: --ignore-empty-files means 1 byte.
+        smallest = max(settings.minimum_size, 1) if ignore_empty_files else settings.minimum_size
+        export_duplicate_report(duplicates, report, duplicate_folders, ScanSettings(settings.exclude_names, smallest))
         print(f"Report saved to '{report}'.")
     return 0
 
@@ -275,7 +363,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     if args.validate:
-        return _validate(report_path(args.output_option or args.path or args.output), args.dry_run)
+        return _validate(
+            report_path(args.output_option or args.path or args.output), args.dry_run, args.throttle_limit or 1
+        )
     return _scan(
         args.path or ".",
         report_path(args.output_option or args.output),
@@ -284,4 +374,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.folders,
         args.ignore_empty_files,
         args.dry_run,
+        args.rehash,
+        ScanSettings(args.exclude, args.minimum_size or 0),
     )

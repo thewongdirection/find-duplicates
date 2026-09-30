@@ -25,7 +25,7 @@ BeforeAll {
         $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $full)
         [System.IO.File]::WriteAllText($full, $Content)
         [System.IO.File]::SetLastWriteTimeUtc($full, $SavedUtc)
-        Get-Item -LiteralPath $full
+        Get-Item -LiteralPath $full -Force  # -Force: names starting with a dot are hidden on Linux and macOS
     }
 
     function Add-TestRoot {
@@ -104,6 +104,16 @@ Describe 'Get-FileInventory' {
         $found.FullName | Should -Be @($keep.FullName)
     }
 
+    It 'leaves out an excluded file when the folder path ends in a separator' {
+        $root = Add-TestRoot
+        $keep = Add-TestFile $root 'keep.txt'
+        $skip = Add-TestFile $root 'duplicates.xlsx'
+
+        $found = @(Get-FileInventory -Path ($root + [System.IO.Path]::DirectorySeparatorChar) -ExcludeFile $skip.FullName)
+
+        $found.Name | Should -Be @($keep.Name)
+    }
+
     It 'lists folders and files in name order whatever order they were created in' {
         $root = Add-TestRoot
         foreach ($name in 'z', 'a', 'm') { $null = Add-TestFile $root "$name/$name.txt" }
@@ -150,9 +160,157 @@ Describe 'Get-FileInventory' {
             Where-Object { $_ -is [System.Management.Automation.VerboseRecord] }
         $verbose.Message | Should -Contain "Scanning $(Join-Path $root 'sub')"
     }
+
+    It 'lists several folders at a time and returns the same files in the same order' {
+        $root = Add-TestRoot
+        foreach ($path in 'b/x.txt', 'a/y.txt', 'a/deep/er/z.txt', 'c/w.txt', 'a/b.txt', 'top.txt') { $null = Add-TestFile $root $path }
+        $null = New-Item -ItemType Directory -Path (Join-Path $root 'a/empty')
+        $link = Join-Path $root 'a/loop'
+        $linked = $true
+        try { $null = New-Item -ItemType SymbolicLink -Path $link -Target $root -ErrorAction Stop }
+        catch { $linked = $false }  # the rest is still worth checking
+
+        try {
+            $one = [System.Collections.Generic.List[object]]::new()
+            $many = [System.Collections.Generic.List[object]]::new()
+            $sequential = @(Get-FileInventory -Path $root -FolderInfo $one)
+            $parallel = @(Get-FileInventory -Path $root -FolderInfo $many -ThrottleLimit 4)
+
+            $parallel.FullName | Should -Be $sequential.FullName
+            @($many | ForEach-Object { "$($_.Path)|$($_.Readable)" }) | Should -Be @($one | ForEach-Object { "$($_.Path)|$($_.Readable)" })
+        }
+        finally {
+            if ($linked) { [System.IO.Directory]::Delete($link) }  # the link only; Pester's cleanup would loop
+        }
+    }
+
+    It 'leaves out files and folders whose names match -ExcludeName, ignoring case' {
+        $root = Add-TestRoot
+        foreach ($path in 'keep.txt', 'Thumbs.db', 'a.TMP', '.git/obj', 'sub/.Git/x', 'sub/keep2.txt') { $null = Add-TestFile $root $path }
+        $info = [System.Collections.Generic.List[object]]::new()
+
+        $found = @(Get-FileInventory -Path $root -ExcludeName 'thumbs.db', '*.tmp', '.GIT' -FolderInfo $info)
+
+        $found.Name | Should -Be @('keep.txt', 'keep2.txt')
+        @($info | Where-Object { $_.Path -like '*git*' }).Count | Should -Be 0 -Because 'left-out folders are not listed'
+        @($info | Where-Object { -not $_.Readable }).Count | Should -Be 0 -Because 'leaving names out does not make a folder unreadable'
+    }
+
+    It 'treats characters other than * and ? in -ExcludeName literally' {
+        $root = Add-TestRoot
+        foreach ($name in 'a.b', 'aXb', '[ab]', 'a', 'file(1).txt', 'x+y') { $null = Add-TestFile $root $name }
+
+        $found = @(Get-FileInventory -Path $root -ExcludeName 'a.b', '[ab]', '?', 'x+y')
+
+        ($found.Name | Sort-Object) | Should -Be @('aXb', 'file(1).txt')
+    }
+
+    It 'matches -ExcludeName patterns against the whole name' {
+        $root = Add-TestRoot
+        foreach ($name in 'ab', 'x.tmp.bak', 'y.tmp', 'abab', 'aba') { $null = Add-TestFile $root $name }
+
+        $found = @(Get-FileInventory -Path $root -ExcludeName 'a', '*.tmp', '*ab*ab')
+
+        ($found.Name | Sort-Object) | Should -Be @('ab', 'aba', 'x.tmp.bak')
+    }
+
+    It 'matches a pattern with many stars quickly' {
+        $root = Add-TestRoot
+        $null = Add-TestFile $root ('a' * 200)
+        $timer = [System.Diagnostics.Stopwatch]::StartNew()
+
+        $found = @(Get-FileInventory -Path $root -ExcludeName '*a*a*a*a*a*a*a*a*b')
+
+        $found.Count | Should -Be 1
+        $timer.Elapsed.TotalSeconds | Should -BeLessThan 5 -Because 'patterns must never backtrack exponentially'
+    }
+
+    It 'rejects an -ExcludeName pattern holding / or \' {
+        { Get-FileInventory -Path (Add-TestRoot) -ExcludeName 'photos/raw' } | Should -Throw '*not paths*'
+        { Get-FileInventory -Path (Add-TestRoot) -ExcludeName 'photos\raw' } | Should -Throw '*not paths*'
+    }
+
+    It 'leaves out a folder link whose name matches -ExcludeName without marking its folder unreadable' {
+        $root = Add-TestRoot
+        $null = Add-TestFile $root 'a/x.txt'
+        $link = Join-Path $root 'a/.git'
+        try { $null = New-Item -ItemType SymbolicLink -Path $link -Target $root -ErrorAction Stop }
+        catch { Set-ItResult -Skipped -Because "symbolic links cannot be created here: $_"; return }
+
+        try {
+            $info = [System.Collections.Generic.List[object]]::new()
+            $null = @(Get-FileInventory -Path $root -ExcludeName '.git' -FolderInfo $info)
+            @($info | Where-Object { -not $_.Readable }).Count | Should -Be 0
+        }
+        finally { [System.IO.Directory]::Delete($link) }  # the link only; Pester's cleanup would loop
+    }
+
+    It 'matches -ExcludeName patterns in any Unicode form, and a character beyond U+FFFF with one ?' {
+        $root = Add-TestRoot
+        $composed = 'caf' + [char] 0xE9 + '.txt'             # e-acute as one character
+        $decomposed = 'CAFE' + [char] 0x301 + '.*'           # E + combining acute, upper case
+        $emoji = 'x' + [char]::ConvertFromUtf32(0x1F600) + '.txt'
+        foreach ($name in $composed, $emoji, 'keep.txt') { $null = Add-TestFile $root $name }
+
+        (Get-FileInventory -Path $root -ExcludeName $decomposed, 'x?.txt').Name | Should -Be 'keep.txt'
+    }
+
+    It 'does not match a character beyond U+FFFF with two ?' {
+        $root = Add-TestRoot
+        $null = Add-TestFile $root ('x' + [char]::ConvertFromUtf32(0x1F600) + '.txt')
+
+        @(Get-FileInventory -Path $root -ExcludeName 'x??.txt').Count | Should -Be 1
+    }
+
+    It 'leaves out the same names listing several folders at a time' {
+        $root = Add-TestRoot
+        foreach ($path in 'a/x.txt', 'a/cache/y.txt', 'b/cache/deep/z.txt', 'b/w.tmp', 'c/v.txt') { $null = Add-TestFile $root $path }
+        $one = [System.Collections.Generic.List[object]]::new()
+        $many = [System.Collections.Generic.List[object]]::new()
+
+        $sequential = @(Get-FileInventory -Path $root -ExcludeName 'cache', '*.tmp' -FolderInfo $one)
+        $parallel = @(Get-FileInventory -Path $root -ExcludeName 'cache', '*.tmp' -FolderInfo $many -ThrottleLimit 4)
+
+        $sequential.Name | Should -Be @('x.txt', 'v.txt')
+        $parallel.FullName | Should -Be $sequential.FullName
+        @($many.Path) | Should -Be @($one.Path)
+    }
 }
 
 Describe 'Folder and cloud file detection' {
+    It 'treats a local folder as not on a network drive' {
+        Test-NetworkDrive -Path (Add-TestRoot) | Should -BeFalse
+    }
+
+    It 'treats a UNC path as a network drive' {
+        if (-not $script:OnWindows) { Set-ItResult -Skipped -Because 'UNC paths are Windows-only'; return }
+        Test-NetworkDrive -Path '\\server\share\folder' | Should -BeTrue
+    }
+
+    It 'treats the long-path forms of a path as what they point to' {
+        if (-not $script:OnWindows) { Set-ItResult -Skipped -Because 'long-path forms are Windows-only'; return }
+        Test-NetworkDrive -Path '\\?\UNC\server\share\folder' | Should -BeTrue
+        Test-NetworkDrive -Path ('\\?\' + (Add-TestRoot)) | Should -BeFalse
+    }
+
+    It 'recognises the file system holding a path' {
+        InModuleScope DuplicateFinder {
+            $mounts = @(@('/', 'ext4'), @('/mnt/share', 'cifs'), @('/mnt/shared', 'nfs'), @('/mnt/my share', 'nfs4'))
+            Get-MountType -Path '/mnt/share/photos' -Mount $mounts | Should -Be 'cifs'
+            Get-MountType -Path '/mnt/shared2' -Mount $mounts | Should -Be 'ext4' -Because 'a longer name is not inside the mount'
+            Get-MountType -Path '/mnt/my share/a' -Mount $mounts | Should -Be 'nfs4'
+            $script:NetworkFileSystems.Contains('cifs') | Should -BeTrue
+            $script:NetworkFileSystems.Contains('ext4') | Should -BeFalse
+        }
+    }
+
+    It 'uses 4 at a time by default on a network drive and 1 elsewhere' {
+        Mock -ModuleName DuplicateFinder Test-NetworkDrive { $true }
+        Get-DefaultThrottleLimit -Path (Add-TestRoot) | Should -Be 4
+        Mock -ModuleName DuplicateFinder Test-NetworkDrive { $false }
+        Get-DefaultThrottleLimit -Path (Add-TestRoot) | Should -Be 1
+    }
+
     It 'follows a <Case>' -ForEach @(
         @{ Case = 'plain folder'; Attributes = [System.IO.FileAttributes]::Directory; LinkType = $null }
         @{ Case = 'cloud-synced (OneDrive) folder'
@@ -287,6 +445,24 @@ Describe 'Find-DuplicateFile' {
         (Find-DuplicateFile -File $scanned).FileName | Should -BeExactly 'Photo.JPG'
     }
 
+    It 'orders each row''s locations from the least to the most nested' {
+        $root = Add-TestRoot
+        $files = @(foreach ($folder in 'z', 'a/b/c', 'a/b', 'B', 'a/C/c') { Add-TestFile $root "$folder/x.txt" })
+
+        $result = @(Find-DuplicateFile -File $files)
+
+        $expected = @('B', 'z', 'a/b', 'a/b/c', 'a/C/c') | ForEach-Object { [System.IO.Path]::GetFullPath((Join-Path $root $_)) }
+        $result[0].Folders | Should -BeExactly $expected -Because 'equally deep folders keep their alphabetical order'
+    }
+
+    It 'counts how many folders deep a path is' {
+        InModuleScope DuplicateFinder {
+            Get-PathDepth -Path 'C:\a\b' | Should -Be 3
+            Get-PathDepth -Path '/home/a/' | Should -Be 2
+            Get-PathDepth -Path '\\server\share\a' | Should -Be 3
+        }
+    }
+
     It 'includes files of 0 bytes by default' {
         $root = Add-TestRoot
         $files = @(
@@ -307,8 +483,43 @@ Describe 'Find-DuplicateFile' {
         (Find-DuplicateFile -File $files -IgnoreEmptyFiles).FileName | Should -Be @('full.txt')
     }
 
+    It 'leaves files smaller than -MinimumSize out' {
+        $root = Add-TestRoot
+        $files = @(
+            foreach ($folder in 'a', 'b') {
+                Add-TestFile $root "$folder/small.txt" -Content ('s' * 9)
+                Add-TestFile $root "$folder/exact.txt" -Content ('e' * 10)
+                Add-TestFile $root "$folder/large.txt" -Content ('l' * 11)
+            }
+        )
+        (Find-DuplicateFile -File $files -MinimumSize 10).FileName | Should -Be @('exact.txt', 'large.txt')
+    }
+
     It 'returns nothing for an empty list' {
         @(Find-DuplicateFile -File @()).Count | Should -Be 0
+    }
+
+    It 'never reads the size or saved date of a file whose name no other file has' {
+        $root = Add-TestRoot
+        $files = @(Add-TestFile $root 'a/x.txt'; Add-TestFile $root 'b/x.txt')
+        # Never created: reading its size or saved date would fail with a warning.
+        $unique = [System.IO.FileInfo] (Join-Path $root 'c/unique.txt')
+
+        $result = @(Find-DuplicateFile -File ($files + $unique) -WarningVariable warnings -WarningAction SilentlyContinue)
+
+        @($warnings).Count | Should -Be 0
+        $result.Count | Should -Be 1
+    }
+
+    It 'skips a file that has gone since the scan, with a warning' {
+        $root = Add-TestRoot
+        $files = @(Add-TestFile $root 'a/x.txt'; Add-TestFile $root 'b/x.txt')
+        $gone = [System.IO.FileInfo] (Join-Path $root 'c/x.txt')  # listed by the scan, deleted before it was compared
+
+        $result = @(Find-DuplicateFile -File ($files + $gone) -WarningVariable warnings -WarningAction SilentlyContinue)
+
+        "$warnings" | Should -BeLike "Skipping '$($gone.FullName)'*"
+        $result[0].Count | Should -Be 2
     }
 
     Context 'MD5 is only calculated when name and saved date already match' {
@@ -405,6 +616,60 @@ Describe 'Find-DuplicateFile' {
         }
     }
 
+    It 'computes the MD5 of the start of a file' {
+        $path = (Add-TestFile (Add-TestRoot) 'abcdef.txt' -Content 'abcdef').FullName
+        InModuleScope DuplicateFinder -Parameters @{ Path = $path } {
+            Get-FileMd5 -Path $Path -Limit 3 | Should -BeExactly '900150983CD24FB0D6963F7D28E17F72'
+        }
+    }
+
+    Context 'Large files compared by their start first' {
+        BeforeAll {
+            function Add-LargeFile {
+                # A 3 MB file of zeros with one byte set, saved at the same date as the others.
+                param([string] $Root, [string] $RelativePath, [int] $At, [byte] $Value)
+                $full = Join-Path $Root $RelativePath
+                $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $full)
+                $bytes = [byte[]]::new(3MB)
+                $bytes[$At] = $Value
+                [System.IO.File]::WriteAllBytes($full, $bytes)
+                [System.IO.File]::SetLastWriteTimeUtc($full, $script:Saved)
+            }
+            # Large means 2 MB here, so that the test files stay small.
+            InModuleScope DuplicateFinder { $script:SavedFirstBytesMinSize = $script:FirstBytesMinSize; $script:FirstBytesMinSize = 2MB }
+        }
+        AfterAll {
+            InModuleScope DuplicateFinder { $script:FirstBytesMinSize = $script:SavedFirstBytesMinSize }
+        }
+
+        It 'reads large files in full only when their start is the same (<Limit> at a time)' -ForEach @(
+            @{ Limit = 1 }
+            @{ Limit = 4 }
+        ) {
+            $root = Add-TestRoot
+            Add-LargeFile $root 'a/same.bin' 0 1; Add-LargeFile $root 'b/same.bin' 0 1
+            Add-LargeFile $root 'a/start.bin' 0 1; Add-LargeFile $root 'b/start.bin' 0 2
+            Add-LargeFile $root 'a/end.bin' 2MB 1; Add-LargeFile $root 'b/end.bin' 2MB 2
+            $cache = [System.Collections.Generic.Dictionary[string, string]]::new()
+
+            $result = @(Find-DuplicateFile -File @(Get-FileInventory -Path $root) -Md5Cache $cache -ThrottleLimit $Limit)
+
+            $result.FileName | Should -Be @('same.bin')
+            @($cache.Keys | ForEach-Object { Split-Path -Leaf $_ } | Sort-Object) |
+                Should -Be @('end.bin', 'end.bin', 'same.bin', 'same.bin') -Because 'files that differ at the start are never read in full'
+        }
+
+        It 'does not compare the start of large files the previous report already hashed' {
+            $root = Add-TestRoot
+            Add-LargeFile $root 'a/start.bin' 0 1; Add-LargeFile $root 'b/start.bin' 0 2
+            $files = @(Get-FileInventory -Path $root)
+            $cache = [System.Collections.Generic.Dictionary[string, string]]::new()
+            foreach ($f in $files) { $cache[$f.FullName] = '0123456789ABCDEF0123456789ABCDEF' }
+
+            (Find-DuplicateFile -File $files -Md5Cache $cache).FileName | Should -Be 'start.bin' -Because 'the recorded hashes are trusted'
+        }
+    }
+
     Context 'Hashing several files at a time (-ThrottleLimit)' {
         BeforeAll {
             $script:ParallelRoot = Add-TestRoot
@@ -463,6 +728,7 @@ Describe 'Export-DuplicateReport' {
         $script:Sets = @(
             [pscustomobject] @{
                 FileName = 'a & b <1>.txt'; LastWriteTime = [datetime]::new(2024, 1, 2, 3, 4, 5)
+                UtcOffset = [TimeSpan]::FromMinutes(330)
                 SizeBytes = 1234; MD5 = 'AAAA'; Count = 3
                 Folders = [string[]] @('C:\one', 'C:\two & more', 'D:\three')
             }
@@ -480,13 +746,15 @@ Describe 'Export-DuplicateReport' {
 
         $rows = @(Read-Worksheet $out)
         $rows.Count | Should -Be 3
-        $rows[0] | Should -Be @('File Name', 'Last Modified', 'Size (bytes)', 'MD5', 'Copies', 'Location 1', 'Location 2', 'Location 3')
+        $rows[0] | Should -Be @('File Name', 'Last Modified', 'UTC Offset', 'Size (bytes)', 'MD5', 'Copies', 'Location 1', 'Location 2', 'Location 3')
         $rows[1][0] | Should -BeExactly 'a & b <1>.txt'
-        $rows[1][2] | Should -Be '1234'
-        $rows[1][3] | Should -Be 'AAAA'
-        $rows[1][4] | Should -Be '3'
-        $rows[1][5..7] | Should -Be @('C:\one', 'C:\two & more', 'D:\three')
-        $rows[2][5..6] | Should -Be @('C:\x', "C:\bad$([char] 0xFFFD)name")
+        $rows[1][2] | Should -Be '+05:30'
+        $rows[1][3] | Should -Be '1234'
+        $rows[1][4] | Should -Be 'AAAA'
+        $rows[1][5] | Should -Be '3'
+        $rows[1][6..8] | Should -Be @('C:\one', 'C:\two & more', 'D:\three')
+        $rows[2][2] | Should -Match '^[+-]\d{2}:\d{2}' -Because "a set without an offset gets this computer's"
+        $rows[2][6..7] | Should -Be @('C:\x', "C:\bad$([char] 0xFFFD)name")
     }
 
     It 'stores the saved date as a real Excel date' {
@@ -525,6 +793,19 @@ Describe 'Export-DuplicateReport' {
         $rules | Should -Contain "Sheet 'Duplicates': duplicate files"
         @($rules | Where-Object { $_ -like 'A file is listed when another file has ALL of*' }).Count | Should -Be 1
         $rules | Should -Not -Contain "Sheet 'Duplicate Folders': duplicate folders" -Because 'no folder sheet, no folder rules'
+        $rules | Should -Not -Contain 'Scan settings' -Because 'the scan left nothing out'
+    }
+
+    It 'records the scan settings on the Rules sheet' {
+        $out = Join-Path (Add-TestRoot) 'report.xlsx'
+        Export-DuplicateReport -DuplicateSet $script:Sets -Path $out -ExcludeName '*.tmp', 'Thumbs.db' -MinimumSize 1024
+
+        $rows = @(Read-Worksheet $out -Part 'xl/worksheets/sheet2.xml' -AllRows)
+        $rows.ForEach({ $_[0] }) | Should -Contain 'Scan settings'
+        $exclude = @($rows | Where-Object { $_[0] -eq 'Names left out (-Exclude; Python: --exclude)' })
+        $exclude[0][1..2] | Should -Be @('*.tmp', 'Thumbs.db')
+        $size = @($rows | Where-Object { $_[0] -eq 'Smallest file listed, in bytes (-MinimumSize or -IgnoreEmptyFiles; Python: --minimum-size or --ignore-empty-files)' })
+        $size[0][1] | Should -Be '1024'
     }
 
     It 'starts the table on row 1' {
@@ -539,7 +820,7 @@ Describe 'Export-DuplicateReport' {
         }
         finally { $zip.Dispose() }
         $sheetXml | Should -Match '<pane ySplit="1" topLeftCell="A2"'
-        $sheetXml | Should -Match '<autoFilter ref="A1:H3"'
+        $sheetXml | Should -Match '<autoFilter ref="A1:I3"'
     }
 
     It 'writes a header-only workbook when there are no duplicates' {
@@ -576,41 +857,53 @@ Describe 'Import-DuplicateReport' {
     BeforeAll {
         $script:RoundTrip = @(
             [pscustomobject] @{
-                FileName = 'a & b.txt'; LastWriteTime = [datetime]::new(2024, 1, 2, 3, 4, 5, 678)
+                FileName = 'a & b.txt'; LastWriteTime = [datetime]::new(2024, 1, 2, 3, 4, 5, 678); UtcOffset = [TimeSpan]::FromHours(10)
                 SizeBytes = 1234; MD5 = 'AAAA'; Count = 3; Folders = [string[]] @('C:\one', 'C:\two', 'D:\three')
             }
             [pscustomobject] @{
-                FileName = 'z.txt'; LastWriteTime = [datetime]::new(2023, 6, 7, 8, 9, 10)
+                FileName = 'z.txt'; LastWriteTime = [datetime]::new(2023, 6, 7, 8, 9, 10); UtcOffset = [TimeSpan]::new(-4, -30, 0)
                 SizeBytes = 5; MD5 = 'BBBB'; Count = 2; Folders = [string[]] @('C:\x', 'C:\y')
             }
         )
 
         function Write-ExcelSavedWorkbook {
-            # A workbook shaped like one Excel has re-saved: shared strings, a
-            # renamed worksheet part, and cells without explicit types.
-            param([string] $Path, [object[][]] $Rows)
+            # A workbook shaped like one Excel has re-saved: shared strings, renamed
+            # worksheet parts, and cells without explicit types; with -RulesRows, a Rules
+            # sheet too.
+            param([string] $Path, [object[][]] $Rows, [object[][]] $RulesRows)
             $strings = [System.Collections.Generic.List[string]]::new()
-            $sheetRows = for ($r = 0; $r -lt $Rows.Count; $r++) {
-                $cells = for ($c = 0; $c -lt $Rows[$r].Count; $c++) {
-                    $ref = "$(ConvertTo-ColumnName ($c + 1))$($r + 1)"
-                    $value = $Rows[$r][$c]
-                    if ($null -eq $value) { continue }  # Excel leaves blank cells out
-                    if ($value -is [string]) {
-                        $strings.Add($value)
-                        "<c r=`"$ref`" t=`"s`"><v>$($strings.Count - 1)</v></c>"
+            $ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+            $rels = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+            $sheets = @(, @('Duplicates', 'data.xml', $Rows))
+            if ($null -ne $RulesRows) { $sheets += , @('Rules', 'notes.xml', $RulesRows) }
+            $parts = [ordered] @{
+                '[Content_Types].xml' = '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>'
+                'xl/workbook.xml' = "<workbook xmlns=`"$ns`" xmlns:r=`"$rels`"><sheets>" +
+                    (-join @(for ($i = 0; $i -lt $sheets.Count; $i++) { "<sheet name=`"$($sheets[$i][0])`" sheetId=`"$($i + 1)`" r:id=`"rId$($i + 7)`"/>" })) +
+                    '</sheets></workbook>'
+                'xl/_rels/workbook.xml.rels' = '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+                    (-join @(for ($i = 0; $i -lt $sheets.Count; $i++) { "<Relationship Id=`"rId$($i + 7)`" Type=`"$rels/worksheet`" Target=`"worksheets/$($sheets[$i][1])`"/>" })) +
+                    '</Relationships>'
+            }
+            foreach ($sheet in $sheets) {
+                $sheetRows = $sheet[2]
+                $xmlRows = for ($r = 0; $r -lt $sheetRows.Count; $r++) {
+                    $cells = for ($c = 0; $c -lt $sheetRows[$r].Count; $c++) {
+                        $ref = "$(ConvertTo-ColumnName ($c + 1))$($r + 1)"
+                        $value = $sheetRows[$r][$c]
+                        if ($null -eq $value) { continue }  # Excel leaves blank cells out
+                        if ($value -is [string]) {
+                            $strings.Add($value)
+                            "<c r=`"$ref`" t=`"s`"><v>$($strings.Count - 1)</v></c>"
+                        }
+                        else { "<c r=`"$ref`"><v>$([System.Convert]::ToString($value, [System.Globalization.CultureInfo]::InvariantCulture))</v></c>" }
                     }
-                    else { "<c r=`"$ref`"><v>$([System.Convert]::ToString($value, [System.Globalization.CultureInfo]::InvariantCulture))</v></c>" }
+                    "<row r=`"$($r + 1)`">$(-join $cells)</row>"
                 }
-                "<row r=`"$($r + 1)`">$(-join $cells)</row>"
+                $parts["xl/worksheets/$($sheet[1])"] = "<worksheet xmlns=`"$ns`"><sheetData>$(-join $xmlRows)</sheetData></worksheet>"
             }
             $sst = -join ($strings | ForEach-Object { "<si><t>$([System.Security.SecurityElement]::Escape($_))</t></si>" })
-            $parts = [ordered] @{
-                '[Content_Types].xml'        = '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>'
-                'xl/workbook.xml'            = '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Duplicates" sheetId="1" r:id="rId7"/></sheets></workbook>'
-                'xl/_rels/workbook.xml.rels' = '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/data.xml"/></Relationships>'
-                'xl/sharedStrings.xml'       = "<sst xmlns=`"http://schemas.openxmlformats.org/spreadsheetml/2006/main`">$sst</sst>"
-                'xl/worksheets/data.xml'     = "<worksheet xmlns=`"http://schemas.openxmlformats.org/spreadsheetml/2006/main`"><sheetData>$(-join $sheetRows)</sheetData></worksheet>"
-            }
+            $parts['xl/sharedStrings.xml'] = "<sst xmlns=`"$ns`">$sst</sst>"
             $zip = [System.IO.Compression.ZipFile]::Open($Path, [System.IO.Compression.ZipArchiveMode]::Create)
             try {
                 foreach ($name in $parts.Keys) {
@@ -622,6 +915,41 @@ Describe 'Import-DuplicateReport' {
         }
     }
 
+    It 'validates a report made before the UTC Offset column, and adds the column when it rewrites it' {
+        $root = Add-TestRoot
+        $files = @(foreach ($folder in 'a', 'b', 'c') { Add-TestFile $root "$folder/x.txt" })
+        $path = Join-Path $root 'old.xlsx'
+        $header = [object[]] @('File Name', 'Last Modified', 'Size (bytes)', 'MD5', 'Copies', 'Location 1', 'Location 2', 'Location 3')
+        $row = [object[]] (@('x.txt', $files[0].LastWriteTime.ToOADate(), [double] $files[0].Length, 'ABC', [double] 3) + @($files.DirectoryName))
+        Write-ExcelSavedWorkbook -Path $path -Rows ([object[][]] @($header, $row))
+        Remove-Item -LiteralPath $files[2].FullName
+
+        $result = Update-DuplicateReport -Path $path
+
+        $result.CopiesRemoved | Should -Be 1 -Because 'the other two copies are found by local time'
+        (Read-Worksheet $path)[0][2] | Should -Be 'UTC Offset'
+        (Import-DuplicateReport -Path $path).UtcOffset | Should -Be ($files[0].LastWriteTime - $files[0].LastWriteTimeUtc)
+    }
+
+    It 'writes the UTC offset <Text> and reads it back' -ForEach @(
+        @{ Seconds = 19800; Text = '+05:30' }
+        @{ Seconds = -16200; Text = '-04:30' }
+        @{ Seconds = 0; Text = '+00:00' }
+        @{ Seconds = 50400; Text = '+14:00' }
+        @{ Seconds = 1172; Text = '+00:19:32' }   # local mean time, as some zones used before 1900
+    ) {
+        InModuleScope DuplicateFinder -Parameters $_ {
+            ConvertTo-UtcOffsetText ([TimeSpan]::FromSeconds($Seconds)) | Should -BeExactly $Text
+            ConvertFrom-UtcOffsetText $Text -Path 'report.xlsx' | Should -Be ([TimeSpan]::FromSeconds($Seconds))
+        }
+    }
+
+    It 'rejects a UTC offset it cannot read' {
+        InModuleScope DuplicateFinder {
+            { ConvertFrom-UtcOffsetText '10:00' -Path 'report.xlsx' } | Should -Throw "*'10:00' is not a UTC offset*"
+        }
+    }
+
     It 'reads back what Export-DuplicateReport wrote' {
         $path = Join-Path (Add-TestRoot) 'report.xlsx'
         Export-DuplicateReport -DuplicateSet $script:RoundTrip -Path $path
@@ -630,7 +958,7 @@ Describe 'Import-DuplicateReport' {
 
         $read.Count | Should -Be 2
         for ($i = 0; $i -lt 2; $i++) {
-            foreach ($property in 'FileName', 'LastWriteTime', 'SizeBytes', 'MD5', 'Count') {
+            foreach ($property in 'FileName', 'LastWriteTime', 'UtcOffset', 'SizeBytes', 'MD5', 'Count') {
                 $read[$i].$property | Should -Be $script:RoundTrip[$i].$property -Because $property
             }
             $read[$i].Folders | Should -Be $script:RoundTrip[$i].Folders
@@ -651,6 +979,48 @@ Describe 'Import-DuplicateReport' {
         $read[0].LastWriteTime | Should -Be ([datetime]::new(2024, 1, 1, 12, 0, 0))
         $read[0].SizeBytes | Should -Be 10
         $read[0].Folders | Should -Be @('C:\a', 'C:\b')
+    }
+
+    It 'reads the scan settings from a report saved by Excel' {
+        $path = Join-Path (Add-TestRoot) 'settings.xlsx'
+        Write-ExcelSavedWorkbook -Path $path -Rows @(, @('File Name', 'Last Modified', 'Size (bytes)', 'MD5', 'Copies', 'Location 1')) `
+            -RulesRows @(
+            , @('Matching rules')
+            , @('Names left out (-Exclude; Python: --exclude)', $null, '*.tmp', 'Thumbs.db')
+            , @('Smallest file listed, in bytes (-MinimumSize or -IgnoreEmptyFiles; Python: --minimum-size or --ignore-empty-files)', 2048)
+        )
+
+        InModuleScope DuplicateFinder -Parameters @{ Report = $path } {
+            $workbook = Read-DuplicateWorkbook -Path $Report
+            $workbook.ExcludeName | Should -Be @('*.tmp', 'Thumbs.db')
+            $workbook.MinimumSize | Should -Be 2048
+        }
+    }
+
+    It 'ignores an exclusion pattern in the report that holds / or \' {
+        $path = Join-Path (Add-TestRoot) 'patterns.xlsx'
+        Write-ExcelSavedWorkbook -Path $path -Rows @(, @('File Name', 'Last Modified', 'Size (bytes)', 'MD5', 'Copies', 'Location 1')) `
+            -RulesRows @(, @('Names left out (-Exclude; Python: --exclude)', 'photos/raw', '*.tmp'))
+
+        InModuleScope DuplicateFinder -Parameters @{ Report = $path } {
+            $workbook = Read-DuplicateWorkbook -Path $Report -WarningVariable warnings -WarningAction SilentlyContinue
+            $workbook.ExcludeName | Should -Be @('*.tmp')
+            "$($warnings[0])" | Should -BeLike "*'photos/raw'*not paths*"
+        }
+    }
+
+    It 'ignores a smallest file size in the report that is not a whole number of bytes' {
+        foreach ($bad in '1MB', '1.5', '-1') {
+            $path = Join-Path (Add-TestRoot) 'bad.xlsx'
+            Write-ExcelSavedWorkbook -Path $path -Rows @(, @('File Name', 'Last Modified', 'Size (bytes)', 'MD5', 'Copies', 'Location 1')) `
+                -RulesRows @(, @('Smallest file listed, in bytes (-MinimumSize or -IgnoreEmptyFiles; Python: --minimum-size or --ignore-empty-files)', $bad))
+
+            InModuleScope DuplicateFinder -Parameters @{ Report = $path; Bad = $bad } {
+                $workbook = Read-DuplicateWorkbook -Path $Report -WarningVariable warnings -WarningAction SilentlyContinue
+                $workbook.MinimumSize | Should -Be 0 -Because $Bad
+                "$($warnings[0])" | Should -BeLike "*'$Bad' is not a whole number of bytes*"
+            }
+        }
     }
 
     It 'reads a report that had the rules above the table' {
@@ -735,6 +1105,26 @@ Describe 'Update-DuplicateReport' {
         }
     }
 
+    It 'keeps every copy when validating in another time zone than the scan' {
+        if ($script:OnWindows) { Set-ItResult -Skipped -Because 'the TZ variable sets the time zone only on Linux and macOS'; return }
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b') { $null = Add-TestFile $root "$folder/x.txt" }
+        $previous = $env:TZ
+        try {
+            $env:TZ = 'Asia/Kolkata'
+            [System.TimeZoneInfo]::ClearCachedData()
+            $report = Export-ScannedReport $root
+            $env:TZ = 'America/New_York'
+            [System.TimeZoneInfo]::ClearCachedData()
+
+            (Update-DuplicateReport -Path $report -WhatIf).CopiesRemoved | Should -Be 0
+        }
+        finally {
+            $env:TZ = $previous
+            [System.TimeZoneInfo]::ClearCachedData()
+        }
+    }
+
     It 'leaves the report untouched when every copy still exists' {
         $root = Add-TestRoot
         foreach ($folder in 'a', 'b') { $null = Add-TestFile $root "$folder/x.txt" }
@@ -808,7 +1198,7 @@ Describe 'Update-DuplicateReport' {
         $root = Add-TestRoot
         foreach ($folder in 'a', 'b') { $null = Add-TestFile $root "$folder/x.txt" }
         $report = Export-ScannedReport $root
-        Mock -ModuleName DuplicateFinder Test-DuplicateCopy { 'Unavailable' }
+        Mock -ModuleName DuplicateFinder Test-PathRootReachable { $false }
 
         $result = Update-DuplicateReport -Path $report -WarningVariable warnings -WarningAction SilentlyContinue
 
@@ -828,6 +1218,83 @@ Describe 'Update-DuplicateReport' {
             Test-DuplicateCopy -Folder $Folder -FileName 'x.txt' -SizeBytes 1 -LastWriteTime ([datetime]::Now) |
                 Should -Be 'Unavailable'
         }
+    }
+
+    It 'reports a copy deleted while being checked as missing' {
+        $path = (Add-TestFile (Add-TestRoot) 'gone.txt').FullName
+        $file = [System.IO.FileInfo] $path  # reads nothing up front, as on Linux and macOS
+        Remove-Item -LiteralPath $path
+        InModuleScope DuplicateFinder -Parameters @{ File = $file } {
+            Get-CopyState -File $File -SizeBytes 1 -LastWriteTime ([datetime]::Now) -UtcOffset $null | Should -Be 'Missing'
+        }
+    }
+
+    It 'keeps a copy whose size and saved date cannot be read' {
+        # As for a file named NUL on Windows, which the system treats as a device.
+        $folder = Join-Path (Add-TestRoot) 'a'
+        InModuleScope DuplicateFinder -Parameters @{ Folder = $folder; Saved = $script:Saved } {
+            Mock Find-FileByNameKey { [pscustomobject] @{ Length = [long] 1; LastWriteTime = $null } }
+            Test-DuplicateCopy -Folder $Folder -FileName 'NUL' -SizeBytes 1 -LastWriteTime $Saved | Should -Be 'Unavailable'
+        }
+    }
+
+    It 'checks several copies in one folder from one listing, by exact name or ignoring case' {
+        $root = Add-TestRoot
+        $present = Add-TestFile $root 'a/x.txt'
+        $cased = Add-TestFile $root 'a/Photo.JPG'
+        $changed = Add-TestFile $root 'a/changed.txt'
+        [System.IO.File]::WriteAllText($changed.FullName, 'different now')
+        $folder = $present.DirectoryName
+        $checks = @(
+            foreach ($name in 'x.txt', 'photo.jpg', 'changed.txt', 'gone.txt') {
+                [pscustomobject] @{ Key = $name; FileName = $name; SizeBytes = $present.Length; LastWriteTime = $present.LastWriteTime; UtcOffset = $null }
+            }
+        )
+        InModuleScope DuplicateFinder -Parameters @{ Folder = $folder; Checks = $checks } {
+            $states = @{}
+            foreach ($result in (Test-CopyInFolder -Folder $Folder -Check $Checks)) { $states[$result.Key] = $result.State }
+            $states['x.txt'] | Should -Be 'Present'
+            $states['photo.jpg'] | Should -Be 'Present' -Because 'Photo.JPG is the same name, ignoring case'
+            $states['changed.txt'] | Should -Be 'Changed'
+            $states['gone.txt'] | Should -Be 'Missing'
+        }
+        $null = $cased
+    }
+
+    It 'treats every copy in a folder that has gone as missing' {
+        $folder = Join-Path (Add-TestRoot) 'gone'
+        $checks = @(
+            foreach ($name in 'x.txt', 'y.txt') {
+                [pscustomobject] @{ Key = $name; FileName = $name; SizeBytes = 1; LastWriteTime = $script:Saved; UtcOffset = $null }
+            }
+        )
+        InModuleScope DuplicateFinder -Parameters @{ Folder = $folder; Checks = $checks } {
+            @(Test-CopyInFolder -Folder $Folder -Check $Checks).State | Should -Be @('Missing', 'Missing')
+        }
+    }
+
+    It 'validates the same way checking several folders at a time' {
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b', 'c') {
+            foreach ($name in 'x.txt', 'y.txt') { $null = Add-TestFile $root "$folder/$name" -Content $name }
+            $null = Add-TestFile $root "$folder/Photos/p.jpg" -Content 'photo'
+        }
+        $report = "$root.xlsx"
+        $scan = @(Get-FileInventory -Path $root)
+        $info = [System.Collections.Generic.List[object]]::new()
+        $null = @(Get-FileInventory -Path $root -FolderInfo $info)
+        Export-DuplicateReport -DuplicateSet @(Find-DuplicateFile -File $scan) -FolderSet @(Find-DuplicateFolder -File $scan -Folder $info.ToArray()) -Path $report
+        Remove-Item -LiteralPath (Join-Path $root 'a/x.txt')
+        Remove-Item -LiteralPath (Join-Path $root 'b/Photos') -Recurse
+
+        $one = Update-DuplicateReport -Path $report -WhatIf
+        $many = Update-DuplicateReport -Path $report -ThrottleLimit 4 -WhatIf
+
+        foreach ($property in 'CopiesChecked', 'CopiesRemoved', 'RowsRemaining', 'FolderCopiesChecked', 'FolderCopiesRemoved', 'FolderRowsRemaining') {
+            $many.$property | Should -Be $one.$property -Because $property
+        }
+        $one.CopiesRemoved | Should -Be 2 -Because 'a/x.txt and b/Photos/p.jpg are gone'
+        $one.FolderCopiesRemoved | Should -Be 1
     }
 
     It 'checks each drive or share only once' {
@@ -852,6 +1319,70 @@ Describe 'Update-DuplicateReport' {
         $rows = @(Import-DuplicateReport -Path $report)
         $rows.Count | Should -Be 1
         $rows[0].Count | Should -Be 3 -Because 'the removed copy is still listed'
+    }
+
+    It 'keeps the scan settings when it rewrites the report' {
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b', 'c') { $null = Add-TestFile $root "$folder/x.txt" }
+        $report = "$root.xlsx"
+        Export-DuplicateReport -DuplicateSet @(Find-DuplicateFile -File @(Get-FileInventory -Path $root)) -Path $report `
+            -ExcludeName 'Thumbs.db' -MinimumSize 5
+        Remove-Item -LiteralPath (Join-Path $root 'c/x.txt')
+
+        (Update-DuplicateReport -Path $report).Saved | Should -BeTrue
+        InModuleScope DuplicateFinder -Parameters @{ Report = $report } {
+            $workbook = Read-DuplicateWorkbook -Path $Report
+            $workbook.ExcludeName | Should -Be @('Thumbs.db')
+            $workbook.MinimumSize | Should -Be 5
+        }
+    }
+}
+
+Describe 'Get-PreviousMd5' {
+    BeforeAll {
+        function Add-ScannedTree {
+            # Two duplicated files, each in two folders, and a report of them.
+            $root = Add-TestRoot
+            foreach ($path in 'a/x.txt', 'b/x.txt') { $null = Add-TestFile $root $path -Content 'x' }
+            foreach ($path in 'c/y.txt', 'd/y.txt') { $null = Add-TestFile $root $path -Content 'y' }
+            $report = "$root.xlsx"
+            Export-DuplicateReport -DuplicateSet @(Find-DuplicateFile -File @(Get-FileInventory -Path $root)) -Path $report
+            [pscustomobject] @{ Root = $root; Report = $report }
+        }
+    }
+
+    It 'takes the MD5 hashes of unchanged files from the previous report' {
+        $tree = Add-ScannedTree
+        [System.IO.File]::WriteAllText((Join-Path $tree.Root 'c/y.txt'), 'z')  # same size, new contents, saved now
+
+        $previous = Get-PreviousMd5 -Path $tree.Report -File @(Get-FileInventory -Path $tree.Root)
+
+        @($previous.Keys | Sort-Object) | Should -Be @('a/x.txt', 'b/x.txt', 'd/y.txt' | ForEach-Object { Join-Path $tree.Root $_ })
+        $previous[(Join-Path $tree.Root 'a/x.txt')] | Should -Be (Get-FileHash -LiteralPath (Join-Path $tree.Root 'a/x.txt') -Algorithm MD5).Hash
+    }
+
+    It 'does not read files again whose MD5 the previous report holds' {
+        $tree = Add-ScannedTree
+        $files = @(Get-FileInventory -Path $tree.Root)
+        $cache = Get-PreviousMd5 -Path $tree.Report -File $files
+        Mock -ModuleName DuplicateFinder Get-FileMd5 { throw 'read again' }
+
+        $result = @(Find-DuplicateFile -File $files -Md5Cache $cache -WarningVariable warnings -WarningAction SilentlyContinue)
+
+        @($warnings).Count | Should -Be 0
+        $result.Count | Should -Be 2
+    }
+
+    It 'ignores an MD5 in the previous report that is not an MD5' {
+        $root = Add-TestRoot
+        $files = @(Add-TestFile $root 'a/x.txt'; Add-TestFile $root 'b/x.txt')
+        $report = "$root.xlsx"
+        Export-DuplicateReport -Path $report -DuplicateSet @([pscustomobject] @{
+                FileName = 'x.txt'; LastWriteTime = $files[0].LastWriteTime; UtcOffset = $files[0].LastWriteTime - $files[0].LastWriteTimeUtc
+                SizeBytes = $files[0].Length; MD5 = 'not an md5'; Count = 2; Folders = [string[]] $files.DirectoryName
+            })
+
+        (Get-PreviousMd5 -Path $report -File $files).Count | Should -Be 0
     }
 }
 
@@ -896,6 +1427,23 @@ Describe 'Find-DuplicateFolder' {
         $result[0].SizeBytes | Should -Be ('a photo'.Length + 'b photo'.Length)
         $result[0].Count | Should -Be 2
         $result[0].Folders | Should -Be @((Join-Path $root 'one/Photos'), (Join-Path $root 'two/Photos') | ForEach-Object { [System.IO.Path]::GetFullPath($_) })
+    }
+
+    It 'compares folders as if files and folders left out with -ExcludeName were not there' {
+        $root = Add-TestRoot
+        foreach ($folder in 'one', 'two') {
+            Add-PhotoFolder $root "$folder/Photos"
+            $null = Add-TestFile $root "$folder/Photos/Thumbs.db" -Content "thumbnails of $folder"
+            $null = Add-TestFile $root "$folder/Photos/.cache/$folder.bin" -Content $folder
+        }
+
+        (Find-InTree $root).FolderName | Should -Be @('sub') -Because 'the thumbnails and caches differ'
+        $info = [System.Collections.Generic.List[object]]::new()
+        $files = @(Get-FileInventory -Path $root -FolderInfo $info -ExcludeName 'Thumbs.db', '.cache')
+        $result = @(Find-DuplicateFolder -File $files -Folder $info.ToArray())
+        $result.FolderName | Should -Be @('Photos')
+        $result[0].FileCount | Should -Be 2
+        $result[0].FolderCount | Should -Be 2
     }
 
     It 'matches folder names that differ only by case' {
@@ -988,6 +1536,39 @@ Describe 'Find-DuplicateFolder' {
 
         try { (Find-InTree $root).FolderName | Should -Be @('sub') }
         finally { [System.IO.Directory]::Delete($link) }
+    }
+
+    It 'does not report a folder whose file has gone since the scan' {
+        $root = Add-TestRoot
+        Add-PhotoFolder $root 'one/Photos'
+        Add-PhotoFolder $root 'two/Photos'
+        $scan = Get-FolderScan $root
+        $gone = Join-Path $root 'two/Photos/a.jpg'
+        # A fresh FileInfo reads nothing up front, as the scan's do on Linux and macOS.
+        $files = @(foreach ($f in $scan.Files) { if ($f.FullName -eq $gone) { [System.IO.FileInfo] $gone } else { $f } })
+        Remove-Item -LiteralPath $gone
+
+        $result = @(Find-DuplicateFolder -File $files -Folder $scan.Folders -WarningVariable warnings -WarningAction SilentlyContinue)
+
+        "$warnings" | Should -BeLike "*$gone*"
+        $result.FolderName | Should -Be @('sub') -Because 'the two sub folders are still identical'
+    }
+
+    It 'does not read the files of folders whose name no other folder has' {
+        $root = Add-TestRoot
+        Add-PhotoFolder $root 'one/Photos'
+        Add-PhotoFolder $root 'two/Photos'
+        $null = Add-TestFile $root 'unique/x.txt'
+        $scan = Get-FolderScan $root
+        $gone = Join-Path $root 'unique/x.txt'
+        # A fresh FileInfo reads nothing up front: reading it now would fail with a warning.
+        $files = @(foreach ($f in $scan.Files) { if ($f.FullName -eq $gone) { [System.IO.FileInfo] $gone } else { $f } })
+        Remove-Item -LiteralPath $gone
+
+        $result = @(Find-DuplicateFolder -File $files -Folder $scan.Folders -WarningVariable warnings -WarningAction SilentlyContinue)
+
+        @($warnings).Count | Should -Be 0
+        $result.FolderName | Should -Be @('Photos')
     }
 
     It 'does not read files again that the file scan already hashed' {
@@ -1209,6 +1790,21 @@ Describe 'Validating duplicate folders' {
         $read[0].Folders | Should -Be @((Join-Path $root 'one/Photos'), (Join-Path $root 'three/Photos') | ForEach-Object { [System.IO.Path]::GetFullPath($_) })
     }
 
+    It 'leaves the names the scan left out when validating folder copies' {
+        $root = Add-TestRoot
+        Add-CopiedTree $root
+        $info = [System.Collections.Generic.List[object]]::new()
+        $files = @(Get-FileInventory -Path $root -FolderInfo $info -ExcludeName 'Thumbs.db')
+        $report = "$root.xlsx"
+        Export-DuplicateReport -Path $report -DuplicateSet @(Find-DuplicateFile -File $files) `
+            -FolderSet @(Find-DuplicateFolder -File $files -Folder $info.ToArray()) -ExcludeName 'Thumbs.db'
+        $null = Add-TestFile $root 'two/Photos/Thumbs.db' -Content 'new thumbnails'
+
+        (Update-DuplicateReport -Path $report).FolderCopiesRemoved | Should -Be 0
+        $null = Add-TestFile $root 'two/Photos/new.jpg'
+        (Update-DuplicateReport -Path $report).FolderCopiesRemoved | Should -Be 1
+    }
+
     It 'removes a folder copy whose contents changed' {
         $root = Add-TestRoot
         Add-CopiedTree $root
@@ -1290,7 +1886,7 @@ Describe 'Find-Duplicates.ps1' {
         $rows[1][0] | Should -Be 'invoice.pdf'
         $expected = 'data/2023', 'data/backup', 'data/old/copy' |
             ForEach-Object { [System.IO.Path]::GetFullPath((Join-Path $script:Root $_)) }
-        $rows[1][5..7] | Should -Be $expected -Because 'the full folder path of every copy is recorded'
+        $rows[1][6..8] | Should -Be $expected -Because 'the full folder path of every copy is recorded'
     }
 
     It 'uses the given output file name and adds .xlsx when missing' {
@@ -1322,8 +1918,10 @@ Describe 'Find-Duplicates.ps1' {
         if (-not (Test-Path -LiteralPath $unc)) { Set-ItResult -Skipped -Because 'the administrative share is not available'; return }
 
         $out = Join-Path (Add-TestRoot) 'unc.xlsx'
-        $result = @(& $script:ScriptPath -Path $unc -OutputFile $out -PassThru 6>$null)
+        $output = @(& $script:ScriptPath -Path $unc -OutputFile $out -PassThru 6>&1)
+        $result = @($output | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })
 
+        "$($output -join ' ')" | Should -BeLike '*On a network drive: working on 4 folders and files at a time*'
         $result.Count | Should -Be 1
         $result[0].Folders | Should -Be @("$unc\a", "$unc\b")
         $out | Should -Exist
@@ -1359,6 +1957,54 @@ Describe 'Find-Duplicates.ps1' {
         @(& $script:ScriptPath -Path $root -OutputFile $out -IgnoreEmptyFiles -PassThru 6>$null).Count | Should -Be 0
     }
 
+    It 'leaves names out with -Exclude and small files with -MinimumSize' {
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b') {
+            $null = Add-TestFile $root "$folder/Thumbs.db"
+            $null = Add-TestFile $root "$folder/small.txt" -Content 'small'
+            $null = Add-TestFile $root "$folder/large.txt" -Content ('x' * 2048)
+        }
+        $out = Join-Path (Add-TestRoot) 'excluded.xlsx'
+
+        $result = @(& $script:ScriptPath -Path $root -OutputFile $out -Exclude 'thumbs.db' -MinimumSize 2KB -PassThru 6>$null)
+
+        $result.FileName | Should -Be @('large.txt')
+        $rules = @(Read-Worksheet $out -Part 'xl/worksheets/sheet2.xml' -AllRows | ForEach-Object { $_[0] })
+        $rules | Should -Contain 'Scan settings'
+    }
+
+    It 'reads a minimum size in bytes or with a unit and rejects anything else' {
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b') { $null = Add-TestFile $root "$folder/x.txt" }
+        foreach ($case in @(@('1500', '1500'), @('2KB', '2048'), @('1.5MB', '1572864'))) {
+            $out = Join-Path (Add-TestRoot) 'size.xlsx'
+            $null = & $script:ScriptPath -Path $root -OutputFile $out -MinimumSize $case[0] 6>$null
+            $size = @(Read-Worksheet $out -Part 'xl/worksheets/sheet2.xml' -AllRows | Where-Object { $_[0] -eq 'Smallest file listed, in bytes (-MinimumSize or -IgnoreEmptyFiles; Python: --minimum-size or --ignore-empty-files)' })
+            $size[0][1] | Should -Be $case[1] -Because $case[0]
+        }
+        foreach ($bad in '-1', '10 bytes', 'KB') {
+            { & $script:ScriptPath -Path $root -OutputFile (Join-Path (Add-TestRoot) 'bad.xlsx') -MinimumSize $bad 6>$null } |
+                Should -Throw -Because $bad
+        }
+    }
+
+    It 'rejects an -Exclude pattern holding / or \ before scanning' {
+        $out = Join-Path (Add-TestRoot) 'never.xlsx'
+        { & $script:ScriptPath -Path (Add-TestRoot) -OutputFile $out -Exclude 'photos/raw' 6>$null } | Should -Throw '*not paths*'
+        $out | Should -Not -Exist
+    }
+
+    It 'records -IgnoreEmptyFiles as a smallest file size of 1 byte' {
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b') { $null = Add-TestFile $root "$folder/x.txt" }
+        $out = Join-Path (Add-TestRoot) 'empty.xlsx'
+
+        $null = & $script:ScriptPath -Path $root -OutputFile $out -IgnoreEmptyFiles 6>$null
+
+        $size = @(Read-Worksheet $out -Part 'xl/worksheets/sheet2.xml' -AllRows | Where-Object { $_[0] -eq 'Smallest file listed, in bytes (-MinimumSize or -IgnoreEmptyFiles; Python: --minimum-size or --ignore-empty-files)' })
+        $size[0][1] | Should -Be '1'
+    }
+
     It 'saves no report with -WhatIf' {
         $out = Join-Path (Add-TestRoot) 'whatif.xlsx'
         $result = @(& $script:ScriptPath -Path $script:Root -OutputFile $out -WhatIf -PassThru 6>$null)
@@ -1384,6 +2030,18 @@ Describe 'Find-Duplicates.ps1' {
         $rows = @(Import-DuplicateReport -Path (Join-Path $workDir 'duplicates.xlsx'))
         $rows.Count | Should -Be 1
         $rows[0].Count | Should -Be 2
+    }
+
+    It 'checks several folders at a time with -Validate -ThrottleLimit' {
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b', 'c') { $null = Add-TestFile $root "$folder/x.txt" }
+        $out = Join-Path (Add-TestRoot) 'parallel.xlsx'
+        $null = & $script:ScriptPath -Path $root -OutputFile $out 6>$null
+        Remove-Item -LiteralPath (Join-Path $root 'a/x.txt')
+
+        $null = & $script:ScriptPath -Validate $out -ThrottleLimit 4 6>$null
+
+        @(Import-DuplicateReport -Path $out)[0].Count | Should -Be 2
     }
 
     It 'takes the report to validate as its first argument' {
@@ -1426,6 +2084,32 @@ Describe 'Find-Duplicates.ps1' {
         @(Import-DuplicateFolderReport -Path $out)[0].Count | Should -Be 2
     }
 
+    It 'reuses the previous report''s MD5 hashes, and reads every file again with -Rehash' {
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b') { $null = Add-TestFile $root "$folder/x.txt" }
+        $out = Join-Path (Add-TestRoot) 'again.xlsx'
+        $null = & $script:ScriptPath -Path $root -OutputFile $out 6>$null
+
+        $second = & $script:ScriptPath -Path $root -OutputFile $out 6>&1 | Out-String
+        $third = & $script:ScriptPath -Path $root -OutputFile $out -Rehash 6>&1 | Out-String
+
+        $second | Should -BeLike '*Reusing 2 MD5 hashes from the previous report*'
+        $third | Should -Not -BeLike '*Reusing*'
+        @(Import-DuplicateReport -Path $out).Count | Should -Be 1
+    }
+
+    It 'scans normally when the previous report cannot be read' {
+        $root = Add-TestRoot
+        foreach ($folder in 'a', 'b') { $null = Add-TestFile $root "$folder/x.txt" }
+        $out = Join-Path (Add-TestRoot) 'damaged.xlsx'
+        Set-Content -LiteralPath $out -Value 'not a workbook'
+
+        $null = & $script:ScriptPath -Path $root -OutputFile $out -WarningVariable warnings -WarningAction SilentlyContinue 6>$null
+
+        "$warnings" | Should -BeLike "*Not reusing MD5 hashes from '$out'*"
+        @(Import-DuplicateReport -Path $out).Count | Should -Be 1
+    }
+
     It 'does not scan its own report when it is saved inside the scanned folder' {
         $root = Add-TestRoot
         $null = Add-TestFile $root 'a/x.txt'
@@ -1437,5 +2121,400 @@ Describe 'Find-Duplicates.ps1' {
 
         $second.Count | Should -Be 1
         $second[0].FileName | Should -Be 'x.txt'
+    }
+}
+
+Describe 'Edge cases' {
+    BeforeAll {
+        function ConvertTo-RawPath {
+            # On Windows, the \\?\ form of a full path: only that form can create names Windows
+            # otherwise reserves or trims, and paths longer than 260 characters on every .NET.
+            param([string] $Path)
+            if ($script:OnWindows) { "\\?\$Path" } else { $Path }
+        }
+
+        function Add-RawFile {
+            # Creates a file through its raw path; returns its plain full path.
+            param([string] $Folder, [string] $Name, [string] $Content = 'same content')
+            $null = [System.IO.Directory]::CreateDirectory((ConvertTo-RawPath $Folder))
+            $path = [System.IO.Path]::Combine($Folder, $Name)
+            [System.IO.File]::WriteAllText((ConvertTo-RawPath $path), $Content)
+            [System.IO.File]::SetLastWriteTimeUtc((ConvertTo-RawPath $path), $script:Saved)
+            $path
+        }
+
+        function Test-RunningAsRoot {
+            (-not $script:OnWindows) -and ((id -u) -eq '0')
+        }
+
+        function Save-WithLibreOffice {
+            # Opens a report in LibreOffice Calc and saves it again as .xlsx; returns the new
+            # file's path, or $null when LibreOffice is not installed or cannot convert.
+            param([string] $Path, [string] $OutFolder)
+            $soffice = Get-Command soffice -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $soffice) { return $null }
+            $userProfile = [System.Uri]::new((Join-Path $OutFolder 'profile')).AbsoluteUri
+            $null = & $soffice.Source "-env:UserInstallation=$userProfile" --headless --norestore `
+                --convert-to 'xlsx:Calc MS Excel 2007 XML' --outdir $OutFolder $Path 2>&1
+            $saved = Join-Path $OutFolder ([System.IO.Path]::GetFileName($Path))
+            if (Test-Path -LiteralPath $saved) { $saved } else { $null }
+        }
+    }
+
+    It 'finds duplicates in folders whose full path is longer than 260 characters' {
+        $root = Add-TestRoot
+        $deep = [string]::Join([System.IO.Path]::DirectorySeparatorChar, @(1..5 | ForEach-Object { 'd' * 50 }))
+        foreach ($copy in 'a', 'b') { $null = Add-RawFile ([System.IO.Path]::Combine($root, $copy, $deep)) 'x.txt' }
+
+        try {
+            $files = @(Get-FileInventory -Path $root -WarningVariable scanWarnings -WarningAction SilentlyContinue)
+            $result = @(Find-DuplicateFile -File $files -WarningVariable hashWarnings -WarningAction SilentlyContinue)
+            if ($result.Count -eq 0 -and $PSVersionTable.PSEdition -eq 'Desktop') {
+                # Windows PowerShell 5.1 may be unable to reach such paths; it must then say so.
+                @($scanWarnings).Count + @($hashWarnings).Count | Should -BeGreaterThan 0
+                return
+            }
+            $result.Count | Should -Be 1
+            $result[0].Count | Should -Be 2
+            foreach ($folder in $result[0].Folders) { $folder.Length | Should -BeGreaterThan 260 }
+
+            $report = Join-Path $root 'long.xlsx'
+            Export-DuplicateReport -DuplicateSet $result -Path $report
+            (Update-DuplicateReport -Path $report).CopiesRemoved | Should -Be 0
+        }
+        finally {
+            # Removed here: the test drive cleanup may not reach long paths on every platform.
+            foreach ($copy in 'a', 'b') { [System.IO.Directory]::Delete((ConvertTo-RawPath (Join-Path $root $copy)), $true) }
+        }
+    }
+
+    It 'handles files larger than 4 GB' {
+        if ($script:OnWindows) { Set-ItResult -Skipped -Because 'sparse test files need extra set-up on Windows'; return }
+        $root = Add-TestRoot
+        $size = 4GB + 1
+        foreach ($copy in 'one', 'two') {
+            $folder = [System.IO.Directory]::CreateDirectory([System.IO.Path]::Combine($root, $copy, 'big')).FullName
+            $path = Join-Path $folder 'big.bin'
+            # Extending a file without writing to it makes a sparse file: no disk space is used.
+            $stream = [System.IO.File]::Create($path)
+            try { $stream.SetLength($size) } finally { $stream.Dispose() }
+            [System.IO.File]::SetLastWriteTimeUtc($path, $script:Saved)
+        }
+
+        $folders = [System.Collections.Generic.List[object]]::new()
+        $files = @(Get-FileInventory -Path $root -FolderInfo $folders)
+        $cache = [System.Collections.Generic.Dictionary[string, string]]::new()
+        $result = @(Find-DuplicateFile -File $files -Md5Cache $cache -ThrottleLimit 2)
+        $folderSets = @(Find-DuplicateFolder -File $files -Folder $folders -Md5Cache $cache)
+        $report = Join-Path (Add-TestRoot) 'big.xlsx'
+        Export-DuplicateReport -DuplicateSet $result -FolderSet $folderSets -Path $report
+
+        $result.Count | Should -Be 1
+        $result[0].MD5 | Should -Be 'F18C798FF5D450DFE4D3ACDC12B621FF'
+        (Import-DuplicateReport -Path $report).SizeBytes | Should -Be $size
+        (Import-DuplicateFolderReport -Path $report).SizeBytes | Should -Be $size
+        $summary = Update-DuplicateReport -Path $report
+        $summary.CopiesRemoved + $summary.FolderCopiesRemoved | Should -Be 0
+    }
+
+    It 'finds every duplicate in a tree of 10,000 files' {
+        $root = Add-TestRoot
+        # 50 folders in each of two trees, 100 files in each; every file has one copy in the
+        # other tree, and many files share a name, date and size but not their contents.
+        foreach ($copy in 'a', 'b') {
+            for ($f = 0; $f -lt 50; $f++) {
+                $folder = [System.IO.Directory]::CreateDirectory([System.IO.Path]::Combine($root, $copy, "folder$f")).FullName
+                for ($i = 0; $i -lt 100; $i++) {
+                    $path = [System.IO.Path]::Combine($folder, "file$i.txt")
+                    [System.IO.File]::WriteAllText($path, "$f-$i")
+                    [System.IO.File]::SetLastWriteTimeUtc($path, $script:Saved)
+                }
+            }
+        }
+
+        $folders = [System.Collections.Generic.List[object]]::new()
+        $files = @(Get-FileInventory -Path $root -FolderInfo $folders)
+        $cache = [System.Collections.Generic.Dictionary[string, string]]::new()
+        $result = @(Find-DuplicateFile -File $files -Md5Cache $cache -ThrottleLimit 4)
+        $folderSets = @(Find-DuplicateFolder -File $files -Folder $folders -Md5Cache $cache)
+        $report = Join-Path (Add-TestRoot) 'many.xlsx'
+        Export-DuplicateReport -DuplicateSet $result -FolderSet $folderSets -Path $report
+
+        $files.Count | Should -Be 10000
+        $result.Count | Should -Be 5000
+        $folderSets.Count | Should -Be 50
+        @(Import-DuplicateReport -Path $report).Count | Should -Be 5000
+        (Update-DuplicateReport -Path $report).CopiesRemoved | Should -Be 0
+    }
+
+    It 'does not match a copy whose saved time a FAT drive rounded to 2 seconds' {
+        # FAT and exFAT (USB sticks, memory cards) store saved times to 2 seconds, so a copy of
+        # a file saved at 10:30:01 reads 10:30:02. The saved date must match to the second.
+        $root = Add-TestRoot
+        $files = @(
+            Add-TestFile $root 'disk/x.txt' -SavedUtc $script:Saved.AddSeconds(1)
+            Add-TestFile $root 'usb/x.txt' -SavedUtc $script:Saved.AddSeconds(2)
+        )
+        @(Find-DuplicateFile -File $files).Count | Should -Be 0
+    }
+
+    It 'finds, saves and validates duplicates saved before 1970 and after 2038 (<Year>)' -ForEach @(
+        @{ Year = 1960 }   # before 1970: a negative time on Linux and macOS
+        @{ Year = 2040 }   # after January 2038, when 32-bit Unix time runs out
+    ) {
+        $saved = [datetime]::new($Year, 1, 15, 8, 0, 0, [System.DateTimeKind]::Utc)
+        $root = Add-TestRoot
+        $files = @(
+            Add-TestFile $root 'a/dated.txt' -SavedUtc $saved
+            Add-TestFile $root 'b/dated.txt' -SavedUtc $saved
+        )
+        $report = Join-Path $root 'dates.xlsx'
+        Export-DuplicateReport -DuplicateSet @(Find-DuplicateFile -File $files) -Path $report
+
+        (Import-DuplicateReport -Path $report).LastWriteTime | Should -Be $saved.ToLocalTime()
+        (Update-DuplicateReport -Path $report).CopiesRemoved | Should -Be 0
+    }
+
+    It 'keeps copies saved in winter and in summer when validating in a time zone with daylight saving' {
+        if ($script:OnWindows) { Set-ItResult -Skipped -Because 'the TZ variable sets the time zone only on Linux and macOS'; return }
+        $previous = $env:TZ
+        $env:TZ = 'America/New_York'
+        [System.TimeZoneInfo]::ClearCachedData()
+        try {
+            $root = Add-TestRoot
+            $files = foreach ($season in @{ Name = 'summer'; Month = 7 }, @{ Name = 'winter'; Month = 1 }) {
+                $saved = [datetime]::new(2024, $season.Month, 15, 12, 0, 0, [System.DateTimeKind]::Utc)
+                Add-TestFile $root "a/$($season.Name).txt" -SavedUtc $saved
+                Add-TestFile $root "b/$($season.Name).txt" -SavedUtc $saved
+            }
+            $report = Join-Path $root 'seasons.xlsx'
+            Export-DuplicateReport -DuplicateSet @(Find-DuplicateFile -File $files) -Path $report
+
+            (Import-DuplicateReport -Path $report).LastWriteTime.Hour | Should -Be @(8, 7) -Because 'noon UTC is 8:00 in summer (UTC-4) and 7:00 in winter (UTC-5)'
+            (Update-DuplicateReport -Path $report).CopiesRemoved | Should -Be 0
+        }
+        finally {
+            $env:TZ = $previous
+            [System.TimeZoneInfo]::ClearCachedData()
+        }
+    }
+
+    It 'scans a folder given as a symbolic link' {
+        $root = Add-TestRoot
+        $null = Add-TestFile $root 'real/a/x.txt'
+        $null = Add-TestFile $root 'real/b/x.txt'
+        $link = Join-Path $root 'link'
+        try { $null = New-Item -ItemType SymbolicLink -Path $link -Target (Join-Path $root 'real') -ErrorAction Stop }
+        catch { Set-ItResult -Skipped -Because "symbolic links cannot be created here: $_"; return }
+
+        try {
+            $result = @(Find-DuplicateFile -File @(Get-FileInventory -Path $link))
+            $result.Count | Should -Be 1
+            $result[0].Folders | Should -Be @((Join-Path $link 'a'), (Join-Path $link 'b'))
+        }
+        finally { [System.IO.Directory]::Delete($link) }  # the link only, never its target
+    }
+
+    It 'skips a folder deleted during the scan and carries on' {
+        $root = Add-TestRoot
+        foreach ($folder in 'first', 'second', 'third') { $null = Add-TestFile $root "$folder/x.txt" }
+        # Delete "second" while "first" is being scanned, after the root's listing included it.
+        Mock -ModuleName DuplicateFinder Write-Verbose {
+            $scanning = [regex]::Match($Message, '^Scanning (.+)[\\/]first$')
+            if ($scanning.Success) { [System.IO.Directory]::Delete([System.IO.Path]::Combine($scanning.Groups[1].Value, 'second'), $true) }
+        }
+
+        $files = @(Get-FileInventory -Path $root -WarningVariable warnings -WarningAction SilentlyContinue)
+
+        $files.DirectoryName | Should -Be @((Join-Path $root 'first'), (Join-Path $root 'third'))
+        "$warnings" | Should -BeLike "*$(Join-Path $root 'second')*"
+        @(Find-DuplicateFile -File $files).Count | Should -Be 1
+    }
+
+    It 'skips a file the operating system will not let it read' {
+        if (Test-RunningAsRoot) { Set-ItResult -Skipped -Because 'root can read every file'; return }
+        $root = Add-TestRoot
+        $locked = (Add-TestFile $root 'locked/x.txt').FullName
+        $null = Add-TestFile $root 'b/x.txt'
+        $null = Add-TestFile $root 'c/x.txt'
+        $stream = $null
+        # Windows: held open by another handle that shares nothing. Elsewhere: no read permission.
+        if ($script:OnWindows) { $stream = [System.IO.File]::Open($locked, 'Open', 'ReadWrite', 'None') }
+        else { chmod 000 $locked }
+
+        try {
+            $result = @(Find-DuplicateFile -File @(Get-FileInventory -Path $root) -WarningVariable warnings -WarningAction SilentlyContinue)
+            "$warnings" | Should -BeLike '*locked*'
+            $result.Count | Should -Be 1
+            $result[0].Count | Should -Be 2
+        }
+        finally {
+            if ($stream) { $stream.Dispose() } else { chmod 644 $locked }
+        }
+    }
+
+    It 'reports two files in one folder whose names differ only in case' {
+        $root = Add-TestRoot
+        $folder = [System.IO.Directory]::CreateDirectory((Join-Path $root 'photos')).FullName
+        # Windows folders can be made case-sensitive (as WSL does); that needs no admin rights.
+        if ($script:OnWindows) { $null = fsutil.exe file setCaseSensitiveInfo $folder enable 2>&1 }
+        $null = Add-TestFile $root 'photos/IMG.JPG'
+        if ([System.IO.File]::Exists((Join-Path $folder 'img.jpg'))) {
+            Set-ItResult -Skipped -Because 'this folder ignores case'; return
+        }
+        $null = Add-TestFile $root 'photos/img.jpg'
+
+        $result = @(Find-DuplicateFile -File @(Get-FileInventory -Path $root))
+        $report = Join-Path (Add-TestRoot) 'case.xlsx'
+        Export-DuplicateReport -DuplicateSet $result -Path $report
+
+        $result.Count | Should -Be 1
+        $result[0].FileName | Should -BeExactly 'IMG.JPG'
+        $result[0].Folders | Should -Be @($folder, $folder)
+        (Update-DuplicateReport -Path $report).CopiesRemoved | Should -Be 0
+    }
+
+    It 'writes a file with as many copies as Excel has location columns' {
+        $set = [pscustomobject] @{
+            FileName = 'x.txt'; LastWriteTime = $script:Saved; SizeBytes = 1; MD5 = 'A'; Count = 16378
+            Folders = [string[]] @(1..16378 | ForEach-Object { "/copy$_" })
+        }
+        $report = Join-Path (Add-TestRoot) 'wide.xlsx'
+        Export-DuplicateReport -DuplicateSet @($set) -Path $report
+        (Import-DuplicateReport -Path $report).Count | Should -Be 16378
+    }
+
+    It 'refuses a file with more copies than Excel has location columns' {
+        $set = [pscustomobject] @{
+            FileName = 'x.txt'; LastWriteTime = $script:Saved; SizeBytes = 1; MD5 = 'A'; Count = 16379
+            Folders = [string[]] @(1..16379 | ForEach-Object { "/copy$_" })
+        }
+        $report = Join-Path (Add-TestRoot) 'too-wide.xlsx'
+        { Export-DuplicateReport -DuplicateSet @($set) -Path $report } |
+            Should -Throw 'A file has 16379 copies; Excel supports at most 16378 location columns.'
+        Test-Path -LiteralPath $report | Should -BeFalse
+    }
+
+    It 'refuses more duplicated files than Excel has rows' {
+        $report = Join-Path (Add-TestRoot) 'too-long.xlsx'
+        InModuleScope DuplicateFinder -Parameters @{ Report = $report; Saved = $script:Saved } {
+            $sets = @(1..3 | ForEach-Object {
+                    [pscustomobject] @{ FileName = "$_.txt"; LastWriteTime = $Saved; SizeBytes = 1; MD5 = 'A'; Count = 2; Folders = @('/a', '/b') }
+                })
+            $script:ExcelMaxRows = 3  # instead of writing a million rows
+            try { { Export-DuplicateReport -DuplicateSet $sets -Path $Report } | Should -Throw 'Found 3 duplicated files; Excel supports at most 2 rows.' }
+            finally { $script:ExcelMaxRows = 1048576 }
+        }
+    }
+
+    It 'refuses text longer than an Excel cell can hold' {
+        $set = [pscustomobject] @{
+            FileName = 'x.txt'; LastWriteTime = $script:Saved; SizeBytes = 1; MD5 = 'A'; Count = 2
+            Folders = @(('/' + ('x' * 32767)), '/b')
+        }
+        $report = Join-Path (Add-TestRoot) 'long-cell.xlsx'
+        { Export-DuplicateReport -DuplicateSet @($set) -Path $report } |
+            Should -Throw 'Cell G2 would hold 32768 characters; Excel allows at most 32767.'
+        Test-Path -LiteralPath $report | Should -BeFalse
+    }
+
+    It 'reads and validates a report after LibreOffice has saved it' {
+        $root = Add-TestRoot
+        $data = Join-Path $root 'data'
+        foreach ($copy in 'a', 'b') {
+            $null = Add-TestFile $data "$copy/x & y.txt"
+            $null = Add-TestFile $data "$copy/Holiday/p.jpg" -Content 'photo'
+        }
+        $report = Join-Path $root 'report.xlsx'
+        $null = & $script:ScriptPath -Path $data -OutputFile $report -IncludeFolders 6>$null
+        $saved = Save-WithLibreOffice -Path $report -OutFolder (Join-Path $root 'resaved')
+        if (-not $saved) {
+            if ($env:FIND_DUPLICATES_REQUIRE_LIBREOFFICE) { throw 'LibreOffice Calc is required for this test but could not convert the report.' }
+            Set-ItResult -Skipped -Because 'LibreOffice Calc is not installed'; return
+        }
+
+        $before = @(Import-DuplicateReport -Path $report)
+        $after = @(Import-DuplicateReport -Path $saved)
+        $after.Count | Should -Be $before.Count
+        for ($i = 0; $i -lt $before.Count; $i++) {
+            foreach ($property in 'FileName', 'LastWriteTime', 'SizeBytes', 'MD5', 'Count') {
+                $after[$i].$property | Should -Be $before[$i].$property
+            }
+            $after[$i].Folders | Should -Be $before[$i].Folders
+        }
+        (Import-DuplicateFolderReport -Path $saved).FolderName | Should -Be 'Holiday'
+        $summary = Update-DuplicateReport -Path $saved
+        $summary.CopiesRemoved + $summary.FolderCopiesRemoved | Should -Be 0
+    }
+
+    It 'copes with names Windows reserves or trims (<Name>)' -ForEach @(
+        @{ Name = 'NUL' }                # reserved on Windows (a device)
+        @{ Name = 'PRN.txt' }            # reserved on Windows, even with an extension
+        @{ Name = 'ends in a dot.' }     # Windows trims a trailing dot from ordinary paths
+        @{ Name = 'ends in a space ' }   # ... and a trailing space
+    ) {
+        $root = Add-TestRoot
+        foreach ($copy in 'a', 'b') { $null = Add-RawFile (Join-Path $root $copy) $Name }
+
+        try {
+            # Windows: it must finish without failing (such copies may be reported or skipped with
+            # a warning). Elsewhere these are ordinary names and must be matched.
+            $result = @(Find-DuplicateFile -File @(Get-FileInventory -Path $root -WarningAction SilentlyContinue) -WarningAction SilentlyContinue)
+            $report = Join-Path (Add-TestRoot) 'names.xlsx'
+            Export-DuplicateReport -DuplicateSet $result -Path $report
+            $summary = Update-DuplicateReport -Path $report -WarningAction SilentlyContinue
+            if (-not $script:OnWindows) {
+                $result.Count | Should -Be 1
+                $result[0].FileName | Should -BeExactly $Name
+                $summary.CopiesRemoved | Should -Be 0
+            }
+        }
+        finally {
+            # Removed here: ordinary deletion cannot reach these names on Windows.
+            foreach ($copy in 'a', 'b') { [System.IO.Directory]::Delete((ConvertTo-RawPath (Join-Path $root $copy)), $true) }
+        }
+    }
+
+    It 'includes hidden and system files and folders' {
+        $root = Add-TestRoot
+        $files = @(
+            Add-TestFile $root '.hidden-folder/.hidden'
+            Add-TestFile $root 'b/.hidden'
+        )
+        if ($script:OnWindows) {
+            foreach ($file in $files) { $file.Attributes = [System.IO.FileAttributes] 'Hidden, System, Archive' }
+            $folder = [System.IO.DirectoryInfo] (Join-Path $root '.hidden-folder')
+            $folder.Attributes = $folder.Attributes -bor [System.IO.FileAttributes]::Hidden
+        }
+
+        $result = @(Find-DuplicateFile -File @(Get-FileInventory -Path $root))
+        $result.Count | Should -Be 1
+        $result[0].FileName | Should -Be '.hidden'
+    }
+
+    It 'orders rows by file name ignoring case, then saved date, then MD5' {
+        $root = Add-TestRoot
+        $files = @(
+            Add-TestFile $root 'one/B.txt' -Content 'b'
+            Add-TestFile $root 'two/b.txt' -Content 'b'
+            Add-TestFile $root 'one/a.txt' -Content 'x' -SavedUtc $script:Saved.AddHours(1)
+            Add-TestFile $root 'two/a.txt' -Content 'x' -SavedUtc $script:Saved.AddHours(1)
+            Add-TestFile $root 'three/a.txt' -Content 'x'
+            Add-TestFile $root 'four/a.txt' -Content 'x'
+            Add-TestFile $root 'five/A.txt' -Content 'y'
+            Add-TestFile $root 'six/A.txt' -Content 'y'
+            Add-TestFile $root 'one/a' -Content 'z'
+            Add-TestFile $root 'two/a' -Content 'z'
+        )
+        $md5x = (Get-FileHash -LiteralPath $files[4].FullName -Algorithm MD5).Hash
+        $md5y = (Get-FileHash -LiteralPath $files[6].FullName -Algorithm MD5).Hash
+        $sameDate = @($md5x, $md5y)
+        if ([string]::CompareOrdinal($md5x, $md5y) -gt 0) { $sameDate = @($md5y, $md5x) }
+
+        $result = @(Find-DuplicateFile -File $files)
+
+        $result.FileName.ToUpperInvariant() | Should -Be @('A', 'A.TXT', 'A.TXT', 'A.TXT', 'B.TXT') -Because 'a name sorts before the longer names it starts'
+        $result[1..2].MD5 | Should -Be $sameDate
+        $result[3].LastWriteTime | Should -Be $script:Saved.AddHours(1).ToLocalTime()
     }
 }

@@ -69,6 +69,24 @@ TREE = [
 if os.name != "nt":  # characters Windows does not allow in file names
     TREE += [("a/less <than>.txt", "lt", 0), ("b/less <than>.txt", "lt", 0)]
 
+# Added for the exclusion test only: files and folders that differ between the copies of
+# "Holiday" but are left out by name, and names matched in another case and Unicode form
+# and by a ? standing for a character beyond U+FFFF.
+EXCLUDED_TREE = [
+    ("x/Holiday/Thumbs.db", "thumbs x", 0),
+    ("y/Holiday/THUMBS.DB", "thumbs y", 0),
+    ("x/Holiday/Cache/c.bin", "cache x", 0),
+    ("y/Holiday/cache/other.bin", "cache y", 0),
+    ("a/temp.tmp", "same", 0),
+    ("b/temp.tmp", "same", 0),
+    ("a/r" + chr(0x1F600) + ".txt", "same", 0),
+    ("b/r" + chr(0x1F600) + ".txt", "same", 0),
+]
+EXCLUDE_PATTERNS = ["thumbs.db", "CACHE", "*.tmp", "r?.txt"]
+MINIMUM_SIZE = "3"
+# Changed before validating the exclusion test: left out by name, so every copy is kept.
+CHANGED_BEFORE_VALIDATE = [("y/Holiday/THUMBS.DB", "new thumbnails"), ("x/Holiday/Cache/new.bin", "new")]
+
 # Removed before validating: one copy of a three-copy set, one of a two-copy set,
 # and a file inside one copy of the duplicate "Holiday" folder.
 REMOVED_BEFORE_VALIDATE = ["b/report.doc", "b/photo.jpg", "y/Holiday/p1.jpg"]
@@ -93,10 +111,13 @@ class ParityTests(unittest.TestCase):
         return os.path.join(self.root, name)
 
     def run_powershell(self, *args):
-        ps = subprocess.run(
-            [PWSH, "-NoProfile", "-NonInteractive", "-File", PS_SCRIPT, *args],
-            capture_output=True, text=True,
-        )
+        self._run_pwsh("-File", PS_SCRIPT, *args)
+
+    def run_powershell_command(self, command):
+        self._run_pwsh("-Command", command)
+
+    def _run_pwsh(self, *args):
+        ps = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", *args], capture_output=True, text=True)
         self.assertEqual(ps.returncode, 0, f"PowerShell failed:\n{ps.stdout}\n{ps.stderr}")
 
     def run_python(self, *args):
@@ -152,6 +173,33 @@ class ParityTests(unittest.TestCase):
         self.assert_same_report(self.report("ps.xlsx"), self.report("py.xlsx"))
         names = [row[0] for row in read_worksheet(self.report("py.xlsx"))[1:]]
         self.assertNotIn("Photo.JPG", names, "a row left with one copy is removed")
+
+    def test_reports_leaving_names_and_small_files_out_match(self):
+        for path, content, offset in EXCLUDED_TREE:
+            add_file(self.data, path, content, SAVED + timedelta(seconds=offset))
+        patterns = ",".join(f"'{pattern}'" for pattern in EXCLUDE_PATTERNS)
+        # -File would pass the pattern list as one string, so this goes through -Command.
+        self.run_powershell_command(
+            f"& '{PS_SCRIPT}' -Path '{self.data}' -OutputFile '{self.report('ps.xlsx')}' -IncludeFolders "
+            f"-Exclude {patterns} -MinimumSize {MINIMUM_SIZE}"
+        )
+        excludes = [arg for pattern in EXCLUDE_PATTERNS for arg in ("--exclude", pattern)]
+        self.run_python(self.data, self.report("py.xlsx"), "--folders", *excludes, "--minimum-size", MINIMUM_SIZE)
+
+        self.assert_same_report(self.report("ps.xlsx"), self.report("py.xlsx"))
+        names = [row[0] for row in read_worksheet(self.report("py.xlsx"))[1:]]
+        self.assertNotIn("temp.tmp", names)
+        self.assertNotIn("uni.txt", names, "smaller than the minimum size")
+        folder_names = [row[0] for row in read_worksheet(self.report("py.xlsx"), FOLDER_SHEET)[1:]]
+        self.assertIn("Holiday", folder_names, "the thumbnails and caches are left out")
+
+        for relative, content in CHANGED_BEFORE_VALIDATE:
+            add_file(self.data, relative, content)
+        self.run_powershell("-Validate", "-OutputFile", self.report("ps.xlsx"))
+        self.run_python("--validate", self.report("py.xlsx"))
+        self.assert_same_report(self.report("ps.xlsx"), self.report("py.xlsx"))
+        folder_names = [row[0] for row in read_worksheet(self.report("py.xlsx"), FOLDER_SHEET)[1:]]
+        self.assertIn("Holiday", folder_names, "validating leaves the same names out")
 
 
 def _worksheet_parts(path):
