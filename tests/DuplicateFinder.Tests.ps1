@@ -1900,6 +1900,24 @@ Describe 'Find-Duplicates.ps1' {
         $rows[1][6..8] | Should -Be $expected -Because 'the full folder path of every copy is recorded'
     }
 
+    It 'shows the full help instead of scanning when started without parameters' {
+        $workDir = Add-TestRoot
+        $null = Add-TestFile $workDir 'a/x.txt'
+        $null = Add-TestFile $workDir 'b/x.txt'
+        Push-Location $workDir
+        try { $help = & $script:ScriptPath 6>&1 | Out-String -Width 200 }
+        finally { Pop-Location }
+
+        $help | Should -BeLike '*Finds duplicate files in a folder*' -Because 'the synopsis is shown'
+        foreach ($parameter in 'Path', 'OutputFile', 'ThrottleLimit', 'IncludeFolders', 'IgnoreEmptyFiles', 'Exclude',
+            'MinimumSize', 'SkipCloudOnly', 'Rehash', 'Validate', 'PassThru', 'WhatIf') {
+            $help | Should -BeLike "*-$parameter *" -Because "-$parameter is described"
+        }
+        $help | Should -BeLike '*EXAMPLE*'
+        $help | Should -Not -BeLike "*Scanning '*"
+        Join-Path $workDir 'duplicates.xlsx' | Should -Not -Exist
+    }
+
     It 'uses the given output file name and adds .xlsx when missing' {
         $workDir = Add-TestRoot
         $null = & $script:ScriptPath -Path $script:Root -OutputFile (Join-Path $workDir 'my-report') 6>$null

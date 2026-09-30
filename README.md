@@ -222,7 +222,10 @@ Find-Duplicates.ps1 [[-Path] <folder>] [[-OutputFile] <report>] [-ThrottleLimit 
 Find-Duplicates.ps1 -Validate [[-OutputFile] <report>] [-ThrottleLimit <1-64>] [-PassThru] [-WhatIf] [-Verbose]
 ```
 
-Built-in help: `Get-Help .\Find-Duplicates.ps1 -Full`.
+Built-in help: run `.\Find-Duplicates.ps1` without any parameters (or
+`Get-Help .\Find-Duplicates.ps1 -Full`) to see every parameter, with examples.
+Without parameters the script only shows this help; to scan the current folder,
+give it `-Path .`.
 
 If Windows blocks the script, run it as
 `powershell -ExecutionPolicy Bypass -File .\Find-Duplicates.ps1 ...`.
@@ -231,7 +234,7 @@ If Windows blocks the script, run it as
 
 | Parameter | Default | What it does |
 |---|---|---|
-| `-Path <folder>` | current folder | Folder to scan, including all sub folders. Also the first positional argument. |
+| `-Path <folder>` | current folder (when other parameters are given) | Folder to scan, including all sub folders. Also the first positional argument. |
 | `-OutputFile <report>` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced, after its MD5 hashes are reused (see `-Rehash`). Also the second positional argument. |
 | `-ThrottleLimit <1-64>` | `4` on a network share or drive, `1` otherwise | How many files to hash, and folders to list, at the same time. See [Performance](#performance). |
 | `-IncludeFolders` | off | Also find [duplicate folders](#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
@@ -245,8 +248,11 @@ If Windows blocks the script, run it as
 | `-Verbose` | off | Print every folder as it is scanned, and every link or online-only file skipped. |
 
 ```powershell
-# Scan the current folder, save .\duplicates.xlsx
+# Show the full help (every parameter, with examples)
 .\Find-Duplicates.ps1
+
+# Scan the current folder, save .\duplicates.xlsx
+.\Find-Duplicates.ps1 -Path .
 
 # Scan a folder, save .\duplicates.xlsx
 .\Find-Duplicates.ps1 -Path D:\Photos

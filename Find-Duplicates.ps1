@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Finds duplicate files in a folder and all of its sub folders and saves them to
@@ -46,8 +47,12 @@
     cloud folders (OneDrive, Google Drive, Dropbox ...) are all supported.
     Microsoft Excel does NOT need to be installed.
 
+    Started without any parameters, the script shows this help and does nothing
+    else. To scan the current folder, give it: -Path .
+
 .PARAMETER Path
-    Folder to scan. Defaults to the current folder.
+    Folder to scan. Defaults to the current folder when other parameters are given
+    (without any parameters the script shows this help instead).
 
 .PARAMETER OutputFile
     Report to write (scan) or to check and update (validate). Defaults to
@@ -99,22 +104,58 @@
     Show what would be saved or removed without changing the report.
 
 .EXAMPLE
-    .\Find-Duplicates.ps1 -Path D:\Photos
+    .\Find-Duplicates.ps1 -Path .
+
+    Scans the current folder and saves duplicates.xlsx there.
+
+.EXAMPLE
+    .\Find-Duplicates.ps1 -Path D:\Photos -OutputFile C:\Reports\photo-dupes
+
+    Scans D:\Photos and saves C:\Reports\photo-dupes.xlsx. The same, positionally:
+    .\Find-Duplicates.ps1 D:\Photos C:\Reports\photo-dupes
 
 .EXAMPLE
     .\Find-Duplicates.ps1 -Path \\server\share -OutputFile C:\Reports\share-dupes.xlsx -ThrottleLimit 8
 
+    Scans a network share, hashing 8 files at a time.
+
 .EXAMPLE
     .\Find-Duplicates.ps1 -Path "$env:OneDrive" -SkipCloudOnly
+
+    Scans OneDrive without downloading online-only files.
 
 .EXAMPLE
     .\Find-Duplicates.ps1 -Path D:\Backups -IncludeFolders
 
+    Also lists duplicate folders, on the "Duplicate Folders" sheet.
+
 .EXAMPLE
-    .\Find-Duplicates.ps1 -Path D:\Photos -Exclude Thumbs.db, *.tmp -MinimumSize 100KB
+    .\Find-Duplicates.ps1 -Path D:\Photos -Exclude Thumbs.db, .git, *.tmp -MinimumSize 100KB -IgnoreEmptyFiles
+
+    Leaves out thumbnail caches, Git folders, temporary files, and files under 100 KB.
+
+.EXAMPLE
+    .\Find-Duplicates.ps1 -Path D:\Photos -Rehash
+
+    Scans again, reading every candidate file instead of reusing the MD5 hashes in
+    the existing duplicates.xlsx.
+
+.EXAMPLE
+    .\Find-Duplicates.ps1 -Path D:\Photos -WhatIf -Verbose
+
+    Prints every folder scanned and the totals, without saving a report.
+
+.EXAMPLE
+    .\Find-Duplicates.ps1 -Path D:\Photos -PassThru | Sort-Object Count -Descending | Select-Object -First 10
+
+    Also returns the duplicates as objects: here, the 10 files with the most copies.
 
 .EXAMPLE
     .\Find-Duplicates.ps1 -Validate -OutputFile C:\Reports\share-dupes.xlsx -WhatIf
+
+    Shows which copies listed in the report are gone or changed, without changing it.
+    Leave out -WhatIf to remove them from the report. The same, positionally:
+    .\Find-Duplicates.ps1 -Validate C:\Reports\share-dupes.xlsx -WhatIf
 #>
 [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Scan')]
 param(
@@ -160,6 +201,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# Started without parameters: show how to use them instead of scanning the current folder.
+if ($PSBoundParameters.Count -eq 0) {
+    Get-Help -Name $PSCommandPath -Full
+    return
+}
 
 Import-Module (Join-Path $PSScriptRoot 'DuplicateFinder.psm1') -Force
 

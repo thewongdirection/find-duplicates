@@ -1156,6 +1156,27 @@ class CliTests(TempDirTestCase):
         self.assertEqual(rows[1][6:9], [os.path.join(self.data, p) for p in ("2023", "backup", "old/copy".replace("/", os.sep))])
         self.assertIn("Found 1 duplicated files (3 copies in total).", out)
 
+    def test_shows_the_full_help_instead_of_scanning_when_started_without_parameters(self):
+        work = self.new_dir("work")
+        add_file(work, "a/x.txt")
+        add_file(work, "b/x.txt")
+        out = io.StringIO()
+        # As "python -m find_duplicates" calls it: main() reads sys.argv.
+        with _chdir(work), mock.patch.object(sys, "argv", ["find-duplicates"]), contextlib.redirect_stdout(out):
+            code = cli.main()
+
+        self.assertEqual(code, 0)
+        help_text = out.getvalue()
+        self.assertIn("Find duplicate files in a folder", help_text)
+        for option in ("path", "output", "--output-file", "--throttle-limit", "--folders", "--ignore-empty-files",
+                       "--exclude", "--minimum-size", "--skip-cloud-only", "--rehash", "--validate", "--dry-run",
+                       "--verbose"):
+            self.assertIn(option, help_text)
+        self.assertIn("examples:", help_text)
+        self.assertNotIn("Scanning '", help_text)
+        self.assertFalse(os.path.exists(os.path.join(work, "duplicates.xlsx")))
+        self.assertEqual(self.run_cli(), (0, help_text))
+
     def test_uses_the_given_output_name_and_adds_xlsx(self):
         work = self.new_dir("work")
         self.run_cli(self.data, os.path.join(work, "my-report"))

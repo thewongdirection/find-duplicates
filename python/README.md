@@ -34,7 +34,9 @@ make sure the account that runs it can read the folders to scan and write the
 report. Scheduled runs, network shares and cloud drives are covered in the
 [main README](../README.md#deployment).
 
-Built-in help: `python -m find_duplicates --help`.
+Built-in help: run `python -m find_duplicates` without any arguments (or with
+`--help`) to see every option, with examples. Without arguments it only shows this
+help; to scan the current folder, give it `.` as the path.
 
 ## Command reference
 
@@ -48,7 +50,7 @@ python -m find_duplicates --validate [report] [--dry-run] [-v]
 
 | Option | Default | What it does |
 |---|---|---|
-| `path` | current folder | Folder to scan, including all sub folders. |
+| `path` | current folder (when other arguments are given) | Folder to scan, including all sub folders. |
 | `output`, `-o FILE`, `--output-file FILE` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced. |
 | `-j N`, `--throttle-limit N` | `4` on a network share or drive, `1` otherwise | How many files to hash, and folders to list, at the same time (1-64); see [Threads](#threads). Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk. |
 | `--folders` | off | Also find [duplicate folders](../README.md#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
@@ -61,8 +63,11 @@ python -m find_duplicates --validate [report] [--dry-run] [-v]
 | `-v`, `--verbose` | off | Print every folder as it is scanned, and every link or online-only file skipped. |
 
 ```sh
-# Scan the current folder, save ./duplicates.xlsx
+# Show the full help (every option, with examples)
 python -m find_duplicates
+
+# Scan the current folder, save ./duplicates.xlsx
+python -m find_duplicates .
 
 # Scan a folder, save ./duplicates.xlsx
 python -m find_duplicates D:\Photos
