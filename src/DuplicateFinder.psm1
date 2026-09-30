@@ -152,6 +152,8 @@ function Find-DuplicateFile {
         One object per duplicate set: FileName, LastWriteTime, SizeBytes, MD5,
         Count and Folders (full folder path of every copy, sorted).
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingBrokenHashAlgorithms', '',
+        Justification = 'MD5 is part of the duplicate definition and is not used for security.')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]

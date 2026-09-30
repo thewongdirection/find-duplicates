@@ -1,4 +1,7 @@
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.3.0' }
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingBrokenHashAlgorithms', '',
+    Justification = 'MD5 is part of the duplicate definition and is not used for security.')]
+param()
 
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -231,15 +234,20 @@ Describe 'Find-DuplicateFile' {
     It 'skips a file it cannot hash and keeps the rest' {
         $root = Add-TestRoot
         $files = @(
-            Add-TestFile $root 'a/x.txt'
+            Add-TestFile $root 'locked/x.txt'
             Add-TestFile $root 'b/x.txt'
             Add-TestFile $root 'c/x.txt'
         )
-        $locked = $files[0].FullName
-        Mock -ModuleName DuplicateFinder Get-FileHash { throw 'locked' } -ParameterFilter { $LiteralPath -eq $locked }
+        # Decide by path alone so the mock needs no captured variables.
+        Mock -ModuleName DuplicateFinder Get-FileHash {
+            if ("$LiteralPath" -like '*locked*') { throw 'file is locked' }
+            [pscustomobject] @{ Hash = 'SAME' }
+        }
 
-        $result = @(Find-DuplicateFile -File $files -WarningAction SilentlyContinue)
+        $result = @(Find-DuplicateFile -File $files -WarningVariable warnings -WarningAction SilentlyContinue)
 
+        @($warnings).Count | Should -Be 1
+        "$($warnings[0])" | Should -BeLike '*locked*'
         $result.Count | Should -Be 1
         $result[0].Folders | Should -Be @($files[1..2].DirectoryName | Sort-Object)
     }
@@ -290,9 +298,9 @@ Describe 'Export-DuplicateReport' {
 
         $zip = [System.IO.Compression.ZipFile]::OpenRead($out)
         try {
-            $zip.Entries.FullName | Sort-Object | Should -Be @(
-                '[Content_Types].xml', '_rels/.rels', 'xl/_rels/workbook.xml.rels',
-                'xl/styles.xml', 'xl/workbook.xml', 'xl/worksheets/sheet1.xml')
+            $expected = '[Content_Types].xml', '_rels/.rels', 'xl/_rels/workbook.xml.rels',
+                'xl/styles.xml', 'xl/workbook.xml', 'xl/worksheets/sheet1.xml'
+            ($zip.Entries.FullName | Sort-Object) | Should -Be ($expected | Sort-Object)
             foreach ($entry in $zip.Entries) {
                 $reader = [System.IO.StreamReader]::new($entry.Open())
                 try { { [xml] $reader.ReadToEnd() } | Should -Not -Throw -Because $entry.FullName }
