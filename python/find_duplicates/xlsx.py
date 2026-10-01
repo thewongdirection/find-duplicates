@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import re
+import sys
 import uuid
 import zipfile
 from datetime import datetime, timedelta
@@ -392,6 +393,51 @@ def _offset_of(duplicate: DuplicateSet) -> timedelta:
     return local_utc_offset(duplicate.last_write_time)
 
 
+# Said when the report cannot be written because another program holds it open
+# (PowerShell: $script:ReportLockedMessage).
+REPORT_LOCKED_MESSAGE = (
+    "The report '{0}' is locked by another program (is it open in Excel?). "
+    "Close it or free whatever is locking it, then run the command again."
+)
+# Windows errors for a file another program holds: sharing violation, lock violation.
+_LOCKED_WINERRORS = (32, 33)
+
+
+class ReportLockedError(OSError):
+    """The report exists and another program has it locked (for example open in Excel)."""
+
+
+def report_locked(path: str) -> bool:
+    """Whether an existing file is locked by another program, so that it cannot be opened
+    for writing. A missing file is not locked; one the user may not write (permissions,
+    read-only) is not locked either. (PowerShell: FindDuplicates.Native.IsLocked.)"""
+    if sys.platform != "win32":
+        return False  # no mandatory locks: other programs cannot stop a write
+    import ctypes
+    from ctypes import wintypes
+
+    # Opened as .NET's FileShare.None does, so that the answer is PowerShell's: open() would
+    # not tell a locked file (sharing or lock violation) from one the user may not write.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                     wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    generic_read_write, no_sharing, open_existing, normal = 0xC0000000, 0, 3, 0x80
+    handle = kernel32.CreateFileW(path, generic_read_write, no_sharing, None, open_existing, normal, None)
+    if handle == wintypes.HANDLE(-1).value:
+        return ctypes.get_last_error() in _LOCKED_WINERRORS
+    kernel32.CloseHandle(handle)
+    return False
+
+
+def assert_report_writable(path: str) -> None:
+    """Raise ReportLockedError when the report exists and another program has it locked, so
+    that a scan or validation is not done for nothing. (PowerShell: Assert-ReportWritable.)"""
+    if report_locked(path):
+        raise ReportLockedError(REPORT_LOCKED_MESSAGE.format(path))
+
+
 def export_duplicate_report(
     duplicates: Sequence[DuplicateSet],
     path: str,
@@ -440,7 +486,12 @@ def export_duplicate_report(
             for number, sheet in enumerate(sheets, start=1):
                 xml = _rules_worksheet(sheet) if isinstance(sheet, _RulesSheet) else _worksheet(sheet)
                 archive.writestr(f"xl/worksheets/sheet{number}.xml", xml)
-        os.replace(temp_path, path)
+        try:
+            os.replace(temp_path, path)
+        except OSError as exc:
+            if report_locked(path):
+                raise ReportLockedError(REPORT_LOCKED_MESSAGE.format(path)) from exc
+            raise
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)

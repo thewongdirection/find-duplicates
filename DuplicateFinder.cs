@@ -93,6 +93,23 @@ namespace FindDuplicates
             return exact.ToString();
         }
 
+        // Whether an existing file is locked by another program (for example a report open in
+        // Excel), so that it cannot be opened for writing. A missing file is not locked; one
+        // the user may not write (permissions, read-only) is not locked either.
+        // (Python: xlsx.report_locked.)
+        public static bool IsLocked(string path)
+        {
+            try
+            {
+                using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+                return false;
+            }
+            catch (FileNotFoundException) { return false; }
+            catch (DirectoryNotFoundException) { return false; }
+            catch (IOException) { return true; }
+            catch (UnauthorizedAccessException) { return false; }
+        }
+
         static string TrimSeparator(string path)
         {
             string root = Path.GetPathRoot(path);

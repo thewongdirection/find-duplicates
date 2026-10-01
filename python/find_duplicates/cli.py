@@ -16,7 +16,7 @@ from .matcher import MAX_THROTTLE_LIMIT, MIN_THROTTLE_LIMIT, find_duplicate_file
 from .names import check_name_pattern
 from .scanner import FolderRecord, default_throttle_limit, full_path, iter_files
 from .validate import previous_md5, validate_report
-from .xlsx import ScanSettings, export_duplicate_report
+from .xlsx import ReportLockedError, ScanSettings, assert_report_writable, export_duplicate_report
 
 log = logging.getLogger("find_duplicates")
 
@@ -37,7 +37,7 @@ keep the MD5 recorded there. Files of 0 bytes are included unless
 and --minimum-size leaves small files out. A "Rules" sheet in the report states the
 matching rules in plain words.
 
-DUPLICATE FOLDERS (--folders): also finds folders with the same name and
+DUPLICATE FOLDERS (on by default; --skip-folders to leave them out): also finds folders with the same name and
 exactly the same contents: the same tree of file and sub folder names, where
 every file is a duplicate (name, saved date, MD5) of the file at the same place
 in the other folder. Only the top-most duplicate folders are reported, on a
@@ -74,8 +74,8 @@ examples:
   python -m find_duplicates "%OneDrive%" --skip-cloud-only
       Scans OneDrive without downloading online-only files.
 
-  python -m find_duplicates D:\\Backups --folders
-      Also lists duplicate folders, on the "Duplicate Folders" sheet.
+  python -m find_duplicates D:\\Backups --skip-folders
+      Lists duplicate files only, without the "Duplicate Folders" sheet.
 
   python -m find_duplicates D:\\Photos --exclude Thumbs.db --exclude .git --exclude "*.tmp" --minimum-size 100KB --ignore-empty-files
       Leaves out thumbnail caches, Git folders, temporary files, and files under 100 KB.
@@ -220,7 +220,16 @@ def _parser() -> argparse.ArgumentParser:
         "Duplicate folders still compare every file. Recorded in the report.",
     )
     parser.add_argument(
-        "--folders", action="store_true", help='Also find duplicate folders and save them on the "Duplicate Folders" sheet.'
+        "--skip-folders",
+        action="store_true",
+        help='Do not look for duplicate folders: the report then has no "Duplicate Folders" sheet. '
+        "Duplicate folders are found by default.",
+    )
+    parser.add_argument(
+        "--folders",
+        action="store_true",
+        help="Find duplicate folders, as is done by default; kept so that older commands still work. "
+        "Cannot be used together with --skip-folders.",
     )
     parser.add_argument(
         "--rehash",
@@ -240,13 +249,15 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     parser = _parser()
     args = parser.parse_args(argv)
 
+    if args.folders and args.skip_folders:
+        parser.error("--folders and --skip-folders cannot be used together.")
     if args.validate:
-        scan_only = (args.skip_cloud_only, args.folders, args.ignore_empty_files, args.rehash, args.exclude,
-                     args.minimum_size is not None)
+        scan_only = (args.skip_cloud_only, args.folders, args.skip_folders, args.ignore_empty_files, args.rehash,
+                     args.exclude, args.minimum_size is not None)
         if any(scan_only):
             parser.error(
-                "--skip-cloud-only, --folders, --ignore-empty-files, --rehash, --exclude and --minimum-size only apply "
-                "to a scan, not to --validate"
+                "--skip-cloud-only, --folders, --skip-folders, --ignore-empty-files, --rehash, --exclude and "
+                "--minimum-size only apply to a scan, not to --validate"
             )
         if len([value for value in (args.path, args.output, args.output_option) if value]) > 1:
             parser.error("--validate takes a single report")
@@ -264,6 +275,9 @@ def report_path(output: Optional[str]) -> str:
 
 def _validate(report: str, dry_run: bool, throttle_limit: int = 1) -> int:
     progress = ProgressLine()
+    # A report open in Excel cannot be saved: say so now, not after a long validation.
+    if not dry_run and not _report_writable(report):
+        return 1
     print(f"Validating '{report}' ...")
     try:
         result = validate_report(
@@ -305,6 +319,9 @@ def _scan(
     settings: Optional[ScanSettings] = None,
 ) -> int:
     settings = settings or ScanSettings()
+    # A report open in Excel cannot be saved: say so now, not after a long scan.
+    if not dry_run and not _report_writable(report):
+        return 1
     scan_root = full_path(folder)
     if not os.path.isdir(scan_root):
         print(f"error: '{folder}' is not a folder.", file=sys.stderr)
@@ -371,9 +388,22 @@ def _scan(
     else:
         # The smallest file listed, recorded in the report: --ignore-empty-files means 1 byte.
         smallest = max(settings.minimum_size, 1) if ignore_empty_files else settings.minimum_size
-        export_duplicate_report(duplicates, report, duplicate_folders, ScanSettings(settings.exclude_names, smallest))
+        try:
+            export_duplicate_report(duplicates, report, duplicate_folders, ScanSettings(settings.exclude_names, smallest))
+        except ReportLockedError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         print(f"Report saved to '{report}'.")
     return 0
+
+
+def _report_writable(report: str) -> bool:
+    try:
+        assert_report_writable(report)
+    except ReportLockedError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return False
+    return True
 
 
 def _safe_console() -> None:
@@ -410,7 +440,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         report_path(args.output_option or args.output),
         args.skip_cloud_only,
         args.throttle_limit,
-        args.folders,
+        not args.skip_folders,  # duplicate folders are found unless --skip-folders says not to
         args.ignore_empty_files,
         args.dry_run,
         args.rehash,

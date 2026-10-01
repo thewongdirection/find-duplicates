@@ -31,6 +31,33 @@ def add_file(root: str, relative: str, content: str = "same content", saved: dat
     return path
 
 
+@contextlib.contextmanager
+def locked_like_excel(path: str) -> Iterator[None]:
+    """Hold a file open as Excel holds an open workbook: others may read it, not write it.
+    Windows only (Python's open() cannot deny other programs access)."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                     wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    generic_read, file_share_read, open_existing, normal = 0x80000000, 0x1, 3, 0x80
+    handle = kernel32.CreateFileW(path, generic_read, file_share_read, None, open_existing, normal, None)
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        yield
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def locked_message(path: str) -> str:
+    return (f"The report '{path}' is locked by another program (is it open in Excel?). "
+            "Close it or free whatever is locking it, then run the command again.")
+
+
 def as_if_on_a_network_drive():
     """Treat every path as on a network drive, where Python works on several threads (-j):
     locally it does not, being faster without (see scanner.on_network_drive)."""

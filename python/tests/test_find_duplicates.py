@@ -29,11 +29,12 @@ from find_duplicates.names import path_depth  # noqa: E402
 from find_duplicates.scanner import FileRecord, iter_files, local_time, utc_offset  # noqa: E402
 from find_duplicates.validate import validate_report  # noqa: E402
 from find_duplicates.xlsx import (  # noqa: E402
-    ScanSettings, column_name, excel_serial, export_duplicate_report, from_excel_serial, parse_utc_offset,
+    ReportLockedError, ScanSettings, column_name, excel_serial, export_duplicate_report, from_excel_serial, parse_utc_offset,
     read_duplicate_report, read_duplicate_workbook, utc_offset_text,
 )
 from tests.helpers import (  # noqa: E402
-    SAVED, add_file, as_if_on_a_network_drive, read_worksheet, sheet_names, time_zone,
+    SAVED, add_file, as_if_on_a_network_drive, locked_like_excel, locked_message, read_worksheet, sheet_names,
+    time_zone,
 )
 
 
@@ -508,6 +509,20 @@ class ExportDuplicateReportTests(TempDirTestCase):
         path = os.path.join(self.root, name)
         export_duplicate_report(self.SETS if sets is None else sets, path)
         return path
+
+    @unittest.skipUnless(sys.platform == "win32", "other programs lock files against writing only on Windows")
+    def test_says_the_report_is_locked_when_another_program_holds_it_open(self):
+        report = self.export("locked.xlsx")
+        with open(report, "rb") as stream:
+            before = stream.read()
+
+        with locked_like_excel(report), self.assertRaises(ReportLockedError) as caught:
+            export_duplicate_report([], report)
+
+        self.assertEqual(str(caught.exception), locked_message(report))
+        with open(report, "rb") as stream:
+            self.assertEqual(stream.read(), before, "the report is left as it was")
+        self.assertEqual([name for name in os.listdir(self.root) if name.endswith(".tmp")], [])
 
     def test_one_row_per_file_with_a_column_per_location(self):
         rows = read_worksheet(self.export())
@@ -1183,7 +1198,8 @@ class CliTests(TempDirTestCase):
         self.assertEqual(code, 0)
         help_text = out.getvalue()
         self.assertIn("Find duplicate files in a folder", help_text)
-        for option in ("path", "output", "--output-file", "--throttle-limit", "--folders", "--ignore-empty-files",
+        for option in ("path", "output", "--output-file", "--throttle-limit", "--folders", "--skip-folders",
+                       "--ignore-empty-files",
                        "--exclude", "--minimum-size", "--skip-cloud-only", "--rehash", "--validate", "--dry-run",
                        "--verbose"):
             self.assertIn(option, help_text)
@@ -1225,6 +1241,36 @@ class CliTests(TempDirTestCase):
         self.assertEqual(code, 0)
         self.assertIn(f"Report saved to '{os.path.join(reports, 'New Report.xlsx')}'.", out)
 
+    def run_cli_with_errors(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(list(args))
+        return code, out.getvalue(), err.getvalue()
+
+    @unittest.skipUnless(sys.platform == "win32", "other programs lock files against writing only on Windows")
+    def test_says_the_report_is_locked_before_scanning_when_another_program_holds_it_open(self):
+        report = os.path.join(self.new_dir("work"), "locked.xlsx")
+        self.run_cli(self.data, report)
+
+        with locked_like_excel(report):
+            code, out, err = self.run_cli_with_errors(self.data, report)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(err.strip(), f"error: {locked_message(report)}")
+        self.assertNotIn("Scanning", out, "nothing is scanned for a report that cannot be saved")
+
+    @unittest.skipUnless(sys.platform == "win32", "other programs lock files against writing only on Windows")
+    def test_says_the_report_is_locked_before_validating_when_another_program_holds_it_open(self):
+        report = os.path.join(self.new_dir("work"), "locked.xlsx")
+        self.run_cli(self.data, report)
+
+        with locked_like_excel(report):
+            code, out, err = self.run_cli_with_errors("--validate", report)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(err.strip(), f"error: {locked_message(report)}")
+        self.assertNotIn("Validating", out)
+
     def test_hashes_several_files_at_a_time_with_throttle_limit(self):
         report = os.path.join(self.new_dir("work"), "parallel.xlsx")
         code, _ = self.run_cli(self.data, report, "--throttle-limit", "4")
@@ -1252,7 +1298,7 @@ class CliTests(TempDirTestCase):
         self.run_cli(root, report, "--exclude", "thumbs.db", "--minimum-size", "2KB")
 
         self.assertEqual([d.file_name for d in read_duplicate_report(report)], ["large.txt"])
-        rules = [row[0] for row in read_worksheet(report, "xl/worksheets/sheet2.xml", all_rows=True)]
+        rules = [row[0] for row in read_worksheet(report, "xl/worksheets/sheet3.xml", all_rows=True)]
         self.assertIn("Scan settings", rules)
 
     def test_reads_a_minimum_size_in_bytes_or_with_a_unit_and_rejects_anything_else(self):
@@ -1263,7 +1309,7 @@ class CliTests(TempDirTestCase):
             with self.subTest(text=text):
                 report = os.path.join(self.root, "size.xlsx")
                 self.run_cli(root, report, "--minimum-size", text)
-                rows = read_worksheet(report, "xl/worksheets/sheet2.xml", all_rows=True)
+                rows = read_worksheet(report, "xl/worksheets/sheet3.xml", all_rows=True)
                 (size,) = [row for row in rows if row[0] == MINIMUM_SIZE_LABEL]
                 self.assertEqual(size[1], expected)
         for text in ("-1", "10 bytes", "KB", "\u0661\u0662"):  # the last: Arabic-Indic digits
@@ -1284,7 +1330,7 @@ class CliTests(TempDirTestCase):
 
         self.run_cli(root, report, "--ignore-empty-files")
 
-        rows = read_worksheet(report, "xl/worksheets/sheet2.xml", all_rows=True)
+        rows = read_worksheet(report, "xl/worksheets/sheet3.xml", all_rows=True)
         (size,) = [row for row in rows if row[0] == MINIMUM_SIZE_LABEL]
         self.assertEqual(size[1], "1")
 
