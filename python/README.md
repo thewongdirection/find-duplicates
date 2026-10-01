@@ -41,7 +41,7 @@ help; to scan the current folder, give it `.` as the path.
 ## Command reference
 
 ```text
-python -m find_duplicates [path] [output] [-o FILE] [-j N] [--folders] [--ignore-empty-files] [--exclude PATTERN ...]
+python -m find_duplicates [path] [output] [-o FILE] [-j N] [--skip-folders] [--ignore-empty-files] [--exclude PATTERN ...]
                           [--minimum-size SIZE] [--skip-cloud-only] [--rehash] [--dry-run] [-v]
 python -m find_duplicates --validate [report] [--dry-run] [-v]
 ```
@@ -53,7 +53,8 @@ python -m find_duplicates --validate [report] [--dry-run] [-v]
 | `path` | current folder (when other arguments are given) | Folder to scan, including all sub folders. |
 | `output`, `-o FILE`, `--output-file FILE` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced. |
 | `-j N`, `--throttle-limit N` | `4` on a network share or drive, `1` otherwise | How many files to hash, and folders to list, at the same time (1-64); see [Threads](#threads). Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk. |
-| `--folders` | off | Also find [duplicate folders](../README.md#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
+| `--skip-folders` | off | Do not look for [duplicate folders](../README.md#duplicate-folders): the report then has no *Duplicate Folders* sheet. Duplicate folders are found by default. |
+| `--folders` | on | Find duplicate folders, as is done by default; kept so that older commands still work. Cannot be used with `--skip-folders`. |
 | `--ignore-empty-files` | off | Leave files of 0 bytes out of the duplicate files. |
 | `--exclude PATTERN` | none | Leave files and folders with this name out; repeat for more names. `*` stands for any characters and `?` for any one character; upper/lower case is ignored; patterns match names, not paths. Left-out folders are not scanned, and duplicate folders are compared as if left-out names were not there. Recorded on the *Rules* sheet, so `--validate` leaves the same names out. |
 | `--minimum-size SIZE` | `0` | Leave files smaller than this out of the duplicate files: a number of bytes, optionally followed by `KB`, `MB`, `GB`, `TB` or `PB` (1024-based, so `1.5MB` is 1572864 bytes, as in PowerShell). Recorded on the *Rules* sheet. |
@@ -79,8 +80,8 @@ python -m find_duplicates D:\Photos -o C:\Reports\photo-dupes.xlsx
 # Hash 8 files at a time (SSD, network share or cloud folder)
 python -m find_duplicates \\nas\photos -j 8
 
-# Also find duplicate folders (second sheet)
-python -m find_duplicates D:\Backups --folders
+# Duplicate files only, without the Duplicate Folders sheet
+python -m find_duplicates D:\Backups --skip-folders
 
 # Leave out empty (0-byte) files
 python -m find_duplicates D:\Photos --ignore-empty-files
@@ -114,7 +115,7 @@ drive or share that cannot be reached are kept. See the
 | `--dry-run` | off | Report what would be removed, but do not change the report. |
 | `-v`, `--verbose` | off | Print every copy that is removed and why. |
 
-`--skip-cloud-only`, `--folders`, `--ignore-empty-files`, `--rehash`, `--exclude` and `--minimum-size`
+`--skip-cloud-only`, `--folders`, `--skip-folders`, `--ignore-empty-files`, `--rehash`, `--exclude` and `--minimum-size`
 only apply to a scan; validation reads the names to leave out from the report.
 Duplicate folders, when the report has them, are re-checked too.
 
@@ -158,6 +159,7 @@ result = validate_report("duplicates.xlsx", dry_run=True)        # summary: remo
 | `-Path` | `path` (first argument) |
 | `-OutputFile` | `output` (second argument) or `-o` |
 | `-ThrottleLimit N` | `-j N` / `--throttle-limit N` |
+| `-SkipFolders` | `--skip-folders` |
 | `-IncludeFolders` | `--folders` |
 | `-IgnoreEmptyFiles` | `--ignore-empty-files` |
 | `-Rehash` | `--rehash` |

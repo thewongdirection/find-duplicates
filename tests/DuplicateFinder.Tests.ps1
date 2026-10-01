@@ -28,6 +28,16 @@ BeforeAll {
         Get-Item -LiteralPath $full -Force  # -Force: names starting with a dot are hidden on Linux and macOS
     }
 
+    # Holds a file open as Excel holds an open workbook: others may read it, not write it.
+    function Lock-LikeExcel([string] $Path) {
+        [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    }
+
+    function Get-LockedMessage([string] $Path) {
+        "The report '$Path' is locked by another program (is it open in Excel?). " +
+        'Close it or free whatever is locking it, then run the command again.'
+    }
+
     function Add-TestRoot {
         $root = Join-Path $TestDrive ([System.Guid]::NewGuid().ToString('N'))
         (New-Item -ItemType Directory -Path $root).FullName
@@ -67,6 +77,42 @@ BeforeAll {
             if (-not $inTable -and $cells[0] -in 'File Name', 'Folder Name') { $inTable = $true }
             if ($inTable) { , $cells }
         }
+    }
+}
+
+Describe 'Module import' {
+    BeforeAll {
+        # Each case runs in a new PowerShell process of this edition: a compiled type, and
+        # the record of which source it came from, last for the whole process.
+        $script:Shell = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $script:ModulePath = Join-Path (Split-Path -Parent $PSScriptRoot) 'DuplicateFinder.psm1'
+        function Invoke-NewSession([string] $Command) {
+            $script = "`$ErrorActionPreference = 'Stop'; try { $Command } catch { 'ERROR: ' + `$_.Exception.Message }"
+            & $script:Shell -NoProfile -NonInteractive -Command $script
+        }
+    }
+
+    It 'can be imported again in the same session' {
+        $output = Invoke-NewSession "Import-Module '$script:ModulePath'; Import-Module '$script:ModulePath' -Force; 'imported'"
+        $output | Should -Be 'imported'
+    }
+
+    It 'uses an updated DuplicateFinder.cs in a session that loaded an earlier one' {
+        # A copy of the tool, loaded, then updated in place: its compiled helpers get a method more.
+        $folder = Add-TestRoot
+        $repoRoot = Split-Path -Parent $script:ModulePath
+        foreach ($name in 'DuplicateFinder.psm1', 'DuplicateFinder.cs') { Copy-Item -LiteralPath (Join-Path $repoRoot $name) -Destination $folder }
+        $module = Join-Path $folder 'DuplicateFinder.psm1'
+        $source = Join-Path $folder 'DuplicateFinder.cs'
+        $update = Join-Path (Add-TestRoot) 'DuplicateFinder.cs'
+        [System.IO.File]::WriteAllText($update, ([regex] '(public static class Native\s*\{)').Replace(
+                [System.IO.File]::ReadAllText($source), '$1 public static string Probe() { return "updated"; }', 1))
+
+        $output = Invoke-NewSession ("Import-Module '$module'; Copy-Item -LiteralPath '$update' -Destination '$source' -Force; " +
+            "Import-Module '$module' -Force; " +
+            '& (Get-Module DuplicateFinder) { $script:Native::Probe() }; ConvertTo-ColumnName 28')
+
+        $output | Should -Be @('updated', 'AB') -Because 'the updated helpers are compiled and used without a new session'
     }
 }
 
@@ -850,6 +896,22 @@ Describe 'Export-DuplicateReport' {
         finally { Pop-Location }
 
         Join-Path $dir 'relative.xlsx' | Should -Exist
+    }
+
+    It 'says the report is locked when another program holds it open' {
+        if (-not $script:OnWindows) { Set-ItResult -Skipped -Because 'other programs lock files against writing only on Windows'; return }
+        $report = Join-Path (Add-TestRoot) 'locked.xlsx'
+        Export-DuplicateReport -DuplicateSet $script:Sets -Path $report
+        $before = [System.IO.File]::ReadAllBytes($report)
+
+        $lock = Lock-LikeExcel $report
+        try { $thrown = $null; Export-DuplicateReport -DuplicateSet @() -Path $report }
+        catch { $thrown = $_.Exception.Message }
+        finally { $lock.Dispose() }
+
+        $thrown | Should -BeExactly (Get-LockedMessage $report)
+        [System.IO.File]::ReadAllBytes($report) | Should -Be $before -Because 'the report is left as it was'
+        @(Get-ChildItem -LiteralPath (Split-Path -Parent $report) -Filter '*.tmp').Count | Should -Be 0
     }
 }
 
@@ -1923,7 +1985,7 @@ Describe 'Find-Duplicates.ps1' {
         finally { Pop-Location }
 
         $help | Should -BeLike '*Finds duplicate files in a folder*' -Because 'the synopsis is shown'
-        foreach ($parameter in 'Path', 'OutputFile', 'ThrottleLimit', 'IncludeFolders', 'IgnoreEmptyFiles', 'Exclude',
+        foreach ($parameter in 'Path', 'OutputFile', 'ThrottleLimit', 'IncludeFolders', 'SkipFolders', 'IgnoreEmptyFiles', 'Exclude',
             'MinimumSize', 'SkipCloudOnly', 'Rehash', 'Validate', 'PassThru', 'WhatIf') {
             $help | Should -BeLike "*-$parameter *" -Because "-$parameter is described"
         }
@@ -1953,7 +2015,7 @@ Describe 'Find-Duplicates.ps1' {
 
     It 'reports the folders as spelled on disk when given the path in another case' {
         if (-not $script:OnWindows) { Set-ItResult -Skipped -Because 'names ignore case only on Windows'; return }
-        $root = [FindDuplicates.Native]::ExactPath((Add-TestRoot))
+        $root = Resolve-ExactPath -Path (Add-TestRoot)
         $null = Add-TestFile $root 'My Photos/Trip A/x.txt'
         $null = Add-TestFile $root 'My Photos/Trip B/x.txt'
         $typed = (Join-Path $root 'My Photos').ToLowerInvariant()
@@ -1968,13 +2030,43 @@ Describe 'Find-Duplicates.ps1' {
 
     It 'saves the report under its folder as spelled on disk, keeping the new file name as given' {
         if (-not $script:OnWindows) { Set-ItResult -Skipped -Because 'names ignore case only on Windows'; return }
-        $workDir = [FindDuplicates.Native]::ExactPath((Add-TestRoot))
+        $workDir = Resolve-ExactPath -Path (Add-TestRoot)
         $null = New-Item -ItemType Directory -Path (Join-Path $workDir 'Reports')
         $typed = (Join-Path $workDir 'Reports').ToLowerInvariant() + '\New Report'
 
         $output = & $script:ScriptPath -Path $script:Root -OutputFile $typed 6>&1 | Out-String -Width 1000
 
         $output | Should -BeLikeExactly "*Report saved to '$workDir\Reports\New Report.xlsx'.*"
+    }
+
+    It 'says the report is locked before scanning when another program holds it open' {
+        if (-not $script:OnWindows) { Set-ItResult -Skipped -Because 'other programs lock files against writing only on Windows'; return }
+        $report = Join-Path (Add-TestRoot) 'locked.xlsx'
+        $null = & $script:ScriptPath -Path $script:Root -OutputFile $report 6>$null
+        $output = [System.Collections.Generic.List[object]]::new()
+
+        $lock = Lock-LikeExcel $report
+        try { $thrown = $null; & $script:ScriptPath -Path $script:Root -OutputFile $report 6>&1 | ForEach-Object { $output.Add($_) } }
+        catch { $thrown = $_.Exception.Message }
+        finally { $lock.Dispose() }
+
+        $thrown | Should -BeExactly (Get-LockedMessage $report)
+        "$output" | Should -Not -BeLike '*Scanning*' -Because 'nothing is scanned for a report that cannot be saved'
+    }
+
+    It 'says the report is locked before validating when another program holds it open' {
+        if (-not $script:OnWindows) { Set-ItResult -Skipped -Because 'other programs lock files against writing only on Windows'; return }
+        $report = Join-Path (Add-TestRoot) 'locked.xlsx'
+        $null = & $script:ScriptPath -Path $script:Root -OutputFile $report 6>$null
+        $output = [System.Collections.Generic.List[object]]::new()
+
+        $lock = Lock-LikeExcel $report
+        try { $thrown = $null; & $script:ScriptPath -Validate $report 6>&1 | ForEach-Object { $output.Add($_) } }
+        catch { $thrown = $_.Exception.Message }
+        finally { $lock.Dispose() }
+
+        $thrown | Should -BeExactly (Get-LockedMessage $report)
+        "$output" | Should -Not -BeLike '*Validating*'
     }
 
     It 'scans and validates a network share given as a UNC path' {
@@ -2038,7 +2130,7 @@ Describe 'Find-Duplicates.ps1' {
         $result = @(& $script:ScriptPath -Path $root -OutputFile $out -Exclude 'thumbs.db' -MinimumSize 2KB -PassThru 6>$null)
 
         $result.FileName | Should -Be @('large.txt')
-        $rules = @(Read-Worksheet $out -Part 'xl/worksheets/sheet2.xml' -AllRows | ForEach-Object { $_[0] })
+        $rules = @(Read-Worksheet $out -Part 'xl/worksheets/sheet3.xml' -AllRows | ForEach-Object { $_[0] })
         $rules | Should -Contain 'Scan settings'
     }
 
@@ -2048,7 +2140,7 @@ Describe 'Find-Duplicates.ps1' {
         foreach ($case in @(@('1500', '1500'), @('2KB', '2048'), @('1.5MB', '1572864'))) {
             $out = Join-Path (Add-TestRoot) 'size.xlsx'
             $null = & $script:ScriptPath -Path $root -OutputFile $out -MinimumSize $case[0] 6>$null
-            $size = @(Read-Worksheet $out -Part 'xl/worksheets/sheet2.xml' -AllRows | Where-Object { $_[0] -eq 'Smallest file listed, in bytes (-MinimumSize or -IgnoreEmptyFiles; Python: --minimum-size or --ignore-empty-files)' })
+            $size = @(Read-Worksheet $out -Part 'xl/worksheets/sheet3.xml' -AllRows | Where-Object { $_[0] -eq 'Smallest file listed, in bytes (-MinimumSize or -IgnoreEmptyFiles; Python: --minimum-size or --ignore-empty-files)' })
             $size[0][1] | Should -Be $case[1] -Because $case[0]
         }
         foreach ($bad in '-1', '10 bytes', 'KB') {
@@ -2070,7 +2162,7 @@ Describe 'Find-Duplicates.ps1' {
 
         $null = & $script:ScriptPath -Path $root -OutputFile $out -IgnoreEmptyFiles 6>$null
 
-        $size = @(Read-Worksheet $out -Part 'xl/worksheets/sheet2.xml' -AllRows | Where-Object { $_[0] -eq 'Smallest file listed, in bytes (-MinimumSize or -IgnoreEmptyFiles; Python: --minimum-size or --ignore-empty-files)' })
+        $size = @(Read-Worksheet $out -Part 'xl/worksheets/sheet3.xml' -AllRows | Where-Object { $_[0] -eq 'Smallest file listed, in bytes (-MinimumSize or -IgnoreEmptyFiles; Python: --minimum-size or --ignore-empty-files)' })
         $size[0][1] | Should -Be '1'
     }
 
@@ -2139,6 +2231,37 @@ Describe 'Find-Duplicates.ps1' {
         @($result | Where-Object { $_.PSObject.Properties['FolderName'] }).Count | Should -Be 1
         @($result | Where-Object { $_.PSObject.Properties['FileName'] }).Count | Should -Be 2
         @(Import-DuplicateFolderReport -Path $out)[0].FolderName | Should -Be 'Photos'
+    }
+
+    It 'lists duplicate folders by default' {
+        $root = Add-TestRoot
+        foreach ($folder in 'one', 'two') {
+            $null = Add-TestFile $root "$folder/Photos/a.jpg" -Content 'a'
+            $null = Add-TestFile $root "$folder/Photos/b.jpg" -Content 'b'
+        }
+        $out = Join-Path (Add-TestRoot) 'default.xlsx'
+
+        $output = & $script:ScriptPath -Path $root -OutputFile $out 6>&1 | Out-String
+
+        $output | Should -BeLike '*Found 1 duplicated folders (2 copies in total).*'
+        @(Import-DuplicateFolderReport -Path $out)[0].FolderName | Should -Be 'Photos'
+    }
+
+    It 'leaves duplicate folders out with -SkipFolders' {
+        $root = Add-TestRoot
+        foreach ($folder in 'one', 'two') { $null = Add-TestFile $root "$folder/Photos/a.jpg" -Content 'a' }
+        $out = Join-Path (Add-TestRoot) 'files-only.xlsx'
+
+        $output = & $script:ScriptPath -Path $root -OutputFile $out -SkipFolders 6>&1 | Out-String
+
+        $output | Should -Not -BeLike '*duplicate folders*'
+        Get-SheetName $out | Should -Not -Contain 'Duplicate Folders'
+        @(Import-DuplicateReport -Path $out).Count | Should -Be 1
+    }
+
+    It 'rejects -IncludeFolders together with -SkipFolders' {
+        { & $script:ScriptPath -Path $script:Root -OutputFile (Join-Path (Add-TestRoot) 'x.xlsx') -IncludeFolders -SkipFolders 6>$null } |
+            Should -Throw '-IncludeFolders and -SkipFolders cannot be used together.'
     }
 
     It 're-checks duplicate folders with -Validate' {

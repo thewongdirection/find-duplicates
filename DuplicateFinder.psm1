@@ -19,13 +19,25 @@ Set-StrictMode -Version Latest
 
 Add-Type -AssemblyName System.IO.Compression
 
-# Compiled helpers for the loops that run once per file (DuplicateFinder.cs). A type lives for
-# the whole process, so a module imported again, or by a worker runspace, reuses it.
-if (-not ('FindDuplicates.Native' -as [type])) {
-    $helper = @{ Path = Join-Path $PSScriptRoot 'DuplicateFinder.cs' }
+# Compiled helpers for the loops that run once per file (DuplicateFinder.cs), reached through
+# $script:Native. A compiled type lives for the whole process and cannot be replaced, so each
+# version of the file is compiled under its own namespace, named after a hash of its text: an
+# updated file compiles beside the old one in a session that already ran the tool, and needs no
+# new PowerShell window. A module imported again, or by a worker runspace, reuses its version.
+$helperSource = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'DuplicateFinder.cs'))
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try { $helperHash = [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($helperSource))) }
+finally { $sha.Dispose() }
+$helperNamespace = 'FindDuplicates.V' + $helperHash.Replace('-', '').Substring(0, 16)
+$script:Native = "$helperNamespace.Native" -as [type]
+if ($null -eq $script:Native) {
+    $namespacePattern = [regex] '(?m)^namespace FindDuplicates\b'
+    if ($namespacePattern.Matches($helperSource).Count -ne 1) { throw "DuplicateFinder.cs must declare 'namespace FindDuplicates' once." }
+    $helper = @{ TypeDefinition = $namespacePattern.Replace($helperSource, "namespace $helperNamespace", 1) }
     # Windows PowerShell 5.1 references fewer assemblies by default than PowerShell 7.
     if ($PSVersionTable.PSEdition -ne 'Core') { $helper.ReferencedAssemblies = 'System.Xml' }
     Add-Type @helper
+    $script:Native = [type] "$helperNamespace.Native"
 }
 
 $script:ProgressIntervalMs = 250
@@ -259,7 +271,7 @@ function Get-FileInventory {
     $nameFilter = ConvertTo-NameFilter -Pattern $ExcludeName
 
     # Spelled as on disk (see ExactPath), whatever the case or short names it was given in.
-    $rootPath = [FindDuplicates.Native]::ExactPath($root.FullName)
+    $rootPath = $script:Native::ExactPath($root.FullName)
     $listings = $null
     if ($ThrottleLimit -gt 1) { $listings = Get-TreeListing -Path $rootPath -ThrottleLimit $ThrottleLimit -NameFilter $nameFilter }
 
@@ -296,8 +308,8 @@ function Get-FileInventory {
         $keptFiles = $listing.Files
         $subFolders = $listing.Folders
         if ($null -ne $nameFilter) {
-            $keptFiles = [FindDuplicates.Native]::WithoutMatchingNames($keptFiles, $nameFilter)
-            $subFolders = [FindDuplicates.Native]::WithoutMatchingNames($subFolders, $nameFilter)
+            $keptFiles = $script:Native::WithoutMatchingNames($keptFiles, $nameFilter)
+            $subFolders = $script:Native::WithoutMatchingNames($subFolders, $nameFilter)
         }
 
         # (By a file's own folder, not $folder: a scan root given with a trailing separator
@@ -341,7 +353,7 @@ function Get-FolderListing {
     #>
     # A simple function (no parameter validation): it runs once per folder.
     param([string] $Path)
-    [FindDuplicates.Native]::ListFolder($Path)
+    $script:Native::ListFolder($Path)
 }
 
 function Get-TreeListing {
@@ -378,7 +390,7 @@ function Get-TreeListing {
                     -Status "Folders: $($listings.Count)   Files: $fileCount ($ThrottleLimit at a time)" -CurrentOperation $listing.Path
             }
             $subFolders = $listing.Folders
-            if ($null -ne $NameFilter) { $subFolders = [FindDuplicates.Native]::WithoutMatchingNames($subFolders, $NameFilter) }
+            if ($null -ne $NameFilter) { $subFolders = $script:Native::WithoutMatchingNames($subFolders, $NameFilter) }
             foreach ($sub in $subFolders) {
                 if (Test-FolderLink -Folder $sub) { continue }
                 $pool.Queue.Add($sub.FullName)
@@ -402,6 +414,19 @@ $script:NetworkFileSystems = [System.Collections.Generic.HashSet[string]]::new([
 # How many folders and files to list and hash at a time on a network drive when the
 # command line does not say (-ThrottleLimit): each request waits on the server.
 $script:NetworkThrottleLimit = 4
+
+function Resolve-ExactPath {
+    <#
+    .SYNOPSIS
+        A full path as Windows spells it: drive letter in upper case, each existing name as
+        stored on disk, short 8.3 names expanded; made absolute only elsewhere.
+        (FindDuplicates.Native.ExactPath; Python: scanner.full_path.)
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)] [string] $Path)
+    $script:Native::ExactPath($Path)
+}
 
 function Test-NetworkDrive {
     <#
@@ -495,7 +520,7 @@ function ConvertTo-NameKey {
     #>
     # A simple function (no parameter validation): it runs for every file in some loops.
     param([string] $Name)
-    [FindDuplicates.Native]::NameKey($Name)
+    $script:Native::NameKey($Name)
 }
 
 # One character for a ? wildcard: a surrogate pair (a character beyond U+FFFF, such as an
@@ -621,7 +646,7 @@ function Get-FileMd5 {
     # of its first $Limit bytes only.
     # A simple function (no parameter validation): it runs for every file hashed.
     param([string] $Path, [long] $Limit = 0)
-    [FindDuplicates.Native]::Md5($Path, $Limit)
+    $script:Native::Md5($Path, $Limit)
 }
 
 # Large candidates are first compared by the MD5 of their start (see Split-ByStartHash):
@@ -675,8 +700,8 @@ function Get-FileMd5Map {
     else {
         $pool = $null
         try {
-            $work = { param($File) [FindDuplicates.Native]::Md5($File, 0) }
-            if ($FirstBytes) { $work = { param($File) [FindDuplicates.Native]::Md5($File, $script:FirstBytesToHash) } }
+            $work = { param($File) $script:Native::Md5($File, 0) }
+            if ($FirstBytes) { $work = { param($File) $script:Native::Md5($File, $script:FirstBytesToHash) } }
             $pool = Open-WorkerPool -Work $work -ThrottleLimit ([Math]::Min($ThrottleLimit, $Path.Count))
             foreach ($p in $Path) { $pool.Queue.Add($p) }
             $result = $null
@@ -715,7 +740,7 @@ function Group-ByKey {
         [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $InputItems,
         [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $Key
     )
-    foreach ($group in [FindDuplicates.Native]::GroupByKey($InputItems, $Key)) { , $group }
+    foreach ($group in $script:Native::GroupByKey($InputItems, $Key)) { , $group }
 }
 
 function Find-DuplicateFile {
@@ -755,7 +780,7 @@ function Find-DuplicateFile {
     # Stage 1: name. Grouped first, so the size and saved date of a file whose name no other
     # file has are never read: on Linux, macOS and network drives each is a request per file.
     # Group-ByKey ignores case; only Unicode normalisation is needed here.
-    $nameGroups = @(Group-ByKey -InputItems $File -Key ([FindDuplicates.Native]::NormalizedNames($File)))
+    $nameGroups = @(Group-ByKey -InputItems $File -Key ($script:Native::NormalizedNames($File)))
 
     # Stage 2: saved date (UTC, whole second: copies made to network shares or other file
     # systems often lose sub-second precision) and size, a cheap check that avoids hashing
@@ -1421,6 +1446,23 @@ function Write-RulesSheetXml {
     $Writer.WriteEndElement()  # worksheet
 }
 
+# Said when the report cannot be written because another program holds it open (Python:
+# xlsx.REPORT_LOCKED_MESSAGE).
+$script:ReportLockedMessage = "The report '{0}' is locked by another program (is it open in Excel?). " +
+    'Close it or free whatever is locking it, then run the command again.'
+
+function Assert-ReportWritable {
+    <#
+    .SYNOPSIS
+        Stops, saying so, when the report exists and another program has it locked (for
+        example open in Excel), so that a scan or validation is not done for nothing.
+        (Python: xlsx.assert_report_writable.)
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $Path)
+    if ($script:Native::IsLocked($Path)) { throw ($script:ReportLockedMessage -f $Path) }
+}
+
 function Export-DuplicateReport {
     <#
     .SYNOPSIS
@@ -1543,7 +1585,11 @@ function Export-DuplicateReport {
         }
         finally { $fileStream.Dispose() }
 
-        Move-Item -LiteralPath $tempPath -Destination $Path -Force -ErrorAction Stop
+        try { Move-Item -LiteralPath $tempPath -Destination $Path -Force -ErrorAction Stop }
+        catch {
+            if ($script:Native::IsLocked($Path)) { throw ($script:ReportLockedMessage -f $Path) }
+            throw
+        }
     }
     finally {
         if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force }
@@ -1626,7 +1672,7 @@ function Get-SharedString {
     $sharedXml = Read-ZipXml -Archive $Archive -EntryName 'xl/sharedStrings.xml'
     if ($sharedXml) {
         $ns = Get-SpreadsheetNamespace -Xml $sharedXml
-        foreach ($item in $sharedXml.SelectNodes('/s:sst/s:si', $ns)) { $shared.Add([FindDuplicates.Native]::CellText($item, $script:SpreadsheetMain)) }
+        foreach ($item in $sharedXml.SelectNodes('/s:sst/s:si', $ns)) { $shared.Add($script:Native::CellText($item, $script:SpreadsheetMain)) }
     }
     , $shared
 }
@@ -1641,7 +1687,7 @@ function Get-WorksheetRow {
     )
     $sheet = Read-ZipXml -Archive $Archive -EntryName $SheetPath
     if ($null -eq $sheet) { throw "The workbook has no part '$SheetPath'." }
-    foreach ($row in [FindDuplicates.Native]::SheetRows($sheet, $SharedString, $script:SpreadsheetMain)) { , $row }
+    foreach ($row in $script:Native::SheetRows($sheet, $SharedString, $script:SpreadsheetMain)) { , $row }
 }
 
 function Test-ReportHeader {
@@ -1898,7 +1944,7 @@ function Get-CopyState {
     # Missing when it was deleted while being checked; Unavailable when its details cannot be read.
     # A simple function (no parameter validation): it runs for every copy in a report.
     param([object] $File, [long] $SizeBytes, [datetime] $LastWriteTime, [object] $UtcOffset)
-    try { [FindDuplicates.Native]::CopyState($File, $SizeBytes, $LastWriteTime, $UtcOffset) }
+    try { $script:Native::CopyState($File, $SizeBytes, $LastWriteTime, $UtcOffset) }
     catch { 'Unavailable' }  # not a file at all
 }
 
@@ -1932,7 +1978,7 @@ function Test-CopyInFolder {
         $names[$i] = $c.FileName; $sizes[$i] = $c.SizeBytes; $saved[$i] = $c.LastWriteTime
         if ($null -ne $c.UtcOffset) { $offsets[$i] = [TimeSpan] $c.UtcOffset }
     }
-    $states = [FindDuplicates.Native]::CheckCopiesInFolder($Folder, $names, $sizes, $saved, $offsets)
+    $states = $script:Native::CheckCopiesInFolder($Folder, $names, $sizes, $saved, $offsets)
     for ($i = 0; $i -lt $Check.Count; $i++) { [pscustomobject] @{ Key = $Check[$i].Key; State = $states[$i] } }
 }
 
@@ -2073,7 +2119,7 @@ function Test-SameSavedDate {
     #>
     # A simple function (no parameter validation): it runs for every copy in a report.
     param([datetime] $Local, [datetime] $Utc, [datetime] $LastWriteTime, [object] $UtcOffset)
-    [FindDuplicates.Native]::SameSavedDate($Local, $Utc, $LastWriteTime, $UtcOffset)
+    $script:Native::SameSavedDate($Local, $Utc, $LastWriteTime, $UtcOffset)
 }
 
 function Get-PreviousMd5 {
@@ -2121,7 +2167,7 @@ function Get-PreviousMd5 {
             # A file whose details cannot be read is simply hashed (and reported on) as usual.
             try { $size = $f.get_Length(); $local = $f.get_LastWriteTime(); $utc = $f.get_LastWriteTimeUtc() }
             catch { continue }
-            if ($size -eq $row.SizeBytes -and [FindDuplicates.Native]::SameSavedDate($local, $utc, $row.LastWriteTime, $row.UtcOffset)) {
+            if ($size -eq $row.SizeBytes -and $script:Native::SameSavedDate($local, $utc, $row.LastWriteTime, $row.UtcOffset)) {
                 $previous[$f.FullName] = ([string] $row.MD5).ToUpperInvariant()
             }
         }
@@ -2304,4 +2350,5 @@ function Update-DuplicateReport {
 
 Export-ModuleMember -Function Get-FileInventory, Find-DuplicateFile, Find-DuplicateFolder, Export-DuplicateReport,
     ConvertTo-ColumnName, Import-DuplicateReport, Import-DuplicateFolderReport, Update-DuplicateReport, Get-PreviousMd5,
-    Test-NetworkDrive, Get-DefaultThrottleLimit, Assert-NamePattern, ConvertFrom-SizeText
+    Test-NetworkDrive, Get-DefaultThrottleLimit, Assert-NamePattern, ConvertFrom-SizeText, Resolve-ExactPath,
+    Assert-ReportWritable

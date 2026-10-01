@@ -155,6 +155,12 @@ class ParityTests(unittest.TestCase):
         self.assertNotIn("deep", folder_names, "a nested set that only exists inside Holiday is left out")
         self.assert_same_report(self.report("ps.xlsx"), self.report("py.xlsx"))
 
+    def test_default_reports_list_duplicate_folders_and_match(self):
+        self.run_powershell("-Path", self.data, "-OutputFile", self.report("ps.xlsx"))
+        self.run_python(self.data, self.report("py.xlsx"))
+        self.assertIn("Duplicate Folders", sheet_names(self.report("py.xlsx")), "duplicate folders are on by default")
+        self.assert_same_report(self.report("ps.xlsx"), self.report("py.xlsx"))
+
     def test_reports_for_a_path_typed_in_another_case_match(self):
         # Windows ignores case: both tools then record every folder as spelled on disk.
         typed = self.data.lower() if os.name == "nt" else self.data

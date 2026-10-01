@@ -347,6 +347,36 @@ class FolderCliTests(TempRootTestCase):
             self.assertEqual([r.folder_name for r in read_duplicate_folder_report(out)], ["Photos"])
             self.assertEqual(len(read_duplicate_report(out)), 2)
 
+    def test_lists_duplicate_folders_by_default(self):
+        for folder in ("one", "two"):
+            add_file(self.root, f"{folder}/Photos/a.jpg", "a")
+            add_file(self.root, f"{folder}/Photos/b.jpg", "b")
+        with tempfile.TemporaryDirectory() as out_dir:
+            out = os.path.join(out_dir, "default.xlsx")
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(cli.main([self.root, out]), 0)
+            self.assertIn("Found 1 duplicated folders (2 copies in total).", printed.getvalue())
+            self.assertEqual([r.folder_name for r in read_duplicate_folder_report(out)], ["Photos"])
+
+    def test_leaves_duplicate_folders_out_with_skip_folders(self):
+        for folder in ("one", "two"):
+            add_file(self.root, f"{folder}/Photos/a.jpg", "a")
+        with tempfile.TemporaryDirectory() as out_dir:
+            out = os.path.join(out_dir, "files-only.xlsx")
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(cli.main([self.root, out, "--skip-folders"]), 0)
+            self.assertNotIn("duplicate folders", printed.getvalue())
+            self.assertNotIn("Duplicate Folders", sheet_names(out))
+            self.assertEqual(len(read_duplicate_report(out)), 1)
+
+    def test_rejects_folders_together_with_skip_folders(self):
+        errors = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(errors):
+            cli.main([self.root, "--folders", "--skip-folders"])
+        self.assertIn("--folders and --skip-folders cannot be used together.", errors.getvalue())
+
     def test_re_checks_duplicate_folders_with_validate(self):
         for folder in ("one", "two", "three"):
             add_file(self.root, f"{folder}/Photos/a.jpg", "a")

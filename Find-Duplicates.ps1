@@ -26,7 +26,7 @@
     is local time and UTC Offset its difference from UTC, so -Validate works in any
     time zone.
 
-    DUPLICATE FOLDERS (-IncludeFolders)
+    DUPLICATE FOLDERS (on by default; -SkipFolders to leave them out)
     Also finds folders with the same name and exactly the same contents: the same tree
     of file and sub folder names, where every file is a duplicate (name, saved date,
     MD5) of the file at the same place in the other folder. Only the top-most
@@ -85,8 +85,13 @@
     -MinimumSize 1MB or 1.5MB (KB, MB, GB, TB, PB: 1024-based). Duplicate folders still
     compare every file. Recorded in the report.
 
+.PARAMETER SkipFolders
+    Do not look for duplicate folders: the report then has no "Duplicate Folders"
+    sheet. Duplicate folders are found by default.
+
 .PARAMETER IncludeFolders
-    Also find duplicate folders and save them on the "Duplicate Folders" sheet.
+    Find duplicate folders, as is done by default; kept so that older commands still
+    work. Cannot be used together with -SkipFolders.
 
 .PARAMETER Rehash
     Read every candidate file again. Without it, when the report already exists (from
@@ -125,9 +130,9 @@
     Scans OneDrive without downloading online-only files.
 
 .EXAMPLE
-    .\Find-Duplicates.ps1 -Path D:\Backups -IncludeFolders
+    .\Find-Duplicates.ps1 -Path D:\Backups -SkipFolders
 
-    Also lists duplicate folders, on the "Duplicate Folders" sheet.
+    Lists duplicate files only, without the "Duplicate Folders" sheet.
 
 .EXAMPLE
     .\Find-Duplicates.ps1 -Path D:\Photos -Exclude Thumbs.db, .git, *.tmp -MinimumSize 100KB -IgnoreEmptyFiles
@@ -191,6 +196,9 @@ param(
     [switch] $IncludeFolders,
 
     [Parameter(ParameterSetName = 'Scan')]
+    [switch] $SkipFolders,
+
+    [Parameter(ParameterSetName = 'Scan')]
     [switch] $Rehash,
 
     [Parameter(ParameterSetName = 'Validate', Mandatory)]
@@ -219,7 +227,12 @@ if (-not [System.IO.Path]::HasExtension($OutputFile)) {
 # Full paths as Windows spells them (drive letter in upper case, names as on disk, short
 # names expanded), so the report is recognised and left out when it is saved inside the
 # scanned folder, and its locations match the folders whatever case they were typed in.
-$reportPath = [FindDuplicates.Native]::ExactPath($PSCmdlet.GetUnresolvedProviderPathFromPSPath($OutputFile))
+$reportPath = Resolve-ExactPath -Path $PSCmdlet.GetUnresolvedProviderPathFromPSPath($OutputFile)
+
+if ($IncludeFolders -and $SkipFolders) { throw '-IncludeFolders and -SkipFolders cannot be used together.' }
+
+# A report open in Excel cannot be saved: say so now, not after a long scan or validation.
+if (-not $WhatIfPreference) { Assert-ReportWritable -Path $reportPath }
 
 if ($Validate) {
     Write-Host "Validating '$reportPath' ..."
@@ -247,9 +260,11 @@ if ($Validate) {
 }
 
 # Checked before anything is scanned.
+# Duplicate folders are found unless -SkipFolders says not to.
+$listFolders = -not $SkipFolders
 Assert-NamePattern -Pattern $Exclude
 $minimumBytes = ConvertFrom-SizeText -Text $MinimumSize -Name '-MinimumSize'
-$scanRoot = [FindDuplicates.Native]::ExactPath((Resolve-Path -LiteralPath $Path).ProviderPath)
+$scanRoot = Resolve-ExactPath -Path (Resolve-Path -LiteralPath $Path).ProviderPath
 
 Write-Host "Scanning '$scanRoot' ..."
 if (-not $PSBoundParameters.ContainsKey('ThrottleLimit')) {
@@ -260,7 +275,7 @@ if (-not $PSBoundParameters.ContainsKey('ThrottleLimit')) {
 }
 if ($Exclude.Count) { Write-Host "Leaving out files and folders named: $($Exclude -join ', ')" }
 $folderInfo = $null  # (not "= if ...": an empty list would be unrolled into $null)
-if ($IncludeFolders) { $folderInfo = [System.Collections.Generic.List[object]]::new() }
+if ($listFolders) { $folderInfo = [System.Collections.Generic.List[object]]::new() }
 $files = @(Get-FileInventory -Path $scanRoot -ExcludeFile $reportPath -FolderInfo $folderInfo -ThrottleLimit $ThrottleLimit -ExcludeName $Exclude @verbose)
 Write-Host "Found $($files.Count) files. Checking for duplicates ..."
 
@@ -287,7 +302,7 @@ Write-Host "Found $($duplicates.Count) duplicated files ($copies copies in total
 $smallest = $minimumBytes
 if ($IgnoreEmptyFiles -and $smallest -lt 1) { $smallest = 1 }
 $export = @{ DuplicateSet = $duplicates; Path = $reportPath; ExcludeName = $Exclude; MinimumSize = $smallest }
-if ($IncludeFolders) {
+if ($listFolders) {
     Write-Host 'Checking for duplicate folders ...'
     $folderDuplicates = @(Find-DuplicateFolder -File $files -Folder $folderInfo.ToArray() @matchOptions)
     $folderCopies = 0
@@ -304,5 +319,5 @@ else { Write-Host "Report not saved (-WhatIf): '$reportPath'." }
 
 if ($PassThru) {
     $duplicates
-    if ($IncludeFolders) { $folderDuplicates }
+    if ($listFolders) { $folderDuplicates }
 }

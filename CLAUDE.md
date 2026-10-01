@@ -36,7 +36,7 @@ Every new feature, behaviour change or bug fix is done in this order:
 
 Command-line options map one to one: `-Path` ↔ `path`,
 `-OutputFile` ↔ `output` / `-o`, `-ThrottleLimit` ↔ `-j` / `--throttle-limit`,
-`-IncludeFolders` ↔ `--folders`, `-IgnoreEmptyFiles` ↔ `--ignore-empty-files`,
+`-IncludeFolders` ↔ `--folders`, `-SkipFolders` ↔ `--skip-folders`, `-IgnoreEmptyFiles` ↔ `--ignore-empty-files`,
 `-Rehash` ↔ `--rehash`, `-Exclude` ↔ `--exclude` (repeated), `-MinimumSize` ↔ `--minimum-size`,
 `-SkipCloudOnly` ↔ `--skip-cloud-only`, `-Validate` ↔ `--validate`,
 `-WhatIf` ↔ `--dry-run`, `-Verbose` ↔ `--verbose`. `-PassThru` corresponds to
@@ -102,8 +102,10 @@ per-call overhead dominates on large trees and reports. Such loops belong in
 `DuplicateFinder.cs`, which must stay C# 5, ASCII, and limited to assemblies both
 editions reference (the module adds `System.Xml` for Windows PowerShell 5.1). Keep
 thin PowerShell functions around what tests mock (`Get-FileMd5`, `Test-PathRootReachable`,
-`Find-FileByNameKey`, `Test-CloudOnlyFile`). A compiled type lives for the whole process:
-after changing the C# file, test in a new PowerShell session.
+`Find-FileByNameKey`, `Test-CloudOnlyFile`). A compiled type lives for the whole process, so
+the module compiles each version of the C# file under its own namespace (`FindDuplicates.V`
+plus a hash of the text) and reaches it through `$script:Native`: never write
+`[FindDuplicates.Native]` in PowerShell code. The C# file must declare `namespace FindDuplicates` once.
 
 Situations that need real equipment (network shares, cloud drives, Excel
 itself) are listed in `tests/MANUAL-TESTS.md`; extend it when adding such a

@@ -53,7 +53,7 @@ online-only copy of a file that also exists locally.
 
 Needs Excel on Windows or macOS.
 
-1. **Opens cleanly.** Open a report made with `-IncludeFolders`. Excel opens
+1. **Opens cleanly.** Open a report made by a default scan (duplicate folders included). Excel opens
    it without a repair prompt. The *Duplicates*, *Duplicate Folders* and
    *Rules* sheets are present; header rows are frozen and have filters;
    *Last Modified* shows as a date and time.
@@ -62,13 +62,15 @@ Needs Excel on Windows or macOS.
 3. **Round trip.** Delete one row, save in Excel (keeping .xlsx), close Excel,
    then run `-Validate` on the saved file. It is read without errors, and the
    deleted row stays deleted.
-4. **Open while validating.** With the report open in Excel, run `-Validate`.
-   It reads the report; saving the changes fails with a clear message that the
-   file is in use (close Excel and run it again).
+4. **Open while scanning or validating.** With the report open in Excel, run a
+   scan to it, then `-Validate` / `--validate` on it. Each stops at once, before
+   scanning or validating, with "The report '...' is locked by another program
+   (is it open in Excel?). Close it or free whatever is locking it, then run the
+   command again." The report is unchanged; after closing Excel both run.
 5. **Unicode.** A report of files named in Japanese, Arabic and with emoji shows
    those names correctly.
 6. **Edited scan settings.** Scan with `-Exclude Thumbs.db -MinimumSize 1KB`
-   and `-IncludeFolders`, open the report in Excel, add a pattern in a new cell
+   (duplicate folders included by default), open the report in Excel, add a pattern in a new cell
    of the *Names left out* row on the *Rules* sheet and type `abc` as the
    smallest size, and save. `-Validate` warns that it ignores the size, leaves
    out the added names too, and keeps the names row when it rewrites the report.
