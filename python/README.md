@@ -34,7 +34,9 @@ make sure the account that runs it can read the folders to scan and write the
 report. Scheduled runs, network shares and cloud drives are covered in the
 [main README](../README.md#deployment).
 
-Built-in help: `python -m find_duplicates --help`.
+Built-in help: run `python -m find_duplicates` without any arguments (or with
+`--help`) to see every option, with examples. Without arguments it only shows this
+help; to scan the current folder, give it `.` as the path.
 
 ## Command reference
 
@@ -48,21 +50,24 @@ python -m find_duplicates --validate [report] [--dry-run] [-v]
 
 | Option | Default | What it does |
 |---|---|---|
-| `path` | current folder | Folder to scan, including all sub folders. |
+| `path` | current folder (when other arguments are given) | Folder to scan, including all sub folders. |
 | `output`, `-o FILE`, `--output-file FILE` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced. |
 | `-j N`, `--throttle-limit N` | `4` on a network share or drive, `1` otherwise | How many files to hash, and folders to list, at the same time (1-64); see [Threads](#threads). Try 4-8 for SSDs, network shares and cloud folders; keep 1 for a single spinning hard disk. |
 | `--folders` | off | Also find [duplicate folders](../README.md#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
 | `--ignore-empty-files` | off | Leave files of 0 bytes out of the duplicate files. |
 | `--exclude PATTERN` | none | Leave files and folders with this name out; repeat for more names. `*` stands for any characters and `?` for any one character; upper/lower case is ignored; patterns match names, not paths. Left-out folders are not scanned, and duplicate folders are compared as if left-out names were not there. Recorded on the *Rules* sheet, so `--validate` leaves the same names out. |
 | `--minimum-size SIZE` | `0` | Leave files smaller than this out of the duplicate files: a number of bytes, optionally followed by `KB`, `MB`, `GB`, `TB` or `PB` (1024-based, so `1.5MB` is 1572864 bytes, as in PowerShell). Recorded on the *Rules* sheet. |
-| `--rehash` | off | Read every candidate file again. Without it, when the report already exists (from an earlier scan), files it lists whose size and saved date have not changed keep the MD5 recorded there instead of being read again. |
+| `--rehash` | off | Read every candidate file again. Without it, when the report already exists (from an earlier scan), files it lists whose size and saved date have not changed keep the MD5 recorded there instead of being read again. Files are matched to the report by folder and name, ignoring case (for folders, on Windows only), so a report made with the path typed in another case is still used. |
 | `--skip-cloud-only` | off | Never download online-only cloud files to hash them. Duplicates among such files are then not reported. |
 | `--dry-run` | off | Scan and report the totals, but do not save the report. |
 | `-v`, `--verbose` | off | Print every folder as it is scanned, and every link or online-only file skipped. |
 
 ```sh
-# Scan the current folder, save ./duplicates.xlsx
+# Show the full help (every option, with examples)
 python -m find_duplicates
+
+# Scan the current folder, save ./duplicates.xlsx
+python -m find_duplicates .
 
 # Scan a folder, save ./duplicates.xlsx
 python -m find_duplicates D:\Photos
@@ -203,6 +208,10 @@ The same as for PowerShell: see
 - On Windows, paths longer than 260 characters need the system's *long paths*
   setting (`LongPathsEnabled`); without it such folders are skipped with a
   warning.
+- On Windows, the folder and report paths are spelled as on disk, as PowerShell
+  does (`scanner.full_path`): `d:\users\chris\pictures` becomes
+  `D:\users\Chris\Pictures`, short 8.3 names are expanded, and both tools write
+  identical locations whatever case the path was typed in.
 - On Windows, saved dates before 1970 are converted to local time with the rule
   for the same date in 1972 (Python's own conversion cannot handle them there),
   which is also what PowerShell does for dates older than Windows' time zone data.

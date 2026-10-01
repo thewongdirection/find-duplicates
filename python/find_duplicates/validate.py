@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import stat
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
@@ -320,18 +321,21 @@ _MD5 = re.compile("[0-9A-Fa-f]{32}")
 def previous_md5(report: str, files: Sequence[FileRecord]) -> Dict[str, str]:
     """MD5 hashes to take from an earlier report instead of reading the files again.
 
-    Returns full path -> MD5 for each scanned file that the report lists (same folder and
-    name, ignoring case) whose size and saved date are still the report's. Only those
+    Returns full path -> MD5 for each scanned file that the report lists (same name,
+    ignoring case, in the same folder, ignoring case on Windows) whose size and saved date are still the report's. Only those
     files' details are looked up. MD5s that are not 32 hexadecimal digits (an edited
     report) are ignored.
     """
     rows = read_duplicate_workbook(report).files
     wanted = {name_key(row.file_name) for row in rows}
+    # Windows ignores case in folder names too, so a report whose locations were typed or
+    # recorded in another case still matches; elsewhere folders must match exactly.
+    folder_key = name_key if sys.platform == "win32" else str
     scanned: Dict[Tuple[str, str], FileRecord] = {}
     for record in files:
         key = name_key(record.name)
         if key in wanted:
-            scanned.setdefault((record.folder, key), record)
+            scanned.setdefault((folder_key(record.folder), key), record)
 
     previous: Dict[str, str] = {}
     for row in rows:
@@ -339,7 +343,7 @@ def previous_md5(report: str, files: Sequence[FileRecord]) -> Dict[str, str]:
             continue
         name = name_key(row.file_name)
         for folder in row.folders:
-            record = scanned.get((folder, name))
+            record = scanned.get((folder_key(folder), name))
             if record is None:
                 continue
             try:

@@ -1373,6 +1373,20 @@ Describe 'Get-PreviousMd5' {
         $result.Count | Should -Be 2
     }
 
+    It 'takes the MD5 hashes from a report whose folders are in another case on Windows' {
+        $root = Add-TestRoot
+        $files = @(Add-TestFile $root 'My Photos/x.txt' -Content 'x'; Add-TestFile $root 'Backup/x.txt' -Content 'x')
+        $report = "$root.xlsx"
+        $set = @(Find-DuplicateFile -File $files)[0]
+        $set.Folders = [string[]] @($set.Folders | ForEach-Object { $_.ToLowerInvariant() })
+        Export-DuplicateReport -DuplicateSet @($set) -Path $report
+
+        $previous = Get-PreviousMd5 -Path $report -File $files
+
+        if ($script:OnWindows) { @($previous.Keys | Sort-Object) | Should -Be @($files.FullName | Sort-Object) }
+        else { $previous.Count | Should -Be 0 -Because 'folder names are case-sensitive here' }
+    }
+
     It 'ignores an MD5 in the previous report that is not an MD5' {
         $root = Add-TestRoot
         $files = @(Add-TestFile $root 'a/x.txt'; Add-TestFile $root 'b/x.txt')
@@ -1900,6 +1914,24 @@ Describe 'Find-Duplicates.ps1' {
         $rows[1][6..8] | Should -Be $expected -Because 'the full folder path of every copy is recorded'
     }
 
+    It 'shows the full help instead of scanning when started without parameters' {
+        $workDir = Add-TestRoot
+        $null = Add-TestFile $workDir 'a/x.txt'
+        $null = Add-TestFile $workDir 'b/x.txt'
+        Push-Location $workDir
+        try { $help = & $script:ScriptPath 6>&1 | Out-String -Width 200 }
+        finally { Pop-Location }
+
+        $help | Should -BeLike '*Finds duplicate files in a folder*' -Because 'the synopsis is shown'
+        foreach ($parameter in 'Path', 'OutputFile', 'ThrottleLimit', 'IncludeFolders', 'IgnoreEmptyFiles', 'Exclude',
+            'MinimumSize', 'SkipCloudOnly', 'Rehash', 'Validate', 'PassThru', 'WhatIf') {
+            $help | Should -BeLike "*-$parameter *" -Because "-$parameter is described"
+        }
+        $help | Should -BeLike '*EXAMPLE*'
+        $help | Should -Not -BeLike "*Scanning '*"
+        Join-Path $workDir 'duplicates.xlsx' | Should -Not -Exist
+    }
+
     It 'uses the given output file name and adds .xlsx when missing' {
         $workDir = Add-TestRoot
         $null = & $script:ScriptPath -Path $script:Root -OutputFile (Join-Path $workDir 'my-report') 6>$null
@@ -1917,6 +1949,32 @@ Describe 'Find-Duplicates.ps1' {
         $result = @(& $script:ScriptPath -Path $short -OutputFile (Join-Path (Add-TestRoot) 'short.xlsx') -PassThru 6>$null)
 
         $result[0].Folders | ForEach-Object { $_ | Should -Not -BeLike '*~*' }
+    }
+
+    It 'reports the folders as spelled on disk when given the path in another case' {
+        if (-not $script:OnWindows) { Set-ItResult -Skipped -Because 'names ignore case only on Windows'; return }
+        $root = [FindDuplicates.Native]::ExactPath((Add-TestRoot))
+        $null = Add-TestFile $root 'My Photos/Trip A/x.txt'
+        $null = Add-TestFile $root 'My Photos/Trip B/x.txt'
+        $typed = (Join-Path $root 'My Photos').ToLowerInvariant()
+
+        $output = @(& $script:ScriptPath -Path $typed -OutputFile (Join-Path (Add-TestRoot) 'case.xlsx') -PassThru 6>&1)
+        $result = @($output | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })
+
+        $result[0].Folders | Should -BeExactly @((Join-Path $root 'My Photos\Trip A'), (Join-Path $root 'My Photos\Trip B'))
+        "$($output -join ' ')" | Should -BeLikeExactly "*Scanning '$root\My Photos' ...*"
+        $root.Substring(0, 1) | Should -BeExactly $root.Substring(0, 1).ToUpperInvariant() -Because 'drive letters are upper case'
+    }
+
+    It 'saves the report under its folder as spelled on disk, keeping the new file name as given' {
+        if (-not $script:OnWindows) { Set-ItResult -Skipped -Because 'names ignore case only on Windows'; return }
+        $workDir = [FindDuplicates.Native]::ExactPath((Add-TestRoot))
+        $null = New-Item -ItemType Directory -Path (Join-Path $workDir 'Reports')
+        $typed = (Join-Path $workDir 'Reports').ToLowerInvariant() + '\New Report'
+
+        $output = & $script:ScriptPath -Path $script:Root -OutputFile $typed 6>&1 | Out-String -Width 1000
+
+        $output | Should -BeLikeExactly "*Report saved to '$workDir\Reports\New Report.xlsx'.*"
     }
 
     It 'scans and validates a network share given as a UNC path' {

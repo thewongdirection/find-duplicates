@@ -54,16 +54,42 @@ total size.
 Local folders, network shares (\\\\server\\share or mapped drives) and synced
 cloud folders (OneDrive, Google Drive, Dropbox ...) are all supported.
 Microsoft Excel does NOT need to be installed.
+
+Started without any arguments, find-duplicates shows this help and does nothing
+else. To scan the current folder, give it as the path: find-duplicates .
 """
 
 EPILOG = """\
 examples:
-  python -m find_duplicates D:\\Photos
+  python -m find_duplicates .
+      Scans the current folder and saves duplicates.xlsx there.
+
+  python -m find_duplicates D:\\Photos C:\\Reports\\photo-dupes
+      Scans D:\\Photos and saves C:\\Reports\\photo-dupes.xlsx. The same:
+      python -m find_duplicates D:\\Photos -o C:\\Reports\\photo-dupes
+
   python -m find_duplicates \\\\server\\share C:\\Reports\\share-dupes.xlsx -j 8
+      Scans a network share, hashing 8 files at a time.
+
   python -m find_duplicates "%OneDrive%" --skip-cloud-only
+      Scans OneDrive without downloading online-only files.
+
   python -m find_duplicates D:\\Backups --folders
-  python -m find_duplicates D:\\Photos --exclude Thumbs.db --exclude "*.tmp" --minimum-size 100KB
+      Also lists duplicate folders, on the "Duplicate Folders" sheet.
+
+  python -m find_duplicates D:\\Photos --exclude Thumbs.db --exclude .git --exclude "*.tmp" --minimum-size 100KB --ignore-empty-files
+      Leaves out thumbnail caches, Git folders, temporary files, and files under 100 KB.
+
+  python -m find_duplicates D:\\Photos --rehash
+      Scans again, reading every candidate file instead of reusing the MD5 hashes in
+      the existing duplicates.xlsx.
+
+  python -m find_duplicates D:\\Photos --dry-run --verbose
+      Prints every folder scanned and the totals, without saving a report.
+
   python -m find_duplicates --validate C:\\Reports\\share-dupes.xlsx --dry-run
+      Shows which copies listed in the report are gone or changed, without changing it.
+      Leave out --dry-run to remove them from the report.
 """
 
 
@@ -132,7 +158,7 @@ def _pattern(text: str) -> str:
     return text
 
 
-def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="find-duplicates",
         description=DESCRIPTION,
@@ -142,7 +168,8 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     parser.add_argument(
         "path",
         nargs="?",
-        help="Folder to scan (default: the current folder). With --validate: the report to check.",
+        help="Folder to scan (default: the current folder when other arguments are given; without any arguments "
+        "find-duplicates shows this help instead). With --validate: the report to check.",
     )
     parser.add_argument(
         "output",
@@ -206,6 +233,11 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         "--dry-run", action="store_true", help="Show what would be saved or removed without changing the report."
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Print every folder (or removed copy) as it goes.")
+    return parser
+
+
+def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
+    parser = _parser()
     args = parser.parse_args(argv)
 
     if args.validate:
@@ -222,11 +254,12 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
 
 
 def report_path(output: Optional[str]) -> str:
-    """The absolute report path, adding .xlsx when no extension was given."""
+    """The full report path as Windows spells it (see scanner.full_path), adding .xlsx when
+    no extension was given."""
     output = output or DEFAULT_OUTPUT
     if not os.path.splitext(output)[1]:
         output += ".xlsx"
-    return os.path.abspath(output)
+    return full_path(output)
 
 
 def _validate(report: str, dry_run: bool, throttle_limit: int = 1) -> int:
@@ -354,6 +387,12 @@ def _safe_console() -> None:
 
 def main(argv: Optional[List[str]] = None) -> int:
     _safe_console()
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        # Started without arguments: show how to use them instead of scanning the current folder.
+        _parser().print_help()
+        return 0
     args = _parse_args(argv)
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,

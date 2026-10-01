@@ -9,6 +9,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -28,6 +29,76 @@ namespace FindDuplicates
     public static class Native
     {
         const int HashChunkBytes = 1024 * 1024;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct Win32FindData
+        {
+            public uint Attributes;
+            // Three FILETIMEs: pairs of 32-bit words, so not 8-byte aligned like a long.
+            public uint CreationLow, CreationHigh, AccessLow, AccessHigh, WriteLow, WriteHigh;
+            public uint SizeHigh, SizeLow, Reserved0, Reserved1;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string FileName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)] public string AlternateFileName;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr FindFirstFileW(string fileName, out Win32FindData data);
+
+        [DllImport("kernel32.dll")]
+        static extern bool FindClose(IntPtr handle);
+
+        // An absolute path as Windows stores it: drive letter in upper case, each existing
+        // folder or file name spelled exactly as on disk (short 8.3 names expanded), no
+        // trailing separator. The part from the first name that cannot be looked up on is kept
+        // as given, as are a share's server and share names and \\?\ paths. Links are not
+        // resolved. Elsewhere, where names are case-sensitive, the path is only made absolute.
+        // (Python: scanner.full_path.)
+        public static string ExactPath(string path)
+        {
+            path = Path.GetFullPath(path);
+            if (Environment.OSVersion.Platform != PlatformID.Win32NT) { return TrimSeparator(path); }
+            if (path.StartsWith(@"\\?\", StringComparison.Ordinal) || path.StartsWith(@"\\.\", StringComparison.Ordinal))
+            {
+                return path;
+            }
+            string root = Path.GetPathRoot(path);
+            string[] names = path.Substring(root.Length).Split(new char[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
+            if (root.Length == 3 && root[1] == ':') { root = root.Substring(0, 1).ToUpperInvariant() + @":\"; }
+            else if (!root.EndsWith(@"\", StringComparison.Ordinal)) { root += @"\"; }
+
+            StringBuilder exact = new StringBuilder(root);
+            bool lookUp = true;
+            for (int i = 0; i < names.Length; i++)
+            {
+                string name = names[i];
+                if (i > 0) { exact.Append('\\'); }
+                if (lookUp)
+                {
+                    string found = null;
+                    if (name.IndexOf('*') < 0 && name.IndexOf('?') < 0)
+                    {
+                        Win32FindData data;
+                        IntPtr handle = FindFirstFileW(exact.ToString() + name, out data);
+                        if (handle != new IntPtr(-1))
+                        {
+                            FindClose(handle);
+                            found = data.FileName;
+                        }
+                    }
+                    if (String.IsNullOrEmpty(found)) { lookUp = false; }
+                    else { name = found; }
+                }
+                exact.Append(name);
+            }
+            return exact.ToString();
+        }
+
+        static string TrimSeparator(string path)
+        {
+            string root = Path.GetPathRoot(path);
+            string trimmed = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return trimmed.Length < root.Length ? root : trimmed;
+        }
 
         // A name in Unicode normal form C (so "e + accent" as macOS often stores it equals
         // the single character Windows stores); a name that is not valid UTF-16 as it is.

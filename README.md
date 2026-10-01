@@ -222,7 +222,10 @@ Find-Duplicates.ps1 [[-Path] <folder>] [[-OutputFile] <report>] [-ThrottleLimit 
 Find-Duplicates.ps1 -Validate [[-OutputFile] <report>] [-ThrottleLimit <1-64>] [-PassThru] [-WhatIf] [-Verbose]
 ```
 
-Built-in help: `Get-Help .\Find-Duplicates.ps1 -Full`.
+Built-in help: run `.\Find-Duplicates.ps1` without any parameters (or
+`Get-Help .\Find-Duplicates.ps1 -Full`) to see every parameter, with examples.
+Without parameters the script only shows this help; to scan the current folder,
+give it `-Path .`.
 
 If Windows blocks the script, run it as
 `powershell -ExecutionPolicy Bypass -File .\Find-Duplicates.ps1 ...`.
@@ -231,7 +234,7 @@ If Windows blocks the script, run it as
 
 | Parameter | Default | What it does |
 |---|---|---|
-| `-Path <folder>` | current folder | Folder to scan, including all sub folders. Also the first positional argument. |
+| `-Path <folder>` | current folder (when other parameters are given) | Folder to scan, including all sub folders. Also the first positional argument. |
 | `-OutputFile <report>` | `duplicates.xlsx` in the current folder | Report to write. `.xlsx` is added when there is no extension. An existing report is replaced, after its MD5 hashes are reused (see `-Rehash`). Also the second positional argument. |
 | `-ThrottleLimit <1-64>` | `4` on a network share or drive, `1` otherwise | How many files to hash, and folders to list, at the same time. See [Performance](#performance). |
 | `-IncludeFolders` | off | Also find [duplicate folders](#duplicate-folders) and save them on the *Duplicate Folders* sheet. |
@@ -239,14 +242,17 @@ If Windows blocks the script, run it as
 | `-Exclude <pattern[]>` | none | Leave files and folders with these names out: see [What counts as a duplicate](#what-counts-as-a-duplicate). Recorded on the *Rules* sheet. |
 | `-MinimumSize <bytes>` | `0` | Leave files smaller than this out of the duplicate files. Takes PowerShell sizes such as `100KB` or `1.5MB`. Recorded on the *Rules* sheet. |
 | `-SkipCloudOnly` | off | Never download online-only cloud files to hash them. Duplicates among such files are then not reported. |
-| `-Rehash` | off | Read every candidate file again. Without it, when the report already exists (from an earlier scan), files it lists whose size and saved date have not changed keep the MD5 recorded there instead of being read again. |
+| `-Rehash` | off | Read every candidate file again. Without it, when the report already exists (from an earlier scan), files it lists whose size and saved date have not changed keep the MD5 recorded there instead of being read again. Files are matched to the report by folder and name, ignoring case (for folders, on Windows only), so a report made with the path typed in another case is still used. |
 | `-PassThru` | off | Also return the duplicates as PowerShell objects (for piping or scripting): file sets, then folder sets (which have a `FolderName` property). |
 | `-WhatIf` | off | Scan and report the totals, but do not save the report. |
 | `-Verbose` | off | Print every folder as it is scanned, and every link or online-only file skipped. |
 
 ```powershell
-# Scan the current folder, save .\duplicates.xlsx
+# Show the full help (every parameter, with examples)
 .\Find-Duplicates.ps1
+
+# Scan the current folder, save .\duplicates.xlsx
+.\Find-Duplicates.ps1 -Path .
 
 # Scan a folder, save .\duplicates.xlsx
 .\Find-Duplicates.ps1 -Path D:\Photos
@@ -362,6 +368,10 @@ On the *Duplicates* sheet: one row per duplicated file, one column per copy:
   nested copy (fewest folders deep) and the last one the most nested, so the
   copy furthest right is usually the one to delete; copies equally deep are in
   alphabetical order.
+- On Windows, paths are written as Windows spells them, whatever way they were
+  typed: `-Path d:\users\chris\pictures` records `D:\users\Chris\Pictures\...`
+  (drive letter in upper case, every folder name as on disk, short 8.3 names
+  such as `PROGRA~1` expanded). The report file's path is shown the same way.
 - The header row is frozen and has filters; *Last Modified* is a real Excel
   date; *Size* and *Copies* are numbers.
 - *Last Modified* is local time on the computer that ran the scan, and *UTC
@@ -406,6 +416,7 @@ Each of these is covered by an automated test on Windows, Linux and macOS
 | Changing the computer's time zone between the scan and `-Validate` | Makes no difference: the *UTC Offset* column lets validation compare instants. (Reports made before that column are compared by local time; validate those in the time zone of the scan.) |
 | A folder that is deleted, or cannot be read, during the scan | Reported as a warning and skipped; the scan carries on. |
 | A file that cannot be read (permissions, locked by another program) | Reported as a warning and left out; its other copies are still matched. |
+| The folder or report path typed in another case, or with short 8.3 names (Windows) | Recorded and shown as spelled on disk, with the drive letter in upper case. Server and share names of a UNC path, and `\\?\` paths, are kept as typed. |
 | The scanned folder is itself a symbolic link | Scanned through the link; locations show the link's path. |
 | Two files in one folder whose names differ only in case (Linux, or case-sensitive folders on Windows) | Reported as duplicates; the row lists that folder twice. |
 | Names Windows reserves or trims (`NUL`, `PRN.txt`, names ending in a dot or space) | Ordinary names on Linux and macOS. On Windows such files can only be made by special tools; the scan never fails on them, but may skip them with a warning, and `-Validate` keeps such copies rather than guess. |

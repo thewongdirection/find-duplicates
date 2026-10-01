@@ -23,7 +23,7 @@ from xml.etree import ElementTree
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from find_duplicates import cli  # noqa: E402
+from find_duplicates import cli, scanner  # noqa: E402
 from tests.helpers import SAVED, add_file, read_worksheet, sheet_names  # noqa: E402
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -154,6 +154,16 @@ class ParityTests(unittest.TestCase):
         self.assertIn("inner", folder_names, "the nested set with a copy outside Holiday is kept")
         self.assertNotIn("deep", folder_names, "a nested set that only exists inside Holiday is left out")
         self.assert_same_report(self.report("ps.xlsx"), self.report("py.xlsx"))
+
+    def test_reports_for_a_path_typed_in_another_case_match(self):
+        # Windows ignores case: both tools then record every folder as spelled on disk.
+        typed = self.data.lower() if os.name == "nt" else self.data
+        self.run_powershell("-Path", typed, "-OutputFile", self.report("ps.xlsx"), "-IncludeFolders")
+        self.run_python(typed, self.report("py.xlsx"), "--folders")
+        self.assert_same_report(self.report("ps.xlsx"), self.report("py.xlsx"))
+        locations = [row[6] for row in read_worksheet(self.report("py.xlsx"))[1:]]
+        exact = scanner.full_path(self.data)  # the temp folder may be a short (8.3) path
+        self.assertTrue(all(location.startswith(exact) for location in locations), locations)
 
     def test_parallel_hashing_reports_match(self):
         self.run_powershell("-Path", self.data, "-OutputFile", self.report("ps.xlsx"), "-IncludeFolders",

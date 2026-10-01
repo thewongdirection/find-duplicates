@@ -258,11 +258,13 @@ function Get-FileInventory {
     # exactly as when listing one folder at a time, so the output is the same.
     $nameFilter = ConvertTo-NameFilter -Pattern $ExcludeName
 
+    # Spelled as on disk (see ExactPath), whatever the case or short names it was given in.
+    $rootPath = [FindDuplicates.Native]::ExactPath($root.FullName)
     $listings = $null
-    if ($ThrottleLimit -gt 1) { $listings = Get-TreeListing -Path $root.FullName -ThrottleLimit $ThrottleLimit -NameFilter $nameFilter }
+    if ($ThrottleLimit -gt 1) { $listings = Get-TreeListing -Path $rootPath -ThrottleLimit $ThrottleLimit -NameFilter $nameFilter }
 
     $pending = [System.Collections.Generic.Stack[string]]::new()
-    $pending.Push($root.FullName)
+    $pending.Push($rootPath)
 
     $folderCount = 0
     $fileCount   = 0
@@ -2079,8 +2081,8 @@ function Get-PreviousMd5 {
     .SYNOPSIS
         MD5 hashes to take from an earlier report instead of reading the files again.
     .DESCRIPTION
-        Returns full path -> MD5 for each scanned file that the report lists (same folder
-        and name, ignoring case) whose size and saved date are still the report's. Only
+        Returns full path -> MD5 for each scanned file that the report lists (same name,
+        ignoring case, in the same folder, ignoring case on Windows) whose size and saved date are still the report's. Only
         those files' details are looked up. MD5s that are not 32 hexadecimal digits (an
         edited report) are ignored.
     #>
@@ -2093,12 +2095,18 @@ function Get-PreviousMd5 {
     $names = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($row in $rows) { $null = $names.Add($row.FileName) }
 
-    # Folder + separator + name key -> scanned file, for the names the report lists.
+    # Windows ignores case in folder names too, so a report whose locations were typed or
+    # recorded in another case still matches; elsewhere folders must match exactly.
+    $foldersIgnoreCase = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
+
+    # Folder key + separator + name key -> scanned file, for the names the report lists.
     $separator = [string] [char] 0
     $scanned = [System.Collections.Generic.Dictionary[string, System.IO.FileInfo]]::new([System.StringComparer]::Ordinal)
     foreach ($f in $File) {
         if (-not $names.Contains($f.Name)) { continue }
-        $key = $f.DirectoryName + $separator + (ConvertTo-NameKey $f.Name)
+        $folder = $f.DirectoryName
+        if ($foldersIgnoreCase) { $folder = ConvertTo-NameKey $folder }
+        $key = $folder + $separator + (ConvertTo-NameKey $f.Name)
         if (-not $scanned.ContainsKey($key)) { $scanned[$key] = $f }
     }
 
@@ -2107,6 +2115,7 @@ function Get-PreviousMd5 {
         if ([string] $row.MD5 -notmatch '^[0-9A-Fa-f]{32}$') { continue }
         $name = $separator + (ConvertTo-NameKey $row.FileName)
         foreach ($folder in $row.Folders) {
+            if ($foldersIgnoreCase) { $folder = ConvertTo-NameKey $folder }
             $f = $null
             if (-not $scanned.TryGetValue($folder + $name, [ref] $f)) { continue }
             # A file whose details cannot be read is simply hashed (and reported on) as usual.
