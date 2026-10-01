@@ -216,7 +216,10 @@ $verbose = @{ Verbose = $VerbosePreference -eq 'Continue' }
 if (-not [System.IO.Path]::HasExtension($OutputFile)) {
     $OutputFile += '.xlsx'
 }
-$reportPath = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($OutputFile)
+# Full paths as Windows spells them (drive letter in upper case, names as on disk, short
+# names expanded), so the report is recognised and left out when it is saved inside the
+# scanned folder, and its locations match the folders whatever case they were typed in.
+$reportPath = [FindDuplicates.Native]::ExactPath($PSCmdlet.GetUnresolvedProviderPathFromPSPath($OutputFile))
 
 if ($Validate) {
     Write-Host "Validating '$reportPath' ..."
@@ -246,14 +249,7 @@ if ($Validate) {
 # Checked before anything is scanned.
 Assert-NamePattern -Pattern $Exclude
 $minimumBytes = ConvertFrom-SizeText -Text $MinimumSize -Name '-MinimumSize'
-$scanRoot = (Resolve-Path -LiteralPath $Path).ProviderPath
-
-# Resolve the report's folder like the scan root (e.g. Windows short names expanded), so the
-# report is recognised and left out when it is saved inside the scanned folder.
-$reportFolder = Split-Path -Parent $reportPath
-if (Test-Path -LiteralPath $reportFolder -PathType Container) {
-    $reportPath = Join-Path (Resolve-Path -LiteralPath $reportFolder).ProviderPath (Split-Path -Leaf $reportPath)
-}
+$scanRoot = [FindDuplicates.Native]::ExactPath((Resolve-Path -LiteralPath $Path).ProviderPath)
 
 Write-Host "Scanning '$scanRoot' ..."
 if (-not $PSBoundParameters.ContainsKey('ThrottleLimit')) {

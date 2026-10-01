@@ -121,19 +121,51 @@ def is_cloud_only(record: FileRecord) -> bool:
 
 
 def full_path(path: str) -> str:
-    """Absolute path, with Windows short (8.3) names such as RUNNER~1 expanded.
+    """An absolute path as Windows stores it: drive letter in upper case, each existing
+    folder or file name spelled exactly as on disk (short 8.3 names such as RUNNER~1
+    expanded), no trailing separator.
 
-    Matches the paths PowerShell reports. Links are deliberately not resolved.
+    The part from the first name that cannot be looked up on is kept as given, as are a
+    share's server and share names and ``\\\\?\\`` paths. Links are deliberately not resolved.
+    Elsewhere, where names are case-sensitive, the path is only made absolute. Matches the
+    paths PowerShell reports (``FindDuplicates.Native.ExactPath``).
     """
     path = os.path.abspath(path)
-    if sys.platform == "win32":
-        import ctypes
+    if sys.platform != "win32" or path.startswith(("\\\\?\\", "\\\\.\\")):
+        return path
+    drive, rest = os.path.splitdrive(path)
+    if len(drive) == 2 and drive[1] == ":":
+        drive = drive.upper()
+    exact = drive + "\\"
+    look_up = True
+    for index, name in enumerate(part for part in rest.split("\\") if part):
+        if index > 0:
+            exact += "\\"
+        if look_up:
+            found = None if "*" in name or "?" in name else _name_on_disk(exact + name)
+            if found:
+                name = found
+            else:
+                look_up = False
+        exact += name
+    return exact
 
-        buffer = ctypes.create_unicode_buffer(32_768)
-        length = ctypes.windll.kernel32.GetLongPathNameW(path, buffer, len(buffer))
-        if 0 < length < len(buffer):
-            return buffer.value
-    return path
+
+def _name_on_disk(path: str) -> Optional[str]:
+    """The last name of an existing Windows path as the file system stores it, or None."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.FindFirstFileW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.WIN32_FIND_DATAW)]
+    kernel32.FindFirstFileW.restype = wintypes.HANDLE
+    kernel32.FindClose.argtypes = [wintypes.HANDLE]
+    data = wintypes.WIN32_FIND_DATAW()
+    handle = kernel32.FindFirstFileW(path, ctypes.byref(data))
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        return None
+    kernel32.FindClose(handle)
+    return data.cFileName or None
 
 
 # File systems reached over a network, as Linux names them in /proc/self/mounts.

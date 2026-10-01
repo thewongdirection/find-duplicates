@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import logging
 import os
@@ -908,6 +909,20 @@ class PreviousMd5Tests(TempDirTestCase):
         warning.assert_not_called()
         self.assertEqual(len(result), 2)
 
+    def test_takes_the_md5_hashes_from_a_report_whose_folders_are_in_another_case_on_windows(self):
+        paths = [add_file(self.root, "My Photos/x.txt", "x"), add_file(self.root, "Backup/x.txt", "x")]
+        files = self.records(*paths)
+        report = os.path.join(self.root, "lower.xlsx")
+        (found,) = find_duplicate_files(files)
+        export_duplicate_report([dataclasses.replace(found, folders=[f.lower() for f in found.folders])], report)
+
+        previous = validate.previous_md5(report, files)
+
+        if sys.platform == "win32":
+            self.assertEqual(sorted(previous), sorted(paths))
+        else:
+            self.assertEqual(previous, {}, "folder names are case-sensitive here")
+
     def test_ignores_an_md5_in_the_previous_report_that_is_not_an_md5(self):
         paths = [add_file(self.root, "a/x.txt"), add_file(self.root, "b/x.txt")]
         files = self.records(*paths)
@@ -1183,6 +1198,32 @@ class CliTests(TempDirTestCase):
         self.assertTrue(os.path.exists(os.path.join(work, "my-report.xlsx")))
         self.run_cli(self.data, "-o", os.path.join(work, "named"))
         self.assertTrue(os.path.exists(os.path.join(work, "named.xlsx")))
+
+    @unittest.skipUnless(sys.platform == "win32", "names ignore case only on Windows")
+    def test_reports_the_folders_as_spelled_on_disk_when_given_the_path_in_another_case(self):
+        root = self.new_dir("case")
+        add_file(root, "My Photos/Trip A/x.txt")
+        add_file(root, "My Photos/Trip B/x.txt")
+        typed = os.path.join(root, "My Photos").lower()
+        report = os.path.join(self.new_dir("work"), "case.xlsx")
+
+        code, out = self.run_cli(typed, report)
+
+        self.assertEqual(code, 0)
+        (row,) = read_duplicate_report(report)
+        self.assertEqual(row.folders, [os.path.join(root, "My Photos", "Trip A"), os.path.join(root, "My Photos", "Trip B")])
+        self.assertIn(f"Scanning '{os.path.join(root, 'My Photos')}' ...", out)
+        self.assertEqual(root[0], root[0].upper(), "drive letters are upper case")
+
+    @unittest.skipUnless(sys.platform == "win32", "names ignore case only on Windows")
+    def test_saves_the_report_under_its_folder_as_spelled_on_disk_keeping_the_new_file_name_as_given(self):
+        reports = self.new_dir("Reports")
+        typed = os.path.join(reports.lower(), "New Report")
+
+        code, out = self.run_cli(self.data, typed)
+
+        self.assertEqual(code, 0)
+        self.assertIn(f"Report saved to '{os.path.join(reports, 'New Report.xlsx')}'.", out)
 
     def test_hashes_several_files_at_a_time_with_throttle_limit(self):
         report = os.path.join(self.new_dir("work"), "parallel.xlsx")

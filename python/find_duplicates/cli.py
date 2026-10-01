@@ -254,11 +254,12 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
 
 
 def report_path(output: Optional[str]) -> str:
-    """The absolute report path, adding .xlsx when no extension was given."""
+    """The full report path as Windows spells it (see scanner.full_path), adding .xlsx when
+    no extension was given."""
     output = output or DEFAULT_OUTPUT
     if not os.path.splitext(output)[1]:
         output += ".xlsx"
-    return os.path.abspath(output)
+    return full_path(output)
 
 
 def _validate(report: str, dry_run: bool, throttle_limit: int = 1) -> int:
